@@ -1,6 +1,6 @@
 """双臂关节驱动的同物件上下夹持演示，不发布 ROS 或实机命令。
 
-初始关节角由 IK 设置为张开夹爪的预抓取姿态；尚未演示从任意姿态接近物体。
+任务开始时读取实际 qpos，保存起点，规划接近、夹持、放置、退开和返回起点。
 左臂夹上部、右臂夹下部，物体仅通过指腹接触和摩擦被搬动。
 """
 
@@ -17,17 +17,14 @@ from typing import cast
 
 import numpy as np
 
-from .check_circle import CollisionModel, validate_tool_chain
-from .circle_planner import inward_rotation
-from .circle_sim import cross_arm_failure
-from .cooperative_planner import interpolate_pose, plan_cooperative, sample_errors, sample_object
-from .dual_arm_trajectory import DualArmKinematics, rigid_transform
+from .check_circle import validate_tool_chain
+from .cooperative_planner import sample_object
+from .dual_arm_trajectory import DualArmKinematics, DualArmPlan, rigid_transform
+from .grasp_task_planner import GraspMotion, prepare_grasp_motion
 from .kinematics import ArmKinematics, rotation_error
-from .trajectory import FloatArray, JointPlan, sample_joint_plan
-from archer_mujoco.dual_model_loader import load_dual_arm
+from .trajectory import FloatArray, JointPlan, sample_joint_plan, validate_joints
 from archer_mujoco.grasp_model_loader import load_grasp_model, physics
 from archer_mujoco.grasp_scene import GraspConfig, ViewerAPI, _smooth
-from archer_mujoco.model_loader import mujoco
 
 
 def sample_position_velocity(plan: JointPlan, elapsed: float) -> tuple[FloatArray, FloatArray]:
@@ -45,9 +42,11 @@ def sample_position_velocity(plan: JointPlan, elapsed: float) -> tuple[FloatArra
 
 class DualGraspDemo:
     def __init__(self, left_urdf: str | None = None, right_urdf: str | None = None,
-                 config: GraspConfig = GraspConfig()) -> None:
+                 config: GraspConfig = GraspConfig(),
+                 left_initial: FloatArray | None = None, right_initial: FloatArray | None = None) -> None:
         config.validate()
         self.config = config
+        self.left_urdf, self.right_urdf = left_urdf, right_urdf
         tcp = [0., 0., .147021696]
         zero = [0., 0., 0.]
         self.models = {
@@ -61,59 +60,11 @@ class DualGraspDemo:
             self.models['left'], self.models['right'],
             rigid_transform([-.21, 0., 0.], [0., 0., np.pi / 2.]),
             rigid_transform([.21, 0., 0.], [0., 0., np.pi / 2.]))
-        self.object_start = rigid_transform([0., .4, config.center_z], zero)
-        grasps: dict[str, FloatArray] = {}
-        for side, height in (('left', config.grasp_offset), ('right', -config.grasp_offset)):
-            grasp = rigid_transform([0., 0., height], zero)
-            grasp[:3, :3] = inward_rotation(side, float(np.deg2rad(10.)))
-            grasps[side] = grasp
-        seeds: dict[str, FloatArray] = {}
-        for side, base, seed in (('left', self.kinematics.world_from_left, 7),
-                                 ('right', self.kinematics.world_from_right, 8)):
-            arm = self.models[side]
-            target = np.linalg.inv(base) @ self.object_start @ grasps[side]
-            initial = np.array([0., -.8, 1.6, -.8, 0., 0.], dtype=np.float64)
-            candidates: list[FloatArray] = []
-            generator = np.random.default_rng(seed)
-            for index in range(33):
-                guess = initial if index == 0 else generator.uniform(arm.limits[:, 0], arm.limits[:, 1])
-                solution = arm.solve_ik(target, guess)
-                if solution.success:
-                    candidates.append(solution.joints.copy())
-            if not candidates:
-                raise ValueError(side + ' 预抓取姿态没有找到 IK 解')
-            seeds[side] = min(candidates, key=lambda q: float(np.max(np.abs(q - initial))))
-        # 每条腿独立插值：抬升、前移、返回、落下；两臂保持固定抓取关系。
-        corners = [self.object_start.copy() for _ in range(5)]
-        corners[1][2, 3] += config.lift_height
-        corners[2][2, 3] += config.lift_height
-        corners[2][1, 3] += config.move_distance
-        corners[3][2, 3] += config.lift_height
-        poses = [corners[0]]
-        for start, end in zip(corners[:-1], corners[1:]):
-            poses.extend(interpolate_pose(start, end, float(u)) for u in np.linspace(0., 1., 17)[1:])
-        self.cooperative = plan_cooperative(self.kinematics, seeds['left'], seeds['right'], poses,
-                                             grasps['left'], grasps['right'], minimum_duration=.25)
-        self.breakpoints = self.cooperative.paired.left.times[[16, 32, 48, 64]].copy()
-        print('开始双臂轨迹与离散跨臂预检……')
-        contact = load_dual_arm(left_urdf, right_urdf, left_base_xyz=(-.21, 0., 0.),
-            right_base_xyz=(.21, 0., 0.), left_base_rpy=(0., 0., np.pi / 2.),
-            right_base_rpy=(0., 0., np.pi / 2.), tcp_xyz=tcp, enable_contacts=True)
-        cast(CollisionModel, contact.model).geom_margin[:] = .006
-        duration = self.cooperative.paired.duration
-        samples = set(float(t) for t in self.cooperative.paired.left.times)
-        samples.update(float(t) for t in np.linspace(0., duration, math.ceil(duration / .02) + 1))
-        for elapsed in sorted(samples):
-            for side, plan in (('left', self.cooperative.paired.left), ('right', self.cooperative.paired.right)):
-                contact.data.qpos[contact.arms[side].qpos_indices] = sample_joint_plan(plan, elapsed)[0]
-            mujoco.mj_forward(contact.model, contact.data)
-            failure = cross_arm_failure(contact, .01)
-            if failure is not None:
-                raise ValueError('离散跨臂预检失败：' + failure)
-            errors = sample_errors(self.kinematics, self.cooperative, elapsed)
-            if (max(errors['world_position_m'], errors['relative_position_m']) > .0005
-                    or max(errors['world_rotation_rad'], errors['relative_rotation_rad']) > .003):
-                raise ValueError('协同路径插值误差超过预检阈值')
+        default = np.array([0., -.8, 1.6, -.8, 0., 0.], dtype=np.float64)
+        seeds = {
+            'left': validate_joints(default if left_initial is None else left_initial, self.models['left'].limits),
+            'right': validate_joints(default if right_initial is None else right_initial, self.models['right'].limits),
+        }
         self.loaded = load_grasp_model(seeds['left'], seeds['right'], left_urdf, right_urdf, config)
         # 加载模型与规划器必须具有同一 TCP 变换，防止只显示一致而实际使用不同工具长度。
         world_poses = self.kinematics.forward_world(seeds['left'], seeds['right'])
@@ -132,7 +83,7 @@ class DualGraspDemo:
         self.initial_qpos = self.loaded.data.qpos.copy()
         self.initial_ctrl = self.loaded.data.ctrl.copy()
         self.reset()
-        print(f'预检通过；初始已放在预抓取姿态。物体中心 Z={config.center_z:.3f} m，'
+        print(f'场景 READY；尚未规划或执行接近。物体中心 Z={config.center_z:.3f} m，'
               f'台面 Z={config.table_z:.3f} m。')
 
     def reset(self) -> None:
@@ -140,7 +91,11 @@ class DualGraspDemo:
         self.loaded.data.qpos[:] = self.initial_qpos
         self.loaded.data.ctrl[:] = self.initial_ctrl
         physics.mj_forward(self.loaded.model, self.loaded.data)
-        self.state = 'SETTLE'
+        self.motion: GraspMotion | None = None
+        self.state = 'READY'
+        self.stage_started = 0.
+        self.motion_started = 0.
+        self.stable_since: float | None = None
         self.failure = ''
         self.finished = False
         self.verified = False
@@ -152,99 +107,212 @@ class DualGraspDemo:
         self.contact_loss_time = 0.
         self.maximum_contact_loss_time = 0.
         self.minimum_lift_clearance = math.inf
-        self.history: list[str] = []
+        self.history: list[str] = ['READY']
+        self.home_error: dict[str, float] = {}
 
-    def fail(self, reason: str) -> None:
-        self.state, self.failure, self.finished = 'FAILED', reason, True
+    def read_joints(self) -> dict[str, FloatArray]:
+        return {side: validate_joints(self.loaded.data.qpos[arm.qpos_indices], arm.joint_limits)
+                for side, arm in self.loaded.arms.items()}
 
-    def step(self) -> None:
-        if self.finished:
-            return
-        loaded = self.loaded
-        now = float(loaded.data.time)
-        motion_time = now - 2.7
-        duration = self.cooperative.paired.duration
-        if now < .8:
-            state, close = 'SETTLE', 0.
-        elif now < 2.3:
-            state, close = 'CLOSE', _smooth((now - .8) / 1.5)
-        elif now < 2.7:
-            state, close = 'VERIFY', 1.
-        elif motion_time < duration:
-            leg = min(3, int(np.searchsorted(self.breakpoints, motion_time, side='right')))
-            state, close = ('LIFT', 'MOVE', 'RETURN', 'LOWER')[leg], 1.
-        elif motion_time < duration + 1.:
-            state, close = 'OPEN', 1. - _smooth(motion_time - duration)
-        elif motion_time < duration + 2.:
-            state, close = 'FINAL_SETTLE', 0.
-        else:
-            vertical = abs(float(loaded.data.xmat[loaded.object_body, 8])) > math.cos(math.radians(2.))
-            stationary = float(np.linalg.norm(loaded.data.qvel[loaded.object_dof:loaded.object_dof + 6])) < .01
-            if (self.verified and self.minimum_lift_clearance > self.config.lift_height * .8
-                    and abs(loaded.object_bottom() - self.config.table_z) < .001 and vertical and stationary):
-                self.state, self.finished = 'COMPLETED', True
-            else:
-                self.fail('最终落台、竖直稳定或抬升高度未通过')
-            self.history.append(self.state)
-            return
-        if self.state == 'SETTLE' and state != 'SETTLE':
-            speed = np.linalg.norm(loaded.data.qvel[loaded.object_dof:loaded.object_dof + 6])
-            if abs(loaded.object_bottom() - self.config.table_z) > .001 or float(speed) > .01:
-                self.fail('圆柱没有在台面稳定落定')
-                return
+    def enter(self, state: str) -> None:
         self.state = state
+        self.stage_started = float(self.loaded.data.time)
+        self.stable_since = None
         if not self.history or self.history[-1] != state:
             self.history.append(state)
-        left, left_velocity = sample_position_velocity(self.cooperative.paired.left, motion_time)
-        right, right_velocity = sample_position_velocity(self.cooperative.paired.right, motion_time)
-        loaded.set_arm_targets(left, right, left_velocity, right_velocity)
-        loaded.set_grippers(5.65 * close)
-        loaded.step()
-        if not np.all(np.isfinite(loaded.data.qpos)) or not np.all(np.isfinite(loaded.data.qvel)):
+
+    def fail(self, reason: str) -> None:
+        self.failure, self.finished = reason, True
+        self.enter('FAILED')
+
+    def start(self) -> bool:
+        """只从静止且张开的实际场景开始；本轮起点从 qpos 读取并保存。"""
+        if self.state != 'READY':
+            return False
+        try:
+            physics.mj_forward(self.loaded.model, self.loaded.data)
+            current = self.read_joints()
+            for side, arm in self.loaded.arms.items():
+                if float(np.max(np.abs(self.loaded.data.qvel[arm.dof_indices]))) > .01:
+                    raise ValueError(side + ' 尚未静止，拒绝从运动中启动')
+                if float(np.max(np.abs(self.loaded.data.qpos[self.loaded.finger_positions[side]]))) > .001:
+                    raise ValueError(side + ' 夹爪尚未完全张开，请先重置场景')
+            self.enter('PLANNING')
+            print('读取本轮起点：', {side: q.tolist() for side, q in current.items()})
+            motion = prepare_grasp_motion(self.kinematics, current, self.config, self.left_urdf, self.right_urdf)
+            for side, actual in self.read_joints().items():
+                if float(np.max(np.abs(actual - current[side]))) > .002:
+                    raise ValueError('规划期间姿态发生变化，拒绝使用过期起点')
+            self.motion = motion
+            self.enter('SETTLE')
+            return True
+        except (ValueError, RuntimeError, OSError) as exc:
+            self.fail('规划或起点检查失败：' + str(exc))
+            return False
+
+    def converged(self, paired: DualArmPlan, tolerance: float = .003) -> bool:
+        for side, plan in (('left', paired.left), ('right', paired.right)):
+            arm = self.loaded.arms[side]
+            error = float(np.max(np.abs(self.loaded.data.qpos[arm.qpos_indices] - plan.positions[-1])))
+            speed = float(np.max(np.abs(self.loaded.data.qvel[arm.dof_indices])))
+            if error > tolerance or speed > .01:
+                return False
+        return True
+
+    def grounded(self) -> bool:
+        data = self.loaded.data
+        return (abs(self.loaded.object_bottom() - self.config.table_z) < .001
+                and float(np.linalg.norm(data.qvel[self.loaded.object_dof:self.loaded.object_dof + 6])) < .01
+                and float(data.xmat[self.loaded.object_body, 8]) > math.cos(math.radians(2.)))
+
+    def wait_stable(self, condition: bool, next_state: str, dwell: float = .2, timeout: float = 3.) -> None:
+        now = float(self.loaded.data.time)
+        if condition:
+            if self.stable_since is None:
+                self.stable_since = now
+            elif now - self.stable_since >= dwell:
+                self.enter(next_state)
+                return
+        else:
+            self.stable_since = None
+        if now - self.stage_started > timeout:
+            self.fail(self.state + ' 等待实际反馈稳定超时')
+
+    def guard_grasp(self, motion: GraspMotion, elapsed: float, fingers: dict[str, float], table: float) -> None:
+        loaded = self.loaded
+        expected = sample_object(motion.cooperative, elapsed)
+        error = float(np.linalg.norm(loaded.data.xpos[loaded.object_body] - expected[:3, 3]))
+        self.maximum_object_error = max(self.maximum_object_error, error)
+        actual = self.read_joints()
+        left, right = self.kinematics.forward_world(actual['left'], actual['right'])
+        relative = np.linalg.inv(left) @ right
+        desired = np.linalg.inv(motion.cooperative.object_from_left_tcp) @ motion.cooperative.object_from_right_tcp
+        distance = float(np.linalg.norm(relative[:3, 3] - desired[:3, 3]))
+        angle = float(np.linalg.norm(rotation_error(desired[:3, :3], relative[:3, :3])))
+        tilt = math.acos(min(1., max(-1., float(loaded.data.xmat[loaded.object_body, 8]))))
+        self.maximum_relative_error = max(self.maximum_relative_error, distance)
+        self.maximum_relative_angle = max(self.maximum_relative_angle, angle)
+        self.maximum_object_tilt = max(self.maximum_object_tilt, tilt)
+        placing = (self.state == 'LOWER' and abs(loaded.object_bottom() - self.config.table_z) < .001 and table > .05)
+        lost = not placing and min(fingers.values()) < .01
+        self.contact_loss_time = self.contact_loss_time + self.config.timestep if lost else 0.
+        self.maximum_contact_loss_time = max(self.maximum_contact_loss_time, self.contact_loss_time)
+        if error > .003 or self.contact_loss_time > .05:
+            self.fail('物件误差超过 3 mm，或某个指腹连续失去有效接触超过 50 ms')
+        elif distance > .005 or angle > .03 or tilt > .03:
+            self.fail('TCP 相对位姿或物体倾斜超过演示阈值')
+        if self.state in ('MOVE', 'RETURN'):
+            self.minimum_lift_clearance = min(self.minimum_lift_clearance,
+                                               loaded.object_bottom() - self.config.table_z)
+
+    def step(self) -> None:
+        motion = self.motion
+        if self.finished or motion is None:
+            return
+        data = self.loaded.data
+        now = float(data.time)
+        elapsed = now - self.stage_started
+        active = self.state
+        close, sample_time = 0., 0.
+        paired = motion.approach
+        if active in ('APPROACH', 'APPROACH_SETTLE'):
+            sample_time = elapsed if active == 'APPROACH' else paired.duration
+        elif active in ('CLOSE', 'VERIFY', 'PLACE_SETTLE', 'OPEN', 'OPEN_WAIT'):
+            paired = motion.cooperative.paired
+            sample_time = 0. if active in ('CLOSE', 'VERIFY') else paired.duration
+            close = _smooth(elapsed / 1.5) if active == 'CLOSE' else 1.
+            if active == 'OPEN':
+                close = 1. - _smooth(elapsed)
+            elif active == 'OPEN_WAIT':
+                close = 0.
+        elif active in ('LIFT', 'MOVE', 'RETURN', 'LOWER'):
+            paired = motion.cooperative.paired
+            sample_time = now - self.motion_started
+            leg = min(3, int(np.searchsorted(paired.left.times[[16, 32, 48, 64]], sample_time, side='right')))
+            label = ('LIFT', 'MOVE', 'RETURN', 'LOWER')[leg]
+            if label != self.state:
+                self.enter(label)
+            close = 1.
+        elif active in ('RETREAT', 'RETREAT_SETTLE'):
+            paired = motion.retreat
+            sample_time = elapsed if active == 'RETREAT' else paired.duration
+        elif active in ('RETURN_HOME', 'HOME_SETTLE'):
+            paired = motion.home
+            sample_time = elapsed if active == 'RETURN_HOME' else paired.duration
+        left, lv = sample_position_velocity(paired.left, sample_time)
+        right, rv = sample_position_velocity(paired.right, sample_time)
+        self.loaded.set_arm_targets(left, right, lv, rv)
+        self.loaded.set_grippers(5.65 * close)
+        self.loaded.step()
+        if not np.all(np.isfinite(data.qpos)) or not np.all(np.isfinite(data.qvel)):
             self.fail('仿真状态出现非有限值')
             return
-        fingers, table_force = loaded.contact_forces()
-        if state == 'VERIFY':
+        fingers, table = self.loaded.contact_forces()
+        elapsed = float(data.time) - self.stage_started
+        if self.state == 'SETTLE' and elapsed >= .8:
+            if not self.grounded():
+                self.fail('圆柱尚未在台面稳定落定')
+            else:
+                self.enter('APPROACH')
+        elif self.state == 'APPROACH' and elapsed >= motion.approach.duration:
+            self.enter('APPROACH_SETTLE')
+        elif self.state == 'APPROACH_SETTLE':
+            self.wait_stable(self.converged(motion.approach), 'CLOSE')
+        elif self.state == 'CLOSE' and elapsed >= 1.5:
+            self.enter('VERIFY')
+        elif self.state == 'VERIFY':
             self.verified_time = self.verified_time + self.config.timestep if min(fingers.values()) > .02 else 0.
-            if self.verified_time > .2:
+            if self.verified_time >= .2:
                 self.verified = True
-            if now > 2.68 and not self.verified:
-                self.fail('上下夹爪尚未形成持续四指接触，禁止抬升')
-        if state in ('LIFT', 'MOVE', 'RETURN', 'LOWER'):
+                self.motion_started = float(data.time)
+                self.enter('LIFT')
+            elif elapsed > .8:
+                self.fail('上下夹爪持续接触确认失败，禁止抬升')
+        elif self.state in ('LIFT', 'MOVE', 'RETURN', 'LOWER'):
             if not self.verified:
                 self.fail('夹持未经确认')
                 return
-            expected = sample_object(self.cooperative, motion_time)
-            error = float(np.linalg.norm(loaded.data.xpos[loaded.object_body] - expected[:3, 3]))
-            self.maximum_object_error = max(self.maximum_object_error, error)
-            actual_left, actual_right = self.kinematics.forward_world(
-                loaded.data.qpos[loaded.arms['left'].qpos_indices],
-                loaded.data.qpos[loaded.arms['right'].qpos_indices])
-            desired = np.linalg.inv(self.cooperative.object_from_left_tcp) @ self.cooperative.object_from_right_tcp
-            relative = np.linalg.inv(actual_left) @ actual_right
-            self.maximum_relative_error = max(self.maximum_relative_error,
-                                               float(np.linalg.norm(relative[:3, 3] - desired[:3, 3])))
-            angle = float(np.linalg.norm(rotation_error(desired[:3, :3], relative[:3, :3])))
-            self.maximum_relative_angle = max(self.maximum_relative_angle, angle)
-            cosine = min(1., max(-1., float(loaded.data.xmat[loaded.object_body, 8])))
-            tilt = math.acos(cosine)
-            self.maximum_object_tilt = max(self.maximum_object_tilt, tilt)
-            placing = (state == 'LOWER' and abs(loaded.object_bottom() - self.config.table_z) < .001
-                       and table_force > .05)
-            lost = not placing and min(fingers.values()) < .01
-            self.contact_loss_time = self.contact_loss_time + self.config.timestep if lost else 0.
-            self.maximum_contact_loss_time = max(self.maximum_contact_loss_time, self.contact_loss_time)
-            if error > .003 or self.contact_loss_time > .05:
-                self.fail('物件误差超过 3 mm，或某个指腹连续失去有效接触超过 50 ms')
-            elif self.maximum_relative_error > .005 or angle > .03 or tilt > .03:
-                self.fail('两 TCP 相对位姿或物体倾斜超过演示阈值')
-            if state in ('MOVE', 'RETURN'):
-                self.minimum_lift_clearance = min(self.minimum_lift_clearance,
-                                                   loaded.object_bottom() - self.config.table_z)
+            motion_time = float(data.time) - self.motion_started
+            self.guard_grasp(motion, motion_time, fingers, table)
+            if not self.finished and motion_time >= motion.cooperative.paired.duration:
+                self.enter('PLACE_SETTLE')
+        elif self.state == 'PLACE_SETTLE':
+            self.wait_stable(self.grounded() and self.converged(motion.cooperative.paired), 'OPEN')
+        elif self.state == 'OPEN' and elapsed >= 1.:
+            self.enter('OPEN_WAIT')
+        elif self.state == 'OPEN_WAIT':
+            opened = all(float(np.max(np.abs(data.qpos[indices]))) < .001
+                         for indices in self.loaded.finger_positions.values())
+            # 实际张开、物体落稳且台面已承重后，才允许退开。
+            self.wait_stable(opened and self.grounded() and table > .05, 'RETREAT')
+        elif self.state == 'RETREAT' and elapsed >= motion.retreat.duration:
+            self.enter('RETREAT_SETTLE')
+        elif self.state == 'RETREAT_SETTLE':
+            self.wait_stable(self.converged(motion.retreat), 'RETURN_HOME')
+        elif self.state == 'RETURN_HOME' and elapsed >= motion.home.duration:
+            self.enter('HOME_SETTLE')
+        elif self.state == 'HOME_SETTLE':
+            actual = self.read_joints()
+            self.home_error = {side: float(np.max(np.abs(actual[side] - motion.start_joints[side])))
+                               for side in ('left', 'right')}
+            self.wait_stable(self.converged(motion.home) and self.grounded(), 'COMPLETED', dwell=.3)
+            if self.state == 'COMPLETED':
+                if not self.verified or self.minimum_lift_clearance < self.config.lift_height * .8:
+                    self.fail('抬升验证未通过')
+                else:
+                    self.finished = True
+        if self.state in ('APPROACH', 'APPROACH_SETTLE', 'RETREAT', 'RETREAT_SETTLE', 'RETURN_HOME', 'HOME_SETTLE'):
+            nominal = np.array([0., .4, self.config.center_z], dtype=np.float64)
+            if float(np.linalg.norm(data.xpos[self.loaded.object_body] - nominal)) > .005:
+                self.fail('接近或回程期间物件被扰动超过 5 mm')
 
     def summary(self) -> dict[str, object]:
         return {'state': self.state, 'failure': self.failure, 'config': asdict(self.config),
                 'simulation_time_s': float(self.loaded.data.time), 'stages': self.history,
+                'start_joints_from_feedback_rad': ({side: q.tolist() for side, q in self.motion.start_joints.items()}
+                                                   if self.motion else {}),
+                'final_joints_rad': {side: q.tolist() for side, q in self.read_joints().items()},
+                'home_maximum_joint_error_rad': self.home_error,
                 'maximum_object_position_error_mm': self.maximum_object_error * 1000.,
                 'maximum_relative_tcp_position_error_mm': self.maximum_relative_error * 1000.,
                 'maximum_relative_tcp_rotation_error_rad': self.maximum_relative_angle,
@@ -254,29 +322,37 @@ class DualGraspDemo:
                 'minimum_lift_clearance_mm': (self.minimum_lift_clearance * 1000.
                                               if math.isfinite(self.minimum_lift_clearance) else None),
                 'final_object_center_world_m': self.loaded.data.xpos[self.loaded.object_body].tolist(),
-                'scope': '双臂关节动力学与简化指腹接触；预抓取姿态初始化；未接入 ROS 或实机，未含整臂自碰撞、台面或线缆检查'}
+                'scope': '双臂关节动力学与简化指腹接触；从反馈起点接近、放置后退开并返回；未接 ROS 或实机，未含连续碰撞、自碰撞和线缆检查'}
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--left-urdf')
     parser.add_argument('--right-urdf')
+    parser.add_argument('--left-initial', type=float, nargs=6, help='场景初值，弧度；任务起点仍从反馈读取')
+    parser.add_argument('--right-initial', type=float, nargs=6, help='场景初值，弧度')
     parser.add_argument('--headless', action='store_true', help='不开窗口，自动执行并输出结果')
     parser.add_argument('--output', type=Path, help='可选的 JSON 结果文件')
     args = parser.parse_args()
     try:
-        demo = DualGraspDemo(args.left_urdf, args.right_urdf)
+        demo = DualGraspDemo(args.left_urdf, args.right_urdf,
+            left_initial=None if args.left_initial is None else np.asarray(args.left_initial, dtype=np.float64),
+            right_initial=None if args.right_initial is None else np.asarray(args.right_initial, dtype=np.float64))
         if args.headless:
-            steps = math.ceil((demo.cooperative.paired.duration + 6.) / demo.config.timestep)
-            for _ in range(steps):
-                demo.step()
-                if demo.finished:
-                    break
+            if demo.start() and demo.motion is not None:
+                motion = demo.motion
+                duration = sum(plan.duration for plan in (motion.approach, motion.cooperative.paired, motion.retreat, motion.home))
+                for _ in range(math.ceil((duration + 25.) / demo.config.timestep)):
+                    demo.step()
+                    if demo.finished:
+                        break
+                if not demo.finished:
+                    demo.fail('完整任务总时间超限')
         else:
             viewer_api = cast(ViewerAPI, import_module('mujoco.viewer'))
             keys: list[int] = []
             running = False
-            print('空格键：开始或暂停；R：重置。橙色左臂夹上部，青色右臂夹下部。')
+            print('空格键：读取当前起点并开始，或暂停/继续；R：重置整个场景。')
             with viewer_api.launch_passive(demo.loaded.model, demo.loaded.data,
                                             key_callback=keys.append) as viewer:
                 with viewer.lock():
@@ -288,7 +364,7 @@ def main() -> int:
                     while keys:
                         key = keys.pop(0)
                         if key == 32:
-                            running = not running
+                            running = demo.start() if demo.state == 'READY' else not running
                         elif key in (82, 114):
                             demo.reset()
                             running = False
