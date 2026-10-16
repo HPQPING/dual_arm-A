@@ -1,6 +1,6 @@
 """构建双臂、四个简化指腹和自由圆柱，不修改原来的十二关节模型加载器。
 
-沿用原有 URDF 转换工具。旧 GP80 整体网格仅作可选参考显示，不参与夹取碰撞；
+沿用原有 URDF 转换工具。真实 GP80 整体网格默认用于外观，不参与夹取碰撞；
 夹取使用局部 X 方向开合的简化平行指腹，不代表 GP80 实际连杆或开合轴标定。
 本模型的动力学接触只覆盖圆柱、指腹和台面；整臂碰撞需另行预检。
 """
@@ -144,7 +144,7 @@ class LoadedGrasp:
 def load_grasp_model(
     left_initial: FloatArray, right_initial: FloatArray,
     left_urdf: str | Path | None = None, right_urdf: str | Path | None = None,
-    config: GraspConfig = GraspConfig(), show_original_gripper: bool = False,
+    config: GraspConfig = GraspConfig(), show_original_gripper: bool = True,
 ) -> LoadedGrasp:
     """创建专用抓取场景；左右基座及工具链继续采用已经确定的工程约定。"""
     config.validate()
@@ -187,11 +187,13 @@ def load_grasp_model(
             if tool is None or tip is None:
                 raise ValueError('模型缺少独立 GP80 或 TCP；请使用项目已更新的 Xacro')
             for geom in tool.findall('geom'):
-                geom.set('rgba', '.6 .6 .6 .12' if show_original_gripper else '0 0 0 0')
+                geom.set('rgba', '1 1 1 1' if show_original_gripper else '0 0 0 0')
             ET.SubElement(tool, 'geom', type='cylinder', pos='0 0 .04', size='.025 .04',
-                          rgba='.3 .3 .35 1', contype='0', conaffinity='0', mass='0')
+                          rgba='0 0 0 0' if show_original_gripper else '.3 .3 .35 1',
+                          contype='0', conaffinity='0', mass='0')
             ET.SubElement(tip, 'site', name=side + '_tcp_site', size='.002', rgba='1 0 0 1')
-            color = '1 .5 .1 1' if side == 'left' else '0 .7 1 1'
+            color = ('0 0 0 0' if show_original_gripper else
+                     ('1 .5 .1 1' if side == 'left' else '0 .7 1 1'))
             for label, sign in (('a', -1.), ('b', 1.)):
                 name = side + '_grasp_finger_' + label
                 finger = ET.SubElement(tip, 'body', name=name, pos=_text((sign * .044, 0., 0.)))

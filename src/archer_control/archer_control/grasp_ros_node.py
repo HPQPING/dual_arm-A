@@ -7,18 +7,28 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import ExitStack, nullcontext
+from importlib import import_module
 import json
+import os
 from pathlib import Path
+import sys
+from typing import cast
 
+import numpy as np
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
-from std_msgs.msg import String
+from std_msgs.msg import Float64, String
 from std_srvs.srv import Trigger
+from visualization_msgs.msg import Marker, MarkerArray
 
-from .dual_grasp_scene import DualGraspDemo
+from .simple_grasp_scene import SimpleGraspDemo
+from .grasp_recording import GraspRunRecorder
+from .kinematics import rotation_error
+from archer_mujoco.grasp_scene import Viewer, ViewerAPI
 
 
 def text_message(value: str) -> String:
@@ -31,6 +41,8 @@ class GraspSimulationNode(Node):
     def __init__(self) -> None:
         super().__init__('dual_grasp_sim')
         self.declare_parameter('output_file', '')
+        self.declare_parameter('show_viewer', False)
+        self.declare_parameter('record_dir', str(Path.home() / 'archer_ws/dual_results/grasp'))
         if not self.has_parameter('use_sim_time'):
             self.declare_parameter('use_sim_time', False)
         if self.get_parameter('use_sim_time').value is not False:
@@ -39,7 +51,32 @@ class GraspSimulationNode(Node):
         if not isinstance(output, str):
             raise ValueError('output_file 必须为字符串')
         self.output = Path(output).expanduser() if output else None
-        self.demo = DualGraspDemo()
+        record_dir = self.get_parameter('record_dir').value
+        if not isinstance(record_dir, str):
+            raise ValueError('record_dir 必须为字符串，留空可关闭记录')
+        self.recorder = GraspRunRecorder(Path(record_dir)) if record_dir else None
+        self.recording_error = ''
+        show_viewer = self.get_parameter('show_viewer').value
+        if not isinstance(show_viewer, bool):
+            raise ValueError('show_viewer 必须为布尔值')
+        if show_viewer and sys.platform.startswith('linux') and not os.environ.get('DISPLAY'):
+            raise ValueError('没有可用的 DISPLAY；请在 Ubuntu 桌面终端启动，或设置 show_viewer:=false')
+        self.demo = SimpleGraspDemo()
+        self.resources = ExitStack()
+        self.viewer: Viewer | None = None
+        if show_viewer:
+            api = cast(ViewerAPI, import_module('mujoco.viewer'))
+            try:
+                self.viewer = self.resources.enter_context(api.launch_passive(
+                    self.demo.loaded.model, self.demo.loaded.data, key_callback=lambda key: None))
+                with self.viewer.lock():
+                    self.viewer.cam.lookat[:] = [0., .25, .3]
+                    self.viewer.cam.distance = 1.7
+                    self.viewer.cam.azimuth = 90.
+                    self.viewer.cam.elevation = -15.
+            except Exception:
+                self.resources.close()
+                raise
         self.running = False
         self.stopped = False
         self.planning: Future[bool] | None = None
@@ -49,6 +86,9 @@ class GraspSimulationNode(Node):
                          durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.stage_pub = self.create_publisher(String, '/dual/grasp/stage', qos)
         self.result_pub = self.create_publisher(String, '/dual/grasp/result', qos)
+        self.marker_pub = self.create_publisher(MarkerArray, '/dual/grasp/markers', qos)
+        self.gripper_pub = self.create_publisher(Float64, '/dual/grasp/gripper_command', qos)
+        self.visual_ticks = 0
         self.joint_pubs = {
             side: self.create_publisher(JointState, '/' + side + '/joint_states', 10)
             for side in ('left', 'right')
@@ -62,8 +102,12 @@ class GraspSimulationNode(Node):
         ]
         self.timer = self.create_timer(.01, self.tick)
         self.publish_feedback()
+        self.publish_markers()
         self.publish_stage()
         self.get_logger().info('抓取仿真 READY；调用 /dual/grasp/start 开始，启动节点不会自动运动。')
+        self.get_logger().info('当前为简化抓取演示：夹爪目标 2.0，工件虚拟附着，不验证实际接触力。')
+        self.get_logger().info('起点与归位目标在每次开始时读取当前仿真反馈；到位后左右 J6 目标均为 0 rad。')
+        self.get_logger().info('仿真启动与重置使用用户给定的固定姿态；GP80 保留真实静态外形，暂不播放开合动画。')
 
     def stage(self) -> str:
         if self.stopped:
@@ -77,6 +121,7 @@ class GraspSimulationNode(Node):
     def publish_stage(self) -> None:
         stage = self.stage()
         if stage != self.last_stage:
+            self.record_event(stage)
             self.stage_pub.publish(text_message(stage))
             self.get_logger().info('抓取阶段：' + stage)
             self.last_stage = stage
@@ -86,6 +131,9 @@ class GraspSimulationNode(Node):
         if self.planning is not None:
             return
         stamp = self.get_clock().now().to_msg()
+        command = Float64()
+        command.data = self.demo.gripper_command
+        self.gripper_pub.publish(command)
         for side, arm in self.demo.loaded.arms.items():
             message = JointState()
             message.header.stamp = stamp
@@ -97,6 +145,7 @@ class GraspSimulationNode(Node):
     def publish_result(self) -> None:
         result = self.demo.summary()
         result['ros_stage'] = self.stage()
+        result['recording'] = self.finish_recording(result)
         text = json.dumps(result, ensure_ascii=False, allow_nan=False, indent=2)
         self.result_pub.publish(text_message(text))
         if self.output is not None:
@@ -106,11 +155,94 @@ class GraspSimulationNode(Node):
             except OSError as exc:
                 self.get_logger().error('结果已发布，但文件保存失败：' + str(exc))
 
+    def record_error(self, exc: Exception) -> None:
+        self.recording_error = str(exc)
+        if self.recorder is not None:
+            try:
+                self.recorder.close()
+            except OSError:
+                pass
+        self.get_logger().error('仿真继续执行，但记录失败：' + self.recording_error)
+
+    def record_event(self, stage: str) -> None:
+        if self.recorder is not None and not self.recording_error:
+            try:
+                self.recorder.event(stage)
+            except (OSError, ValueError) as exc:
+                self.record_error(exc)
+
+    def record_sample(self) -> None:
+        if self.recorder is not None and not self.recording_error and self.planning is None:
+            try:
+                self.recorder.sample(self.demo, self.stage())
+            except (OSError, ValueError) as exc:
+                self.record_error(exc)
+
+    def finish_recording(self, result: dict[str, object]) -> dict[str, object]:
+        if self.recorder is None:
+            return {'enabled': False}
+        if not self.recording_error:
+            try:
+                return self.recorder.finish(self.demo, result)
+            except (OSError, ValueError) as exc:
+                self.record_error(exc)
+        return {'enabled': True, 'complete': False, 'error': self.recording_error}
+
+    def publish_markers(self) -> None:
+        """显示实际自由物件和 TCP，绝不使用参考轨迹冒充物件反馈。"""
+        loaded = self.demo.loaded
+        markers: list[Marker] = []
+        stamp = self.get_clock().now().to_msg()
+        for index, name, kind, position, scale, color in (
+            (0, 'object', Marker.CYLINDER, loaded.data.xpos[loaded.object_body],
+             (self.demo.config.object_diameter, self.demo.config.object_diameter, self.demo.config.object_height),
+             (.95, .65, .10, 1.)),
+            (1, 'table', Marker.CUBE, (0., .35, self.demo.config.table_z - .02),
+             (1.3, 1.5, .04), (.35, .45, .45, .45)),
+            (2, 'left_tcp', Marker.SPHERE, loaded.data.site_xpos[loaded.arms['left'].tcp_site_id],
+             (.012, .012, .012), (1., .25, .10, 1.)),
+            (3, 'right_tcp', Marker.SPHERE, loaded.data.site_xpos[loaded.arms['right'].tcp_site_id],
+             (.012, .012, .012), (.10, .70, 1., 1.)),
+        ):
+            marker = Marker()
+            marker.header.frame_id, marker.header.stamp = 'world', stamp
+            marker.ns, marker.id = 'grasp_' + name, index
+            marker.type, marker.action = kind, Marker.ADD
+            marker.pose.position.x, marker.pose.position.y, marker.pose.position.z = map(float, position)
+            marker.pose.orientation.w = 1.
+            if index == 0:
+                matrix = loaded.data.xmat[loaded.object_body].reshape(3, 3)
+                vector = rotation_error(matrix, np.eye(3, dtype=np.float64))
+                angle = float(np.linalg.norm(vector))
+                xyz = np.zeros(3) if angle < 1e-12 else vector * np.sin(angle / 2.) / angle
+                marker.pose.orientation.x = float(xyz[0])
+                marker.pose.orientation.y = float(xyz[1])
+                marker.pose.orientation.z = float(xyz[2])
+                marker.pose.orientation.w = float(np.cos(angle / 2.))
+            marker.scale.x, marker.scale.y, marker.scale.z = scale
+            marker.color.r, marker.color.g, marker.color.b, marker.color.a = color
+            markers.append(marker)
+        message = MarkerArray()
+        message.markers = markers
+        self.marker_pub.publish(message)
+
+    def prepare(self) -> bool:
+        # 查看器和规划器共享模型，规划期间持锁且主线程不执行 sync。
+        with self.viewer.lock() if self.viewer is not None else nullcontext():
+            return self.demo.start()
+
     def on_start(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
         if self.planning is not None or self.stopped or self.demo.state != 'READY':
             response.success, response.message = False, '只允许从 READY 启动；停止或失败后请 reset'
             return response
-        self.planning = self.worker.submit(self.demo.start)
+        self.recording_error = ''
+        if self.recorder is not None:
+            try:
+                self.recorder.begin(self.demo)
+                self.get_logger().info('本轮仿真记录目录：' + str(self.recorder.folder))
+            except (OSError, ValueError, RuntimeError) as exc:
+                self.record_error(exc)
+        self.planning = self.worker.submit(self.prepare)
         response.success, response.message = True, '已接受，正在后台规划；通过 stage/result 查询最终结果'
         self.publish_stage()
         return response
@@ -120,6 +252,7 @@ class GraspSimulationNode(Node):
         response.message = '整个仿真世界已冻结' if response.success else '当前没有正在执行的任务'
         if response.success:
             self.running = False
+        self.record_sample()
         self.publish_stage()
         return response
 
@@ -128,6 +261,7 @@ class GraspSimulationNode(Node):
         response.message = '继续仿真' if response.success else '仅允许从 PAUSED 继续'
         if response.success:
             self.running = True
+        self.record_sample()
         self.publish_stage()
         return response
 
@@ -147,16 +281,26 @@ class GraspSimulationNode(Node):
         if self.planning is not None or self.running:
             response.success, response.message = False, '请先停止，且等待后台规划结束后重置'
             return response
-        self.demo.reset()
+        if self.recorder is not None and self.recorder.active:
+            result = self.demo.summary()
+            result.update({'state': 'INTERRUPTED', 'ros_stage': 'RESET'})
+            self.finish_recording(result)
+        with self.viewer.lock() if self.viewer is not None else nullcontext():
+            self.demo.reset()
         self.stopped = False
         # 清除上一轮锁存结果，防止新订阅者把旧成功结果当成本轮结果。
         self.result_pub.publish(text_message('{}'))
         self.publish_feedback()
+        self.publish_markers()
         self.publish_stage()
         response.success, response.message = True, '整个仿真场景已恢复初值，状态 READY'
         return response
 
     def tick(self) -> None:
+        if self.viewer is not None and not self.viewer.is_running():
+            self.on_stop(Trigger.Request(), Trigger.Response())
+            self.viewer = None
+            self.get_logger().info('查看器已关闭；冻结当前仿真，ROS 节点仍可查询和重置。')
         if self.planning is not None:
             if not self.planning.done():
                 return
@@ -174,23 +318,35 @@ class GraspSimulationNode(Node):
         if self.running:
             try:
                 # 每次最多推进 10 ms；调度变慢时仿真变慢，不补跑大段时间。
-                for _ in range(round(.01 / self.demo.config.timestep)):
-                    self.demo.step()
-                    if self.demo.finished:
-                        break
+                with self.viewer.lock() if self.viewer is not None else nullcontext():
+                    for _ in range(round(.01 / self.demo.config.timestep)):
+                        self.demo.step()
+                        if self.demo.finished:
+                            break
             except Exception as exc:
                 self.demo.fail('仿真执行异常：' + str(exc))
             if self.demo.finished:
                 self.running = False
                 self.publish_result()
         self.publish_feedback()
+        self.record_sample()
+        self.visual_ticks += 1
+        if self.visual_ticks % 5 == 0:
+            self.publish_markers()
         self.publish_stage()
+        if self.viewer is not None:
+            self.viewer.sync()
 
     def close(self) -> None:
         self.running = False
         self.timer.cancel()
         # 等待后台只读规划结束后再销毁模型和 ROS 节点。
         self.worker.shutdown(wait=True, cancel_futures=True)
+        if self.recorder is not None and self.recorder.active:
+            result = self.demo.summary()
+            result.update({'state': 'INTERRUPTED', 'ros_stage': 'NODE_CLOSED'})
+            self.finish_recording(result)
+        self.resources.close()
 
 
 def main(args: list[str] | None = None) -> None:
