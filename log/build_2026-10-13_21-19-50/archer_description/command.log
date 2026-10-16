@@ -1,4 +1,0 @@
-Invoking command in '/home/user/archer_ws/build/archer_description': CMAKE_PREFIX_PATH=/opt/ros/humble /home/user/.local/bin/cmake --build /home/user/archer_ws/build/archer_description -- -j18 -l18
-Invoked command in '/home/user/archer_ws/build/archer_description' returned '0': CMAKE_PREFIX_PATH=/opt/ros/humble /home/user/.local/bin/cmake --build /home/user/archer_ws/build/archer_description -- -j18 -l18
-Invoking command in '/home/user/archer_ws/build/archer_description': CMAKE_PREFIX_PATH=/opt/ros/humble /home/user/.local/bin/cmake --install /home/user/archer_ws/build/archer_description
-Invoked command in '/home/user/archer_ws/build/archer_description' returned '0': CMAKE_PREFIX_PATH=/opt/ros/humble /home/user/.local/bin/cmake --install /home/user/archer_ws/build/archer_description

@@ -1,6 +1,0 @@
-Invoking command in '/home/user/archer_ws/build/archer_bringup': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/opt/ros/humble /home/user/.local/bin/cmake /home/user/archer_ws/src/archer_bringup -DCMAKE_INSTALL_PREFIX=/home/user/archer_ws/install/archer_bringup
-Invoked command in '/home/user/archer_ws/build/archer_bringup' returned '0': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/opt/ros/humble /home/user/.local/bin/cmake /home/user/archer_ws/src/archer_bringup -DCMAKE_INSTALL_PREFIX=/home/user/archer_ws/install/archer_bringup
-Invoking command in '/home/user/archer_ws/build/archer_bringup': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/opt/ros/humble /home/user/.local/bin/cmake --build /home/user/archer_ws/build/archer_bringup -- -j18 -l18
-Invoked command in '/home/user/archer_ws/build/archer_bringup' returned '0': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/opt/ros/humble /home/user/.local/bin/cmake --build /home/user/archer_ws/build/archer_bringup -- -j18 -l18
-Invoking command in '/home/user/archer_ws/build/archer_bringup': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/opt/ros/humble /home/user/.local/bin/cmake --install /home/user/archer_ws/build/archer_bringup
-Invoked command in '/home/user/archer_ws/build/archer_bringup' returned '0': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/opt/ros/humble /home/user/.local/bin/cmake --install /home/user/archer_ws/build/archer_bringup

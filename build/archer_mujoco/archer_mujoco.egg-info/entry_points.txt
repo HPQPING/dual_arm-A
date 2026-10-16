@@ -1,3 +1,0 @@
-[console_scripts]
-gripper_markers = archer_mujoco.gripper_markers:main
-single_arm_sim = archer_mujoco.sim_node:main
