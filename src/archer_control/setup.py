@@ -32,6 +32,7 @@ setup(
     entry_points={
         'console_scripts': [
             'single_arm_task = archer_control.single_arm_node:main',
+            'dual_grasp_scene = archer_control.dual_grasp_scene:main',
         ],
     },
 )
