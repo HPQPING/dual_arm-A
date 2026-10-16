@@ -1,0 +1,103 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!--
+    GP80 固定外形模型。
+
+    mount_xyz / mount_rpy：
+      夹爪模型相对法兰参考坐标的安装变换。
+
+    tcp_xyz：
+      TCP 相对夹爪模型原点的位置。
+      默认 147 mm 为仿真候选值，待显示检查和实物核对。
+
+    show_tcp：
+      是否显示 TCP 红色标记。
+      关闭标记不会删除 TCP 坐标系。
+
+    长度单位：米；角度单位：弧度。
+  -->
+
+  <xacro:macro name="gp80"
+               params="prefix parent
+                       mount_xyz:='0 0 0'
+                       mount_rpy:='0 0 0'
+                       tcp_xyz:='0 0 0.147021696'
+                       show_tcp:=true">
+
+    <link name="${prefix}gp80_base_link">
+      <inertial>
+        <origin
+          xyz="0.00003207 0.00004116 0.04297674"
+          rpy="0 0 0"/>
+
+        <mass value="0.530"/>
+
+        <inertia
+          ixx="0.00043292"
+          ixy="0.00000309"
+          ixz="0.00000052"
+          iyy="0.00038073"
+          iyz="0.00000073"
+          izz="0.00025998"/>
+      </inertial>
+
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+
+        <geometry>
+          <mesh
+            filename="package://archer_description/meshes/gp80/base_link.STL"/>
+        </geometry>
+
+        <material name="${prefix}gp80_material">
+          <color rgba="1 1 1 1"/>
+        </material>
+      </visual>
+
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+
+        <geometry>
+          <mesh
+            filename="package://archer_description/meshes/gp80/base_link.STL"/>
+        </geometry>
+      </collision>
+    </link>
+
+    <joint name="${prefix}gp80_mount_joint" type="fixed">
+      <parent link="${parent}"/>
+      <child link="${prefix}gp80_base_link"/>
+      <origin xyz="${mount_xyz}" rpy="${mount_rpy}"/>
+    </joint>
+
+    <!--
+      TCP 是工具参考坐标，不是一个额外的物理零件。
+      红球仅用于显示，不添加质量或碰撞几何。
+      TCP 坐标轴暂与夹爪模型坐标轴同向。
+    -->
+    <link name="${prefix}tcp">
+      <xacro:if value="${show_tcp}">
+        <visual>
+          <origin xyz="0 0 0" rpy="0 0 0"/>
+
+          <geometry>
+            <sphere radius="0.004"/>
+          </geometry>
+
+          <material name="${prefix}tcp_marker_material">
+            <color rgba="1 0 0 1"/>
+          </material>
+        </visual>
+      </xacro:if>
+    </link>
+
+    <joint name="${prefix}gp80_to_tcp" type="fixed">
+      <parent link="${prefix}gp80_base_link"/>
+      <child link="${prefix}tcp"/>
+      <origin xyz="${tcp_xyz}" rpy="0 0 0"/>
+    </joint>
+
+  </xacro:macro>
+
+</robot>

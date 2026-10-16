@@ -1,0 +1,6 @@
+source;share/archer_mujoco/hook/pythonpath.ps1
+source;share/archer_mujoco/hook/pythonpath.dsv
+source;share/archer_mujoco/hook/pythonpath.sh
+source;share/archer_mujoco/hook/ament_prefix_path.ps1
+source;share/archer_mujoco/hook/ament_prefix_path.dsv
+source;share/archer_mujoco/hook/ament_prefix_path.sh

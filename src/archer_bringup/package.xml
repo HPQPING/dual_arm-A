@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>archer_bringup</name>
+  <version>0.1.0</version>
+  <description>Launch files and configuration for Archer-Y6 display and MuJoCo simulation.</description>
+
+  <maintainer email="user@example.com">user</maintainer>
+  <license>TODO</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>archer_description</exec_depend>
+  <exec_depend>archer_control</exec_depend>
+  <exec_depend>archer_mujoco</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>joint_state_publisher_gui</exec_depend>
+  <exec_depend>joint_state_publisher</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

@@ -1,0 +1,41 @@
+running egg_info
+writing ../../build/archer_control/archer_control.egg-info/PKG-INFO
+writing dependency_links to ../../build/archer_control/archer_control.egg-info/dependency_links.txt
+writing entry points to ../../build/archer_control/archer_control.egg-info/entry_points.txt
+writing requirements to ../../build/archer_control/archer_control.egg-info/requires.txt
+writing top-level names to ../../build/archer_control/archer_control.egg-info/top_level.txt
+reading manifest file '../../build/archer_control/archer_control.egg-info/SOURCES.txt'
+writing manifest file '../../build/archer_control/archer_control.egg-info/SOURCES.txt'
+running build
+running build_py
+copying archer_control/check_circle.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+copying archer_control/kinematics.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+copying archer_control/check_cooperative.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+copying archer_control/circle_planner.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+copying archer_control/trajectory.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+copying archer_control/dual_arm_node.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+copying archer_control/__init__.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+copying archer_control/check_kinematics.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+copying archer_control/circle_visuals.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+copying archer_control/cooperative_planner.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+copying archer_control/dual_trace_node.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+copying archer_control/circle_sim.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+copying archer_control/dual_arm_trajectory.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+copying archer_control/check_dual_plan.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+copying archer_control/single_arm_node.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+running install
+running install_lib
+copying /home/user/archer_ws/build/archer_control/build/lib/archer_control/dual_arm_node.py -> /home/user/archer_ws/install/archer_control/lib/python3.10/site-packages/archer_control
+byte-compiling /home/user/archer_ws/install/archer_control/lib/python3.10/site-packages/archer_control/dual_arm_node.py to dual_arm_node.cpython-310.pyc
+running install_data
+copying resource/archer_control -> /home/user/archer_ws/install/archer_control/share/ament_index/resource_index/packages
+copying package.xml -> /home/user/archer_ws/install/archer_control/share/archer_control
+copying config/right_arm.yaml -> /home/user/archer_ws/install/archer_control/share/archer_control/config
+copying config/tasks.yaml -> /home/user/archer_ws/install/archer_control/share/archer_control/config
+copying config/left_arm.yaml -> /home/user/archer_ws/install/archer_control/share/archer_control/config
+running install_egg_info
+removing '/home/user/archer_ws/install/archer_control/lib/python3.10/site-packages/archer_control-0.1.0-py3.10.egg-info' (and everything under it)
+Copying ../../build/archer_control/archer_control.egg-info to /home/user/archer_ws/install/archer_control/lib/python3.10/site-packages/archer_control-0.1.0-py3.10.egg-info
+running install_scripts
+Installing single_arm_task script to /home/user/archer_ws/install/archer_control/lib/archer_control
+writing list of installed files to '/home/user/archer_ws/build/archer_control/install.log'

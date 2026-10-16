@@ -1,0 +1,24 @@
+[0.560s] Invoking command in '/home/user/archer_ws/src/archer_hardware': PYTHONPATH=/home/user/archer_ws/build/archer_hardware/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/user/archer_ws/install/archer_hardware/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/archer_hardware build --build-base /home/user/archer_ws/build/archer_hardware/build install --record /home/user/archer_ws/build/archer_hardware/install.log --install-scripts $base/lib/archer_hardware --single-version-externally-managed install_data
+[0.716s] running egg_info
+[0.727s] writing ../../build/archer_hardware/archer_hardware.egg-info/PKG-INFO
+[0.727s] writing dependency_links to ../../build/archer_hardware/archer_hardware.egg-info/dependency_links.txt
+[0.727s] writing requirements to ../../build/archer_hardware/archer_hardware.egg-info/requires.txt
+[0.727s] writing top-level names to ../../build/archer_hardware/archer_hardware.egg-info/top_level.txt
+[0.746s] reading manifest file '../../build/archer_hardware/archer_hardware.egg-info/SOURCES.txt'
+[0.746s] writing manifest file '../../build/archer_hardware/archer_hardware.egg-info/SOURCES.txt'
+[0.747s] running build
+[0.747s] running build_py
+[0.747s] copying archer_hardware/hex_adapter.py -> /home/user/archer_ws/build/archer_hardware/build/lib/archer_hardware
+[0.747s] copying archer_hardware/__init__.py -> /home/user/archer_ws/build/archer_hardware/build/lib/archer_hardware
+[0.747s] copying archer_hardware/driver_node.py -> /home/user/archer_ws/build/archer_hardware/build/lib/archer_hardware
+[0.747s] running install
+[0.750s] running install_lib
+[0.759s] running install_data
+[0.761s] copying resource/archer_hardware -> /home/user/archer_ws/install/archer_hardware/share/ament_index/resource_index/packages
+[0.761s] copying package.xml -> /home/user/archer_ws/install/archer_hardware/share/archer_hardware
+[0.761s] running install_egg_info
+[0.769s] removing '/home/user/archer_ws/install/archer_hardware/lib/python3.10/site-packages/archer_hardware-0.0.0-py3.10.egg-info' (and everything under it)
+[0.769s] Copying ../../build/archer_hardware/archer_hardware.egg-info to /home/user/archer_ws/install/archer_hardware/lib/python3.10/site-packages/archer_hardware-0.0.0-py3.10.egg-info
+[0.769s] running install_scripts
+[0.790s] writing list of installed files to '/home/user/archer_ws/build/archer_hardware/install.log'
+[0.830s] Invoked command in '/home/user/archer_ws/src/archer_hardware' returned '0': PYTHONPATH=/home/user/archer_ws/build/archer_hardware/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/user/archer_ws/install/archer_hardware/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/archer_hardware build --build-base /home/user/archer_ws/build/archer_hardware/build install --record /home/user/archer_ws/build/archer_hardware/install.log --install-scripts $base/lib/archer_hardware --single-version-externally-managed install_data

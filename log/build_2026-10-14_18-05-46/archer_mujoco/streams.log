@@ -1,0 +1,46 @@
+[0.621s] Invoking command in '/home/user/archer_ws/src/archer_mujoco': CMAKE_PREFIX_PATH=/home/user/archer_ws/install/archer_description:/home/user/archer_ws/install/archer_bringup PYTHONPATH=/home/user/archer_ws/build/archer_mujoco/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/user/archer_ws/install/archer_mujoco/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/archer_mujoco build --build-base /home/user/archer_ws/build/archer_mujoco/build install --record /home/user/archer_ws/build/archer_mujoco/install.log --install-scripts $base/lib/archer_mujoco --single-version-externally-managed install_data
+[0.786s] running egg_info
+[0.795s] writing ../../build/archer_mujoco/archer_mujoco.egg-info/PKG-INFO
+[0.795s] writing dependency_links to ../../build/archer_mujoco/archer_mujoco.egg-info/dependency_links.txt
+[0.796s] writing entry points to ../../build/archer_mujoco/archer_mujoco.egg-info/entry_points.txt
+[0.796s] writing requirements to ../../build/archer_mujoco/archer_mujoco.egg-info/requires.txt
+[0.796s] writing top-level names to ../../build/archer_mujoco/archer_mujoco.egg-info/top_level.txt
+[0.819s] reading manifest file '../../build/archer_mujoco/archer_mujoco.egg-info/SOURCES.txt'
+[0.819s] writing manifest file '../../build/archer_mujoco/archer_mujoco.egg-info/SOURCES.txt'
+[0.819s] running build
+[0.819s] running build_py
+[0.819s] copying archer_mujoco/model_loader.py -> /home/user/archer_ws/build/archer_mujoco/build/lib/archer_mujoco
+[0.819s] copying archer_mujoco/pose_check.py -> /home/user/archer_ws/build/archer_mujoco/build/lib/archer_mujoco
+[0.819s] copying archer_mujoco/dual_model_loader.py -> /home/user/archer_ws/build/archer_mujoco/build/lib/archer_mujoco
+[0.819s] copying archer_mujoco/__init__.py -> /home/user/archer_ws/build/archer_mujoco/build/lib/archer_mujoco
+[0.819s] copying archer_mujoco/gripper_markers.py -> /home/user/archer_ws/build/archer_mujoco/build/lib/archer_mujoco
+[0.819s] copying archer_mujoco/sim_node.py -> /home/user/archer_ws/build/archer_mujoco/build/lib/archer_mujoco
+[0.819s] copying archer_mujoco/dual_sim_node.py -> /home/user/archer_ws/build/archer_mujoco/build/lib/archer_mujoco
+[0.820s] running install
+[0.821s] running install_lib
+[0.831s] copying /home/user/archer_ws/build/archer_mujoco/build/lib/archer_mujoco/model_loader.py -> /home/user/archer_ws/install/archer_mujoco/lib/python3.10/site-packages/archer_mujoco
+[0.831s] copying /home/user/archer_ws/build/archer_mujoco/build/lib/archer_mujoco/pose_check.py -> /home/user/archer_ws/install/archer_mujoco/lib/python3.10/site-packages/archer_mujoco
+[0.831s] copying /home/user/archer_ws/build/archer_mujoco/build/lib/archer_mujoco/dual_model_loader.py -> /home/user/archer_ws/install/archer_mujoco/lib/python3.10/site-packages/archer_mujoco
+[0.831s] copying /home/user/archer_ws/build/archer_mujoco/build/lib/archer_mujoco/sim_node.py -> /home/user/archer_ws/install/archer_mujoco/lib/python3.10/site-packages/archer_mujoco
+[0.831s] copying /home/user/archer_ws/build/archer_mujoco/build/lib/archer_mujoco/dual_sim_node.py -> /home/user/archer_ws/install/archer_mujoco/lib/python3.10/site-packages/archer_mujoco
+[0.831s] byte-compiling /home/user/archer_ws/install/archer_mujoco/lib/python3.10/site-packages/archer_mujoco/model_loader.py to model_loader.cpython-310.pyc
+[0.834s] byte-compiling /home/user/archer_ws/install/archer_mujoco/lib/python3.10/site-packages/archer_mujoco/pose_check.py to pose_check.cpython-310.pyc
+[0.835s] byte-compiling /home/user/archer_ws/install/archer_mujoco/lib/python3.10/site-packages/archer_mujoco/dual_model_loader.py to dual_model_loader.cpython-310.pyc
+[0.836s] byte-compiling /home/user/archer_ws/install/archer_mujoco/lib/python3.10/site-packages/archer_mujoco/sim_node.py to sim_node.cpython-310.pyc
+[0.838s] byte-compiling /home/user/archer_ws/install/archer_mujoco/lib/python3.10/site-packages/archer_mujoco/dual_sim_node.py to dual_sim_node.cpython-310.pyc
+[0.838s] running install_data
+[0.838s] copying resource/archer_mujoco -> /home/user/archer_ws/install/archer_mujoco/share/ament_index/resource_index/packages
+[0.838s] copying package.xml -> /home/user/archer_ws/install/archer_mujoco/share/archer_mujoco
+[0.839s] copying config/simulation.yaml -> /home/user/archer_ws/install/archer_mujoco/share/archer_mujoco/config
+[0.839s] copying models/archer_arm.xml -> /home/user/archer_ws/install/archer_mujoco/share/archer_mujoco/models
+[0.839s] copying models/scene_dual.xml -> /home/user/archer_ws/install/archer_mujoco/share/archer_mujoco/models
+[0.839s] copying models/scene_left.xml -> /home/user/archer_ws/install/archer_mujoco/share/archer_mujoco/models
+[0.839s] copying models/scene_right.xml -> /home/user/archer_ws/install/archer_mujoco/share/archer_mujoco/models
+[0.839s] running install_egg_info
+[0.850s] removing '/home/user/archer_ws/install/archer_mujoco/lib/python3.10/site-packages/archer_mujoco-0.1.0-py3.10.egg-info' (and everything under it)
+[0.850s] Copying ../../build/archer_mujoco/archer_mujoco.egg-info to /home/user/archer_ws/install/archer_mujoco/lib/python3.10/site-packages/archer_mujoco-0.1.0-py3.10.egg-info
+[0.851s] running install_scripts
+[0.870s] Installing gripper_markers script to /home/user/archer_ws/install/archer_mujoco/lib/archer_mujoco
+[0.870s] Installing single_arm_sim script to /home/user/archer_ws/install/archer_mujoco/lib/archer_mujoco
+[0.870s] writing list of installed files to '/home/user/archer_ws/build/archer_mujoco/install.log'
+[0.888s] Invoked command in '/home/user/archer_ws/src/archer_mujoco' returned '0': CMAKE_PREFIX_PATH=/home/user/archer_ws/install/archer_description:/home/user/archer_ws/install/archer_bringup PYTHONPATH=/home/user/archer_ws/build/archer_mujoco/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/user/archer_ws/install/archer_mujoco/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/archer_mujoco build --build-base /home/user/archer_ws/build/archer_mujoco/build install --record /home/user/archer_ws/build/archer_mujoco/install.log --install-scripts $base/lib/archer_mujoco --single-version-externally-managed install_data

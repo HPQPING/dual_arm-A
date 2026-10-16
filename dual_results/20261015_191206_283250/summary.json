@@ -1,0 +1,21 @@
+{
+  "task_state": "COMPLETED",
+  "start_stamp_ns": 1792062729278086518,
+  "records": {
+    "left": 2431,
+    "right": 2419
+  },
+  "arc_records": {
+    "left": 1747,
+    "right": 1755
+  },
+  "maximum_tracking_error_mm": {
+    "left": 12.451332907589231,
+    "right": 21.103008133835257
+  },
+  "maximum_distance_to_circle_mm": {
+    "left": 0.9476551462956043,
+    "right": 0.8111852126962449
+  },
+  "source": "实际 TCP 由 ROS 关节反馈和模型正运动学计算，不是实机外部测量"
+}

@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/user/archer_ws/build/archer_bringup/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

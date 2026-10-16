@@ -1,0 +1,95 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Enabled: true
+  Name: root
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: world
+    Frame Rate: 30
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: 地面网格
+      Enabled: true
+      Alpha: 0.4
+      Cell Size: 0.1
+      Plane: XY
+      Plane Cell Count: 20
+      Reference Frame: world
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+    - Class: rviz_default_plugins/RobotModel
+      Name: 双臂模型
+      Enabled: true
+      Alpha: 1
+      Visual Enabled: true
+      Collision Enabled: false
+      Description Source: Topic
+      Description Topic:
+        Value: /robot_description
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      TF Prefix: ""
+      Update Interval: 0
+    - Class: rviz_default_plugins/MarkerArray
+      Name: 参考圆与实际轨迹
+      Enabled: true
+      Topic:
+        Value: /dual/tcp_markers
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      Queue Size: 10
+    - Class: rviz_default_plugins/TF
+      Name: 基座法兰与TCP坐标
+      Enabled: true
+      Frame Timeout: 5
+      Marker Scale: 0.15
+      Show Arrows: true
+      Show Axes: true
+      Show Names: true
+      Frames:
+        All Enabled: false
+        world:
+          Value: true
+        left_base_link:
+          Value: true
+        right_base_link:
+          Value: true
+        left_flange:
+          Value: true
+        right_flange:
+          Value: true
+        left_tcp:
+          Value: true
+        right_tcp:
+          Value: true
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Target Frame: world
+      Distance: 1.8
+      Pitch: 0.3
+      Yaw: 1.57079632679
+      Focal Point:
+        X: 0
+        Y: 0.18
+        Z: 0.30
+      Near Clip Distance: 0.01
+Window Geometry:
+  Width: 1280
+  Height: 850

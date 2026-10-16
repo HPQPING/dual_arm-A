@@ -1,0 +1,2 @@
+[console_scripts]
+single_arm_task = archer_control.single_arm_node:main

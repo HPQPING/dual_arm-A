@@ -1,0 +1,37 @@
+[0.011s] Invoking command in '/home/user/archer_ws/build/archer_description': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/home/user/archer_ws/install/archer_mujoco:/home/user/archer_ws/install/archer_hardware:/home/user/archer_ws/install/archer_control:/opt/ros/humble /home/user/.local/bin/cmake --build /home/user/archer_ws/build/archer_description -- -j18 -l18
+[0.286s] Invoked command in '/home/user/archer_ws/build/archer_description' returned '0': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/home/user/archer_ws/install/archer_mujoco:/home/user/archer_ws/install/archer_hardware:/home/user/archer_ws/install/archer_control:/opt/ros/humble /home/user/.local/bin/cmake --build /home/user/archer_ws/build/archer_description -- -j18 -l18
+[0.346s] Invoking command in '/home/user/archer_ws/build/archer_description': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/home/user/archer_ws/install/archer_mujoco:/home/user/archer_ws/install/archer_hardware:/home/user/archer_ws/install/archer_control:/opt/ros/humble /home/user/.local/bin/cmake --install /home/user/archer_ws/build/archer_description
+[0.402s] -- Install configuration: ""
+[0.402s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/urdf
+[0.402s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/urdf/archer_arm.xacro
+[0.402s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/urdf/dual_arm.xacro
+[0.402s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/urdf/gp80.xacro
+[0.402s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/urdf/single_arm.xacro
+[0.402s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/meshes
+[0.402s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/meshes/link_1.STL
+[0.402s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/meshes/link_3.STL
+[0.402s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/meshes/link_2.STL
+[0.402s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/meshes/link_5.STL
+[0.402s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/meshes/link_6.STL
+[0.402s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/meshes/gp80
+[0.403s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/meshes/gp80/base_link.STL
+[0.403s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/meshes/base_link.STL
+[0.403s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/meshes/link_4.STL
+[0.403s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/rviz
+[0.403s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/rviz/archer.rviz
+[0.403s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/ament_index/resource_index/package_run_dependencies/archer_description
+[0.403s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/ament_index/resource_index/parent_prefix_path/archer_description
+[0.403s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/environment/ament_prefix_path.sh
+[0.403s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/environment/ament_prefix_path.dsv
+[0.403s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/environment/path.sh
+[0.403s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/environment/path.dsv
+[0.403s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/local_setup.bash
+[0.403s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/local_setup.sh
+[0.403s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/local_setup.zsh
+[0.403s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/local_setup.dsv
+[0.403s] -- Installing: /home/user/archer_ws/install/archer_description/share/archer_description/package.dsv
+[0.403s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/ament_index/resource_index/packages/archer_description
+[0.403s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/cmake/archer_descriptionConfig.cmake
+[0.403s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/cmake/archer_descriptionConfig-version.cmake
+[0.403s] -- Up-to-date: /home/user/archer_ws/install/archer_description/share/archer_description/package.xml
+[0.405s] Invoked command in '/home/user/archer_ws/build/archer_description' returned '0': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/home/user/archer_ws/install/archer_mujoco:/home/user/archer_ws/install/archer_hardware:/home/user/archer_ws/install/archer_control:/opt/ros/humble /home/user/.local/bin/cmake --install /home/user/archer_ws/build/archer_description

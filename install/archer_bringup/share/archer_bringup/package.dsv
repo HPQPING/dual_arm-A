@@ -1,0 +1,8 @@
+source;share/archer_bringup/hook/cmake_prefix_path.ps1
+source;share/archer_bringup/hook/cmake_prefix_path.dsv
+source;share/archer_bringup/hook/cmake_prefix_path.sh
+source;share/archer_bringup/local_setup.bash
+source;share/archer_bringup/local_setup.dsv
+source;share/archer_bringup/local_setup.ps1
+source;share/archer_bringup/local_setup.sh
+source;share/archer_bringup/local_setup.zsh

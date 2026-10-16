@@ -1,0 +1,6 @@
+{
+    "python.analysis.extraPaths": [
+        "./src/archer_mujoco",
+        "./src/archer_control"
+    ]
+}

@@ -1,0 +1,43 @@
+[0.561s] Invoking command in '/home/user/archer_ws/src/archer_control': AMENT_PREFIX_PATH=/home/user/archer_ws/install/archer_description:${AMENT_PREFIX_PATH} CMAKE_PREFIX_PATH=/home/user/archer_ws/install/archer_description PYTHONPATH=/home/user/archer_ws/build/archer_control/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/user/archer_ws/install/archer_control/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/archer_control build --build-base /home/user/archer_ws/build/archer_control/build install --record /home/user/archer_ws/build/archer_control/install.log --install-scripts $base/lib/archer_control --single-version-externally-managed install_data
+[0.712s] running egg_info
+[0.722s] writing ../../build/archer_control/archer_control.egg-info/PKG-INFO
+[0.722s] writing dependency_links to ../../build/archer_control/archer_control.egg-info/dependency_links.txt
+[0.722s] writing entry points to ../../build/archer_control/archer_control.egg-info/entry_points.txt
+[0.722s] writing requirements to ../../build/archer_control/archer_control.egg-info/requires.txt
+[0.722s] writing top-level names to ../../build/archer_control/archer_control.egg-info/top_level.txt
+[0.742s] reading manifest file '../../build/archer_control/archer_control.egg-info/SOURCES.txt'
+[0.743s] writing manifest file '../../build/archer_control/archer_control.egg-info/SOURCES.txt'
+[0.743s] running build
+[0.743s] running build_py
+[0.743s] copying archer_control/check_circle.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+[0.743s] copying archer_control/kinematics.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+[0.743s] copying archer_control/circle_planner.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+[0.744s] copying archer_control/trajectory.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+[0.744s] copying archer_control/dual_arm_node.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+[0.744s] copying archer_control/__init__.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+[0.744s] copying archer_control/check_kinematics.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+[0.744s] copying archer_control/circle_visuals.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+[0.744s] copying archer_control/dual_trace_node.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+[0.744s] copying archer_control/circle_sim.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+[0.744s] copying archer_control/dual_arm_trajectory.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+[0.744s] copying archer_control/check_dual_plan.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+[0.744s] copying archer_control/single_arm_node.py -> /home/user/archer_ws/build/archer_control/build/lib/archer_control
+[0.745s] running install
+[0.747s] running install_lib
+[0.757s] copying /home/user/archer_ws/build/archer_control/build/lib/archer_control/dual_arm_node.py -> /home/user/archer_ws/install/archer_control/lib/python3.10/site-packages/archer_control
+[0.757s] copying /home/user/archer_ws/build/archer_control/build/lib/archer_control/dual_trace_node.py -> /home/user/archer_ws/install/archer_control/lib/python3.10/site-packages/archer_control
+[0.757s] byte-compiling /home/user/archer_ws/install/archer_control/lib/python3.10/site-packages/archer_control/dual_arm_node.py to dual_arm_node.cpython-310.pyc
+[0.760s] byte-compiling /home/user/archer_ws/install/archer_control/lib/python3.10/site-packages/archer_control/dual_trace_node.py to dual_trace_node.cpython-310.pyc
+[0.762s] running install_data
+[0.762s] copying resource/archer_control -> /home/user/archer_ws/install/archer_control/share/ament_index/resource_index/packages
+[0.762s] copying package.xml -> /home/user/archer_ws/install/archer_control/share/archer_control
+[0.762s] copying config/right_arm.yaml -> /home/user/archer_ws/install/archer_control/share/archer_control/config
+[0.762s] copying config/tasks.yaml -> /home/user/archer_ws/install/archer_control/share/archer_control/config
+[0.762s] copying config/left_arm.yaml -> /home/user/archer_ws/install/archer_control/share/archer_control/config
+[0.762s] running install_egg_info
+[0.772s] removing '/home/user/archer_ws/install/archer_control/lib/python3.10/site-packages/archer_control-0.1.0-py3.10.egg-info' (and everything under it)
+[0.772s] Copying ../../build/archer_control/archer_control.egg-info to /home/user/archer_ws/install/archer_control/lib/python3.10/site-packages/archer_control-0.1.0-py3.10.egg-info
+[0.773s] running install_scripts
+[0.792s] Installing single_arm_task script to /home/user/archer_ws/install/archer_control/lib/archer_control
+[0.793s] writing list of installed files to '/home/user/archer_ws/build/archer_control/install.log'
+[0.810s] Invoked command in '/home/user/archer_ws/src/archer_control' returned '0': AMENT_PREFIX_PATH=/home/user/archer_ws/install/archer_description:${AMENT_PREFIX_PATH} CMAKE_PREFIX_PATH=/home/user/archer_ws/install/archer_description PYTHONPATH=/home/user/archer_ws/build/archer_control/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/user/archer_ws/install/archer_control/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/archer_control build --build-base /home/user/archer_ws/build/archer_control/build install --record /home/user/archer_ws/build/archer_control/install.log --install-scripts $base/lib/archer_control --single-version-externally-managed install_data

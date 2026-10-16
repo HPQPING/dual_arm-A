@@ -1,0 +1,22 @@
+running egg_info
+writing ../../build/archer_hardware/archer_hardware.egg-info/PKG-INFO
+writing dependency_links to ../../build/archer_hardware/archer_hardware.egg-info/dependency_links.txt
+writing requirements to ../../build/archer_hardware/archer_hardware.egg-info/requires.txt
+writing top-level names to ../../build/archer_hardware/archer_hardware.egg-info/top_level.txt
+reading manifest file '../../build/archer_hardware/archer_hardware.egg-info/SOURCES.txt'
+writing manifest file '../../build/archer_hardware/archer_hardware.egg-info/SOURCES.txt'
+running build
+running build_py
+copying archer_hardware/hex_adapter.py -> /home/user/archer_ws/build/archer_hardware/build/lib/archer_hardware
+copying archer_hardware/__init__.py -> /home/user/archer_ws/build/archer_hardware/build/lib/archer_hardware
+copying archer_hardware/driver_node.py -> /home/user/archer_ws/build/archer_hardware/build/lib/archer_hardware
+running install
+running install_lib
+running install_data
+copying resource/archer_hardware -> /home/user/archer_ws/install/archer_hardware/share/ament_index/resource_index/packages
+copying package.xml -> /home/user/archer_ws/install/archer_hardware/share/archer_hardware
+running install_egg_info
+removing '/home/user/archer_ws/install/archer_hardware/lib/python3.10/site-packages/archer_hardware-0.0.0-py3.10.egg-info' (and everything under it)
+Copying ../../build/archer_hardware/archer_hardware.egg-info to /home/user/archer_ws/install/archer_hardware/lib/python3.10/site-packages/archer_hardware-0.0.0-py3.10.egg-info
+running install_scripts
+writing list of installed files to '/home/user/archer_ws/build/archer_hardware/install.log'

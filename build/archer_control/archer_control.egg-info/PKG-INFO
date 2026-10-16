@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: archer_control
+Version: 0.1.0
+Summary: Trajectory planning and task execution for Archer-Y6 arms.
+Maintainer: user
+Maintainer-email: user@example.com
+License: TODO
+Requires-Dist: setuptools
+Dynamic: license
+Dynamic: maintainer
+Dynamic: maintainer-email
+Dynamic: requires-dist
+Dynamic: summary
