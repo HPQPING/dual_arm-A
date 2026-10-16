@@ -67,8 +67,14 @@ setup(
 
     entry_points={
         'console_scripts': [
-            'single_arm_sim = archer_mujoco.sim_node:main',
+            'check_grasp = archer_mujoco.check_grasp:main',
+            'dual_model_loader = archer_mujoco.dual_model_loader:main',
+            'dual_sim_node = archer_mujoco.dual_sim_node:main',
+            'grasp_scene = archer_mujoco.grasp_scene:main',
             'gripper_markers = archer_mujoco.gripper_markers:main',
+            'model_loader = archer_mujoco.model_loader:main',
+            'pose_check = archer_mujoco.pose_check:main',
+            'sim_node = archer_mujoco.sim_node:main',
         ],
     },
 )
