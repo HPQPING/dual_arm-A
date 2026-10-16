@@ -1,6 +1,8 @@
 # 共同约定：world 在两基座中点，+X 从左到右，+Y 向前，+Z 向上。
 # Xacro 必须已设置 link_6 → flange 为 +Z 8 mm；这里不得再重复加 8 mm。
-# 两节点的公共参数需保持相同；启动文件与任务节点都会进行核对。
+# 场景与任务的公共参数需保持相同；启动文件与任务节点都会进行核对。
+# 文件名沿用 dual_circle.yaml；现同时列出两种任务的参数，不会依次执行两项任务。
+# 除特别说明外，长度单位为米，角度为弧度，时间为秒，关节速度为弧度每秒。
 
 dual_arm_scene:
   ros__parameters:
@@ -37,6 +39,8 @@ dual_arm_scene:
 dual_arm_task:
   ros__parameters:
     use_sim_time: false
+    # 只选择一项：split_circle 画圆，cooperative 按固定抓取关系空载协同移动。
+    # 启动参数 task_type:=... 的优先级高于这里；修改此项需重启任务节点。
     task_type: split_circle
 
     left_base_xyz: [-0.21, 0.0, 0.0]
@@ -58,6 +62,24 @@ dual_arm_task:
     arc_samples: 64
     inward_tilt_deg: 10.0
 
+    # 以下为协同演示参数，仅在 cooperative 模式参与规划，不是实物测量数据。
+    # 物体位姿相对于 world；起点到终点之间插值，两臂保持各自的固定抓取变换。
+    object_start_xyz: [0.0, 0.40, 0.31]
+    object_start_rpy: [0.0, 0.0, 0.0]
+    object_goal_xyz: [0.0, 0.42, 0.32]
+    object_goal_rpy: [0.0, 0.0, 0.08726646259971647]
+
+    # 两个 TCP 在物体坐标系中的位置，上下间距为 0.40 m。
+    # 抓取旋转由任务节点根据 inward_tilt_deg 构造；这里不是世界坐标中的 TCP 位置。
+    left_grasp_xyz: [0.0, 0.0, 0.20]
+    right_grasp_xyz: [0.0, 0.0, -0.20]
+    cooperative_samples: 32
+
+    # 执行时的示例停止阈值：位置 10 mm、姿态约 1.72 度；不是实机精度指标。
+    # 规划阶段另有更严格的采样预检；当前不创建物体接触，也不控制夹爪夹紧。
+    cooperative_position_tolerance: 0.01
+    cooperative_rotation_tolerance: 0.03
+
     # 起始时间在预检完成后确定；分段轨迹为关节空间五次插值。
     start_delay: 3.0
     minimum_duration: 0.20
@@ -65,3 +87,12 @@ dual_arm_task:
     feedback_timeout: 0.5
     start_velocity_limit: 0.01
     goal_tolerance: 0.01
+
+# 仅在 record:=true 时由仿真启动文件启动；也可继续使用原来的独立记录命令。
+dual_trace:
+  ros__parameters:
+    use_sim_time: false
+    output_dir: "~/archer_ws/dual_results"
+    # 左右反馈时间戳相差不超过 5 ms 才计算相对误差；不是硬件同步保证。
+    max_pair_skew_s: 0.005
+    # config_file 由启动文件自动设置为本次实际使用的参数文件绝对路径。

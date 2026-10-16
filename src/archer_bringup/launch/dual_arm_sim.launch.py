@@ -1,7 +1,8 @@
-"""统一启动共享 MuJoCo 与画圆或空载协同任务，不自动触发运动。"""
+"""选择画圆或空载协同任务，可选启动只读记录节点；启动后不自动运动。"""
 
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 
@@ -35,8 +36,8 @@ def _vector(value: object, label: str) -> list[float]:
     return result
 
 
-def validate_parameters(path: Path) -> None:
-    """启动前核对两节点的公共配置；详细运动学和轨迹检查仍由任务节点负责。"""
+def validate_parameters(path: Path, *, record: bool = False) -> str:
+    """核对公共配置及可选记录配置，返回文件中的任务类型。"""
     with path.open(encoding='utf-8') as stream:
         raw: object = yaml.safe_load(stream)
     root = _mapping(raw, '配置文件')
@@ -58,14 +59,29 @@ def validate_parameters(path: Path) -> None:
     for name in ('clearance', 'speed_limits', 'left_urdf', 'right_urdf'):
         if name not in scene or name not in task or scene[name] != task[name]:
             raise ValueError('两节点参数缺失或不一致：' + name)
-    if task.get('task_type') not in ('split_circle', 'cooperative'):
+    task_type = task.get('task_type')
+    if not isinstance(task_type, str) or task_type not in ('split_circle', 'cooperative'):
         raise ValueError('task_type 必须为 split_circle 或 cooperative')
+    if record:
+        node = _mapping(root.get('dual_trace'), 'dual_trace；启用记录时请使用新版参数文件')
+        trace = _mapping(node.get('ros__parameters'), 'dual_trace/ros__parameters')
+        if trace.get('use_sim_time') is not False:
+            raise ValueError('dual_trace 必须显式设置 use_sim_time: false')
+        output = trace.get('output_dir')
+        if not isinstance(output, str) or not output.strip():
+            raise ValueError('dual_trace/output_dir 必须是非空目录路径')
+        skew = trace.get('max_pair_skew_s')
+        if (isinstance(skew, bool) or not isinstance(skew, (float, int))
+                or not math.isfinite(skew) or not 0. <= skew <= .05):
+            raise ValueError('dual_trace/max_pair_skew_s 必须是 0～0.05 s 的有限数值')
+    return task_type
 
 
 def _start(context) -> list[Action]:
     config = Path(LaunchConfiguration('params_file').perform(context)).expanduser().resolve()
     python = Path(LaunchConfiguration('python_executable').perform(context)).expanduser()
     viewer = LaunchConfiguration('show_viewer').perform(context).lower()
+    recording = LaunchConfiguration('record').perform(context).lower()
     mode = LaunchConfiguration('task_type').perform(context)
     if mode not in ('configured', 'split_circle', 'cooperative'):
         raise ValueError('task_type 启动参数无效')
@@ -75,7 +91,11 @@ def _start(context) -> list[Action]:
         raise FileNotFoundError('python_executable 必须是存在的解释器绝对路径')
     if viewer not in ('true', 'false'):
         raise ValueError('show_viewer 只能是 true 或 false')
-    validate_parameters(config)
+    if recording not in ('true', 'false'):
+        raise ValueError('record 只能是 true 或 false')
+    record = recording == 'true'
+    configured_mode = validate_parameters(config, record=record)
+    selected_mode = configured_mode if mode == 'configured' else mode
     for package in ('archer_description', 'archer_mujoco', 'archer_control'):
         get_package_share_directory(package)
 
@@ -90,7 +110,7 @@ def _start(context) -> list[Action]:
     if mode != 'configured':
         task_command += ['-p', 'task_type:=' + mode]
     task = ExecuteProcess(cmd=task_command, name='archer_dual_task', output='screen', shell=False)
-    # 任一进程退出时关闭整组，避免只剩一侧控制流程继续运行。
+    # 场景或任务退出时关闭本组全部进程，记录节点随组退出并保存已有数据。
     scene_exit = RegisterEventHandler(OnProcessExit(
         target_action=scene,
         on_exit=[EmitEvent(event=Shutdown(reason='共享仿真场景已退出'))],
@@ -99,11 +119,30 @@ def _start(context) -> list[Action]:
         target_action=task,
         on_exit=[EmitEvent(event=Shutdown(reason='双臂任务节点已退出'))],
     ))
-    return [
+    actions: list[Action] = [
         scene_exit, task_exit,
+        LogInfo(msg='本次任务：' + selected_mode + '；仅执行这一项，不串联其它任务。'),
         LogInfo(msg='参数一致性检查通过；等待任务 READY 后，手动调用 /dual/task/start。'),
-        scene, task,
     ]
+    if record:
+        # 与任务使用同一文件；任务说明话题决定实际记录模式，避免猜测 YAML 中的默认任务。
+        # JSON 字符串也是合法 YAML 标量；逐项传参且关闭 shell，保留路径中的空格等字符。
+        recorder = ExecuteProcess(
+            cmd=[str(python), '-m', 'archer_control.dual_trace_node', '--ros-args',
+                 '--params-file', str(config), '-p', 'config_file:=' + json.dumps(str(config), ensure_ascii=False)],
+            name='archer_dual_trace', output='screen', shell=False,
+        )
+        # 记录为只读观察；其退出只报告记录中断，不向任务或机械臂发送命令。
+        actions.append(RegisterEventHandler(OnProcessExit(
+            target_action=recorder,
+            on_exit=[LogInfo(msg='记录节点已退出；请检查其日志和本次结果文件。')],
+        )))
+        actions.append(LogInfo(msg='已启用记录；请勿再单独启动第二个 dual_trace_node。'))
+        actions.extend([scene, recorder, task])
+    else:
+        actions.append(LogInfo(msg='本次不启动记录节点；可使用 record:=true 启用。'))
+        actions.extend([scene, task])
+    return actions
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -119,5 +158,7 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument('task_type', default_value='configured',
                               choices=['configured', 'split_circle', 'cooperative'],
                               description='沿用配置文件或显式选择画圆、协同移动任务'),
+        DeclareLaunchArgument('record', default_value='false', choices=['true', 'false'],
+                              description='同时启动只读记录节点；已手动运行记录节点时保持 false'),
         OpaqueFunction(function=_start),
     ])
