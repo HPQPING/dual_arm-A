@@ -3,15 +3,22 @@
 <package format="3">
   <name>archer_hardware</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Archer 双臂官方 SDK 反馈与显式关节位置控制接入。</description>
   <maintainer email="user@todo.todo">user</maintainer>
   <license>TODO: License declaration</license>
-
+  <buildtool_depend>ament_python</buildtool_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>trajectory_msgs</exec_depend>
+  <exec_depend>rcl_interfaces</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <!-- hex_device 使用 Ubuntu 上已核对的厂商 SDK，不由 pip 自动替换。 -->
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
   <test_depend>python3-pytest</test_depend>
-
   <export>
     <build_type>ament_python</build_type>
   </export>

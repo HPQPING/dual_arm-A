@@ -12,14 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""仅检查当前功能包的 Python 样式，并处理检查器初始化失败."""
+
+from pathlib import Path
+
 from ament_flake8.main import main_with_errors
 import pytest
 
 
 @pytest.mark.flake8
 @pytest.mark.linter
-def test_flake8():
-    rc, errors = main_with_errors(argv=[])
-    assert rc == 0, \
-        'Found %d code style errors / warnings:\n' % len(errors) + \
-        '\n'.join(errors)
+def test_flake8() -> None:
+    """显式区分错误码和正常结果，避免对整数执行解包."""
+    package_root = Path(__file__).resolve().parents[1]
+    result = main_with_errors(argv=[str(package_root)])
+    # Humble 的检查器在配置不存在时只返回整数，不能直接解包。
+    if isinstance(result, int):
+        raise AssertionError(
+            f'flake8 未完成检查，返回码 {result}，请检查其配置文件',
+        )
+    return_code, errors = result
+    assert return_code == 0, (
+        f'发现 {len(errors)} 项代码样式问题：\n' + '\n'.join(errors)
+    )

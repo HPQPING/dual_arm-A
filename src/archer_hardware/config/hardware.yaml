@@ -1,0 +1,9 @@
+# 默认仅启动节点，不连接机械臂。显式 connect:=true 才建立只读连接。
+archer_hardware_feedback:
+  ros__parameters:
+    connect: false
+    left_url: "ws://192.168.1.100:8439"
+    right_url: "ws://192.168.1.100:9439"
+    stale_timeout: 0.5
+    startup_timeout: 10.0
+    use_sim_time: false

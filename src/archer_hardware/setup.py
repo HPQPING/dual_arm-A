@@ -1,29 +1,36 @@
+"""安装实机反馈、位置控制节点和配置文件."""
+
+from glob import glob
+
 from setuptools import find_packages, setup
 
-package_name = 'archer_hardware'
+
+PACKAGE_NAME = 'archer_hardware'
 
 setup(
-    name=package_name,
+    name=PACKAGE_NAME,
     version='0.0.0',
-    packages=find_packages(exclude=['test']),
+    packages=find_packages(exclude=['test', 'test.*']),
     data_files=[
         ('share/ament_index/resource_index/packages',
-            ['resource/' + package_name]),
-        ('share/' + package_name, ['package.xml']),
+         ['resource/' + PACKAGE_NAME]),
+        ('share/' + PACKAGE_NAME, ['package.xml']),
+        ('share/' + PACKAGE_NAME + '/config', glob('config/*.yaml')),
     ],
     install_requires=['setuptools'],
-    zip_safe=True,
+    zip_safe=False,
     maintainer='user',
     maintainer_email='user@todo.todo',
-    description='TODO: Package description',
+    description='Archer 双臂官方 SDK 反馈与显式关节位置控制接入。',
     license='TODO: License declaration',
-    extras_require={
-        'test': [
-            'pytest',
-        ],
-    },
+    extras_require={'test': ['pytest']},
     entry_points={
         'console_scripts': [
+            'hardware_feedback = archer_hardware.driver_node:main',
+            'hardware_position = archer_hardware.position_node:main',
+            'hardware_feedback_audit = archer_hardware.commissioning:audit_main',
+            'hardware_joint_trial = archer_hardware.commissioning:trial_main',
+            'hardware_operator = archer_hardware.operator_client:main',
         ],
     },
 )
