@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 from numpy.typing import NDArray
 
-from .grasp_record_format import EVENT_FIELDS, SIDES, STATE_FIELDS
+from ..grasp_record_format import EVENT_FIELDS, SIDES, STATE_FIELDS
 
 
 FloatArray = NDArray[np.float64]

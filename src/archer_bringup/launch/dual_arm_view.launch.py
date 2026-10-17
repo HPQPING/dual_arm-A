@@ -18,7 +18,7 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
-from archer_control.check_circle import validate_tool_chain
+from archer_control.model_checks import validate_tool_chain
 from archer_control.dual_arm_trajectory import rigid_transform
 from archer_control.kinematics import ArmKinematics
 from archer_control.single_arm_node import numbers

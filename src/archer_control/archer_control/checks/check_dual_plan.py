@@ -1,6 +1,6 @@
 """Offline paired planning check. Does not publish or connect to robots.
 
-Run: python3 -m archer_control.check_dual_plan
+Run: python3 -m archer_control.checks.check_dual_plan
 Or pass --left-urdf PATH --right-urdf PATH to use expanded URDF files.
 """
 
@@ -10,9 +10,9 @@ import argparse
 
 import numpy as np
 
-from .dual_arm_trajectory import DualArmKinematics, peak_target_speeds, plan_paired_joints
-from .kinematics import ArmKinematics, rotation_error
-from .trajectory import DEFAULT_SPEED_LIMITS
+from ..dual_arm_trajectory import DualArmKinematics, peak_target_speeds, plan_paired_joints
+from ..kinematics import ArmKinematics, rotation_error
+from ..trajectory import DEFAULT_SPEED_LIMITS
 
 
 def check(model: DualArmKinematics) -> bool:
@@ -78,7 +78,7 @@ def main() -> int:
     parser.add_argument('--mount-rpy', type=float, nargs=3, default=[0., 0., 0.])
     args = parser.parse_args()
     try:
-        from .dual_arm_trajectory import rigid_transform
+        from ..dual_arm_trajectory import rigid_transform
         left = (ArmKinematics.from_urdf(args.left_urdf, 'left') if args.left_urdf
                 else ArmKinematics.from_description('left', args.tcp_xyz, args.mount_xyz, args.mount_rpy))
         right = (ArmKinematics.from_urdf(args.right_urdf, 'right') if args.right_urdf

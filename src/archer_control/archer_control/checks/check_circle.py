@@ -12,12 +12,12 @@ from typing import cast
 
 import numpy as np
 
-from .circle_planner import CIRCLE_CENTER, CIRCLE_RADIUS, MOUNT_XYZ, TCP_XYZ, plan_circle
-from .dual_arm_trajectory import DualArmKinematics, rigid_transform, peak_target_speeds
-from .kinematics import ArmKinematics, rotation_error
-from .trajectory import sample_joint_plan, DEFAULT_SPEED_LIMITS
+from ..circle_planner import CIRCLE_CENTER, CIRCLE_RADIUS, MOUNT_XYZ, TCP_XYZ, plan_circle
+from ..dual_arm_trajectory import DualArmKinematics, rigid_transform, peak_target_speeds
+from ..kinematics import ArmKinematics, rotation_error
+from ..trajectory import sample_joint_plan, DEFAULT_SPEED_LIMITS
 # 保留旧导入路径的兼容性；运行程序直接使用公共模块。
-from .model_checks import (
+from ..model_checks import (
     CollisionModel as CollisionModel, Contact as Contact, Contacts as Contacts,
     CollisionData as CollisionData, BodyKinds as BodyKinds, NameAPI as NameAPI,
     validate_tool_chain as validate_tool_chain, cross_arm_failure,

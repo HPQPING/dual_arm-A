@@ -4,7 +4,7 @@ import argparse
 
 import numpy as np
 
-from .kinematics import ArmKinematics, rotation_error
+from ..kinematics import ArmKinematics, rotation_error
 
 
 def check(model: ArmKinematics) -> bool:

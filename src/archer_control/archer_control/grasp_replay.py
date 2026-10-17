@@ -13,7 +13,7 @@ from typing import cast
 
 import numpy as np
 
-from .grasp_record_check import GraspRun, RecordedFrame, load_run
+from .checks.grasp_record_check import GraspRun, RecordedFrame, load_run
 from archer_mujoco.grasp_model_loader import LoadedGrasp, load_grasp_model, physics
 from archer_mujoco.grasp_scene import GraspConfig, ViewerAPI
 
