@@ -8,67 +8,20 @@
 from __future__ import annotations
 
 import argparse
-from importlib import import_module
-from typing import Protocol, cast
+from typing import cast
 
 import numpy as np
-from numpy.typing import NDArray
 
 from .circle_planner import CIRCLE_CENTER, CIRCLE_RADIUS, MOUNT_XYZ, TCP_XYZ, plan_circle
 from .dual_arm_trajectory import DualArmKinematics, rigid_transform, peak_target_speeds
 from .kinematics import ArmKinematics, rotation_error
 from .trajectory import sample_joint_plan, DEFAULT_SPEED_LIMITS
-
-
-class CollisionModel(Protocol):
-    geom_margin: NDArray[np.float64]
-    geom_bodyid: NDArray[np.int32]
-
-
-class Contact(Protocol):
-    geom1: int
-    geom2: int
-    dist: float
-
-
-class Contacts(Protocol):
-    def __getitem__(self, index: int) -> Contact: ...
-
-
-class CollisionData(Protocol):
-    ncon: int
-    contact: Contacts
-
-
-class BodyKinds(Protocol):
-    mjOBJ_BODY: object
-
-
-class NameAPI(Protocol):
-    mjtObj: BodyKinds
-    def mj_id2name(self, model: object, kind: object, index: int) -> str | None: ...
-
-
-def validate_tool_chain(model: ArmKinematics) -> None:
-    """检查工程坐标约定，避免旧模型或重复偏移被悄悄使用；不代表实机标定。"""
-    prefix = model.base_frame.removesuffix('base_link')
-    expected = (
-        (prefix + 'link_6', prefix + 'flange', (0., 0., .008)),
-        (prefix + 'flange', prefix + 'gp80_base_link', MOUNT_XYZ),
-        (prefix + 'gp80_base_link', prefix + 'tcp', TCP_XYZ),
-    )
-    for parent, child, translation in expected:
-        matches = [joint for joint in model.chain if joint.parent == parent and joint.child == child]
-        if len(matches) != 1 or matches[0].kind != 'fixed':
-            raise ValueError(f'模型缺少固定坐标关系：{parent} → {child}，请先更新 Xacro')
-        joint = matches[0]
-        if not np.allclose(joint.origin[:3, 3], translation, atol=1e-8, rtol=0.):
-            raise ValueError(f'{parent} → {child} 平移应为 {translation} m；'
-                             f'实际为 {joint.origin[:3, 3].tolist()}，请检查偏移是否遗漏或重复')
-        # 夹爪安装旋转可按模型调整；其余两个参考帧按当前约定保持同向。
-        if child != prefix + 'gp80_base_link' and not np.allclose(
-                joint.origin[:3, :3], np.eye(3), atol=1e-8, rtol=0.):
-            raise ValueError(f'{parent} → {child} 的旋转应为零，请检查模型坐标约定')
+# 保留旧导入路径的兼容性；运行程序直接使用公共模块。
+from .model_checks import (
+    CollisionModel as CollisionModel, Contact as Contact, Contacts as Contacts,
+    CollisionData as CollisionData, BodyKinds as BodyKinds, NameAPI as NameAPI,
+    validate_tool_chain as validate_tool_chain, cross_arm_failure,
+)
 
 
 def main() -> int:
@@ -134,8 +87,6 @@ def main() -> int:
             tcp_xyz=args.tcp_xyz, mount_xyz=args.mount_xyz, mount_rpy=mount_rpy, enable_contacts=True,
         )
         geometry = cast(CollisionModel, loaded.model)
-        collision_data = cast(CollisionData, loaded.data)
-        names = cast(NameAPI, import_module('mujoco'))
         # 设置两侧几何体的接触检测裕量，以覆盖所要求的间隙范围。
         geometry.geom_margin[:] = args.clearance * 0.6
         times = set(float(t) for t in result.plan.left.times)
@@ -145,17 +96,9 @@ def main() -> int:
             for side, plan in (('left', result.plan.left), ('right', result.plan.right)):
                 loaded.data.qpos[loaded.arms[side].qpos_indices] = sample_joint_plan(plan, elapsed)[0]
             mujoco.mj_forward(loaded.model, loaded.data)
-            for index in range(collision_data.ncon):
-                contact = collision_data.contact[index]
-                a = names.mj_id2name(loaded.model, names.mjtObj.mjOBJ_BODY,
-                                    int(geometry.geom_bodyid[contact.geom1])) or 'world'
-                b = names.mj_id2name(loaded.model, names.mjtObj.mjOBJ_BODY,
-                                    int(geometry.geom_bodyid[contact.geom2])) or 'world'
-                cross = ((a.startswith('left_') and b.startswith('right_'))
-                         or (a.startswith('right_') and b.startswith('left_')))
-                if cross and contact.dist < args.clearance:
-                    raise ValueError(f'Cross-arm clearance failed at {elapsed:.3f}s: '
-                                     f'{a} / {b}, distance {contact.dist * 1000:.3f} mm')
+            reason = cross_arm_failure(loaded, args.clearance)
+            if reason is not None:
+                raise ValueError(f'跨臂间隙检查失败，t={elapsed:.3f}s：{reason}')
         print(f'PASS: paired circle IK, target speeds, {len(times)} cross-arm clearance samples')
         print(f'Max TCP waypoint error: {max(errors) * 1000:.4f} mm')
         print(f'Max TCP waypoint orientation error: {max(angle_errors):.6f} rad')

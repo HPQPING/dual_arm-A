@@ -17,7 +17,7 @@ from typing import cast
 
 import numpy as np
 
-from .check_circle import validate_tool_chain
+from .model_checks import validate_tool_chain
 from .cooperative_planner import sample_object
 from .dual_arm_trajectory import DualArmKinematics, DualArmPlan, rigid_transform
 from .grasp_task_planner import GraspMotion, prepare_grasp_motion

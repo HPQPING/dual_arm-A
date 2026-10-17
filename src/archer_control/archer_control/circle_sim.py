@@ -22,7 +22,9 @@ import numpy as np
 
 from archer_mujoco.dual_model_loader import LoadedDualArm, load_dual_arm
 from archer_mujoco.model_loader import DataInterface, ModelInterface, mujoco
-from .check_circle import CollisionData, CollisionModel, NameAPI, validate_tool_chain
+from .model_checks import CollisionModel, validate_tool_chain
+# 兼容原先从 circle_sim 导入间隙检查的外部脚本。
+from .model_checks import cross_arm_failure as cross_arm_failure
 from .circle_planner import (
     CIRCLE_CENTER, CIRCLE_RADIUS, MOUNT_XYZ, TCP_XYZ, CircleResult, plan_circle,
 )
@@ -51,24 +53,6 @@ class Viewer(Protocol):
 class ViewerAPI(Protocol):
     def launch_passive(self, model: ModelInterface, data: DataInterface,
                        key_callback: Callable[[int], None] | None = None) -> Viewer: ...
-
-
-def cross_arm_failure(loaded: LoadedDualArm, clearance: float) -> str | None:
-    """只检测两臂之间的采样间隙，不把相邻链接装配重叠当作跨臂碰撞。"""
-    geometry = cast(CollisionModel, loaded.model)
-    data = cast(CollisionData, loaded.data)
-    api = cast(NameAPI, import_module('mujoco'))
-    for index in range(data.ncon):
-        contact = data.contact[index]
-        a = api.mj_id2name(loaded.model, api.mjtObj.mjOBJ_BODY,
-                          int(geometry.geom_bodyid[contact.geom1])) or 'world'
-        b = api.mj_id2name(loaded.model, api.mjtObj.mjOBJ_BODY,
-                          int(geometry.geom_bodyid[contact.geom2])) or 'world'
-        cross = ((a.startswith('left_') and b.startswith('right_'))
-                 or (a.startswith('right_') and b.startswith('left_')))
-        if cross and contact.dist < clearance:
-            return f'{a} / {b}，间距 {contact.dist * 1000:.3f} mm'
-    return None
 
 
 def preflight(loaded: LoadedDualArm, result: CircleResult, clearance: float) -> None:

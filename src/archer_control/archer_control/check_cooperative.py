@@ -9,9 +9,8 @@ import numpy as np
 
 from archer_mujoco.dual_model_loader import load_dual_arm
 from archer_mujoco.model_loader import mujoco
-from .check_circle import CollisionModel, validate_tool_chain
+from .model_checks import CollisionModel, validate_tool_chain, cross_arm_failure
 from .circle_planner import MOUNT_XYZ, TCP_XYZ, inward_rotation
-from .circle_sim import cross_arm_failure
 from .cooperative_planner import interpolate_pose, plan_cooperative, sample_errors
 from .dual_arm_trajectory import DualArmKinematics, rigid_transform, peak_target_speeds
 from .kinematics import ArmKinematics

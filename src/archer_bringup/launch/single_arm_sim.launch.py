@@ -1,4 +1,4 @@
-"""Launch one Archer arm in MuJoCo and RViz with coordinate gripper markers."""
+"""启动单臂 MuJoCo、坐标标记与可选 RViz，使用已注册的仿真入口。"""
 
 from pathlib import Path
 import math
@@ -45,7 +45,7 @@ def _nodes(context):
         ' gripper_mount_rpy:="', ' '.join(str(v) for v in mount_rpy), '"',
     ]), value_type=str)
     simulation_node = Node(
-            package='archer_mujoco', executable='single_arm_sim',
+            package='archer_mujoco', executable='sim_node',
             name='single_arm_sim', output='screen',
             parameters=[str(config), {
                 'side': side, 'tcp_xyz': tcp, 'mount_xyz': mount_xyz, 'mount_rpy': mount_rpy,

@@ -12,9 +12,10 @@ from pathlib import Path
 import numpy as np
 from numpy.typing import NDArray
 
+from .grasp_record_format import EVENT_FIELDS, SIDES, STATE_FIELDS
+
 
 FloatArray = NDArray[np.float64]
-SIDES = ('left', 'right')
 ZERO_STAGES = frozenset(('OPEN_BEFORE_INSERT', 'INSERT', 'INSERT_SETTLE', 'CLOSE_DEMO',
                          'LIFT', 'MOVE', 'RETURN', 'LOWER', 'PLACE_SETTLE', 'RELEASE',
                          'OPEN_WAIT', 'RETREAT', 'RETREAT_SETTLE'))
@@ -90,11 +91,7 @@ def load_run(directory: str | Path) -> GraspRun:
     with (folder / 'state.csv').open(encoding='utf-8', newline='') as stream:
         reader = csv.DictReader(stream)
         headers = reader.fieldnames
-        expected = ['wall_elapsed_s', 'simulation_time_s', 'stage', 'gripper_command', 'virtual_attached']
-        for quantity in ('position_rad', 'velocity_rad_s', 'drive_input_rad'):
-            expected.extend(f'{side}_joint_{i}_{quantity}' for side in SIDES for i in range(1, 7))
-        expected.extend('object_' + key for key in ('x_m', 'y_m', 'z_m', 'qw', 'qx', 'qy', 'qz'))
-        expected.extend(f'{side}_tcp_{axis}_m' for side in SIDES for axis in ('x', 'y', 'z'))
+        expected = list(STATE_FIELDS)
         if headers != expected:
             raise ValueError('state.csv 列名与当前记录格式不一致，或存在重复、缺失列')
         frames: list[RecordedFrame] = []
@@ -122,7 +119,7 @@ def load_run(directory: str | Path) -> GraspRun:
         raise ValueError('采样数量与 summary.json 不一致，或记录为空')
     with (folder / 'events.csv').open(encoding='utf-8', newline='') as stream:
         reader = csv.DictReader(stream)
-        if reader.fieldnames != ['utc_time', 'wall_elapsed_s', 'stage']:
+        if reader.fieldnames != list(EVENT_FIELDS):
             raise ValueError('events.csv 列名不正确')
         events = list(reader)
     history = [event['stage'] for event in events]

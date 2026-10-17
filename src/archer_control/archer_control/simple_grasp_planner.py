@@ -9,7 +9,7 @@ from typing import cast
 import numpy as np
 
 from .circle_planner import inward_rotation
-from .circle_sim import cross_arm_failure
+from .model_checks import cross_arm_failure
 from .cooperative_planner import interpolate_pose, plan_cooperative, sample_errors
 from .dual_arm_trajectory import DualArmKinematics, DualArmPlan, plan_paired_joints, rigid_transform
 from .grasp_task_planner import CollisionGeometry, GraspMotion, _join, _reverse

@@ -22,12 +22,12 @@ from visualization_msgs.msg import Marker, MarkerArray
 import yaml
 
 from archer_mujoco.sim_node import prepare_plan, sample_plan
-from .check_circle import validate_tool_chain
+from .model_checks import validate_tool_chain
 from .circle_planner import semicircle_points
 from .dual_arm_trajectory import checked_pose, rigid_transform
 from .cooperative_planner import interpolate_pose, pose_error
 from .kinematics import ArmKinematics, rotation_error
-from .single_arm_node import number, numbers
+from .parameter_validation import number, numbers
 from .trajectory import FloatArray, joint_names, validate_joints
 
 

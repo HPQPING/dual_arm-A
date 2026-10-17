@@ -1,6 +1,5 @@
 """Single-arm joint and sampled Cartesian tasks for the simulation interface."""
 
-from array import array
 import math
 import time
 
@@ -19,21 +18,8 @@ from .trajectory import (
     joint_names, plan_joint_path, to_ros_trajectory, validate_joints,
 )
 from .kinematics import ArmKinematics
-
-
-def number(value: object, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f'{name} must be a number')
-    result = float(value)
-    if not math.isfinite(result):
-        raise ValueError(f'{name} must be finite')
-    return result
-
-
-def numbers(value: object, name: str) -> list[float]:
-    if not isinstance(value, (list, tuple, array)):
-        raise ValueError(f'{name} must be an array of numbers')
-    return [number(item, name) for item in value]
+# 兼容旧工具导入；其他运行节点直接依赖公共参数模块。
+from .parameter_validation import number as number, numbers as numbers
 
 
 def circle_positions(start: ArrayLike, radius: float, plane: str, samples: int) -> FloatArray:

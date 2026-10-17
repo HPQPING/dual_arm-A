@@ -8,9 +8,8 @@ from typing import Protocol, cast
 
 import numpy as np
 
-from .check_circle import CollisionModel
+from .model_checks import CollisionModel, cross_arm_failure
 from .circle_planner import inward_rotation
-from .circle_sim import cross_arm_failure
 from .cooperative_planner import CooperativePlan, interpolate_pose, plan_cooperative, sample_errors, sample_object
 from .dual_arm_trajectory import DualArmKinematics, DualArmPlan, plan_paired_joints, rigid_transform
 from .trajectory import FloatArray, JointPlan, sample_joint_plan, validate_joints

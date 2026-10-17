@@ -11,6 +11,8 @@ import time
 from typing import TYPE_CHECKING, TextIO
 from uuid import uuid4
 
+from .grasp_record_format import EVENT_FIELDS, STATE_FIELDS
+
 if TYPE_CHECKING:
     from .simple_grasp_scene import SimpleGraspDemo
 
@@ -40,13 +42,8 @@ class GraspRunRecorder:
         try:
             self.trace = (self.folder / 'state.csv').open('x', encoding='utf-8', newline='')
             self.events = (self.folder / 'events.csv').open('x', encoding='utf-8', newline='')
-            fields = ['wall_elapsed_s', 'simulation_time_s', 'stage', 'gripper_command', 'virtual_attached']
-            for quantity in ('position_rad', 'velocity_rad_s', 'drive_input_rad'):
-                fields.extend(f'{side}_joint_{index}_{quantity}' for side in ('left', 'right') for index in range(1, 7))
-            fields.extend('object_' + axis for axis in ('x_m', 'y_m', 'z_m', 'qw', 'qx', 'qy', 'qz'))
-            fields.extend(f'{side}_tcp_{axis}_m' for side in ('left', 'right') for axis in ('x', 'y', 'z'))
-            csv.writer(self.trace).writerow(fields)
-            csv.writer(self.events).writerow(['utc_time', 'wall_elapsed_s', 'stage'])
+            csv.writer(self.trace).writerow(STATE_FIELDS)
+            csv.writer(self.events).writerow(EVENT_FIELDS)
             self.active = True
             self.count, self.history = 0, []
             self.last_sample, self.last_stage = -math.inf, ''
