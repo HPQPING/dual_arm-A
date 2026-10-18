@@ -9,9 +9,11 @@ import math
 from pathlib import Path
 import time
 from typing import TYPE_CHECKING, TextIO
-from uuid import uuid4
 
 from .grasp_record_format import EVENT_FIELDS, STATE_FIELDS
+from .result_paths import (
+    discard_failed_run, discard_recording, new_recording_directory, publish_recording,
+)
 
 if TYPE_CHECKING:
     from .simple_grasp_scene import SimpleGraspDemo
@@ -24,6 +26,8 @@ class GraspRunRecorder:
         self.directory = directory.expanduser()
         self.active = False
         self.folder: Path | None = None
+        self.staging: Path | None = None
+        self.started_at: datetime | None = None
         self.trace: TextIO | None = None
         self.events: TextIO | None = None
         self.count = 0
@@ -36,9 +40,9 @@ class GraspRunRecorder:
     def begin(self, demo: SimpleGraspDemo) -> None:
         if self.active:
             raise RuntimeError('上一轮记录尚未关闭')
-        tag = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f_UTC_') + uuid4().hex[:6]
-        self.folder = self.directory / tag
-        self.folder.mkdir(parents=True, exist_ok=False)
+        self.started_at = datetime.now().astimezone()
+        self.folder = new_recording_directory()
+        self.staging = self.folder
         try:
             self.trace = (self.folder / 'state.csv').open('x', encoding='utf-8', newline='')
             self.events = (self.folder / 'events.csv').open('x', encoding='utf-8', newline='')
@@ -94,12 +98,24 @@ class GraspRunRecorder:
     def finish(self, demo: SimpleGraspDemo, result: dict[str, object]) -> dict[str, object]:
         if not self.active or self.folder is None:
             return {'enabled': True, 'active': False}
+        stage = str(result.get('ros_stage', result.get('state', 'UNKNOWN')))
+        if result.get('state') != 'COMPLETED' or stage != 'COMPLETED':
+            self.close()
+            return {'enabled': True, 'complete': False, 'task_completed': False,
+                    'saved': False, 'reason': '未成功完成，不保存任务文件'}
+        final: Path | None = None
         try:
-            stage = str(result.get('ros_stage', result.get('state', 'UNKNOWN')))
             self.event(stage)
             self.sample(demo, stage, force=True)
+            staging = self.folder
+            self.close(discard=False)
+            final = publish_recording(staging, self.directory, '协同抓取', self.started_at)
+            self.staging = None
+            self.folder = final
             metadata: dict[str, object] = {
-                'enabled': True, 'complete': True, 'directory': str(self.folder),
+                'enabled': True, 'complete': True, 'saved': True, 'task_name': '协同抓取',
+                'directory': str(self.folder),
+                'started_at': self.started_at.isoformat() if self.started_at is not None else None,
                 'task_completed': result.get('state') == 'COMPLETED' and stage == 'COMPLETED',
                 'state_csv': str(self.folder / 'state.csv'), 'events_csv': str(self.folder / 'events.csv'),
                 'summary_json': str(self.folder / 'summary.json'), 'sample_count': self.count,
@@ -114,10 +130,15 @@ class GraspRunRecorder:
             temporary.write_text(json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False) + '\n', encoding='utf-8')
             temporary.replace(self.folder / 'summary.json')
             return metadata
+        except Exception:
+            if final is not None:
+                discard_failed_run(final, self.directory)
+                self.folder = None
+            raise
         finally:
             self.close()
 
-    def close(self) -> None:
+    def close(self, *, discard: bool = True) -> None:
         self.active = False
         try:
             if self.trace is not None:
@@ -129,3 +150,8 @@ class GraspRunRecorder:
                     self.events.close()
                 finally:
                     self.events = None
+            if discard and self.staging is not None:
+                discard_recording(self.staging)
+                if self.folder == self.staging:
+                    self.folder = None
+                self.staging = None

@@ -3,7 +3,7 @@
 import json
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import rclpy
 from rclpy.node import Node
@@ -11,7 +11,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 
-from archer_hardware.driver_node import HardwareFeedbackNode
+from archer_hardware.driver_node import HardwareFeedbackNode, main
 from archer_hardware.position_plan import positive as positive_seconds
 from archer_hardware.hex_adapter import JointFeedback
 
@@ -167,6 +167,64 @@ class FeedbackNodeTests(unittest.TestCase):
         node.started -= node.startup_timeout + 1.0
         node.poll_feedback()
         self.assertTrue(all(s.startswith('ERROR') for s in node.states.values()))
+
+    def test_poll_cleanup_failure_does_not_skip_other_arm(self):
+        """一侧断线且关闭失败时保留错误说明，另一侧仍处理当前帧."""
+        node = self.make_node(True)
+        left = node.adapters['left']
+        assert isinstance(left, FakeAdapter)
+        left.error = True
+        with patch.object(left, 'close', side_effect=RuntimeError('close failed')):
+            node.poll_feedback()
+        self.assertIn('模拟通信中断', node.states['left'])
+        self.assertIn('连接清理未确认', node.states['left'])
+        self.assertEqual(node.states['right'], 'READY')
+        self.assertIn('right', node.last_received)
+
+    def test_shutdown_attempts_both_connections(self):
+        """一侧清理失败不能跳过另一侧，也不能把清理结果报告为成功."""
+        node = self.make_node(True)
+        with patch.object(node.adapters['left'], 'close',
+                          side_effect=RuntimeError('left close failed')):
+            with self.assertRaisesRegex(RuntimeError, 'left: left close failed'):
+                node.close_connections()
+        right = node.adapters['right']
+        assert isinstance(right, FakeAdapter)
+        self.assertTrue(right.closed)
+
+    def test_partial_startup_failure_cleans_both_sides(self):
+        """第二侧连接失败时尝试两侧清理，并保留原连接和清理异常."""
+        rclpy.init(args=['--ros-args', '-p', 'connect:=true'])
+        left = FakeAdapter('ws://127.0.0.1:8439', 0.5)
+        right = FakeAdapter('ws://127.0.0.1:9439', 0.5)
+        original_destroy = Node.destroy_node
+        destroyed = []
+
+        def cleanup(instance):
+            destroyed.append(instance)
+            return original_destroy(instance)
+
+        with patch('archer_hardware.driver_node.HexFeedbackAdapter', side_effect=[left, right]):
+            with patch.object(right, 'connect', side_effect=RuntimeError('right connect failed')):
+                with patch.object(left, 'close', side_effect=RuntimeError('left close failed')):
+                    with patch.object(HardwareFeedbackNode, 'destroy_node', cleanup):
+                        with self.assertRaisesRegex(
+                            RuntimeError, 'right connect failed.*left close failed',
+                        ):
+                            HardwareFeedbackNode()
+        self.assertEqual(len(destroyed), 1)
+        self.assertTrue(right.closed)
+
+    def test_main_releases_ros_after_connection_cleanup_error(self):
+        """退出清理抛错时仍销毁节点和关闭 ROS，异常继续报告给调用者."""
+        node = Mock()
+        node.close_connections.side_effect = RuntimeError('close failed')
+        with patch('archer_hardware.driver_node.HardwareFeedbackNode', return_value=node):
+            with patch('archer_hardware.driver_node.rclpy.spin', side_effect=KeyboardInterrupt):
+                with self.assertRaisesRegex(RuntimeError, 'close failed'):
+                    main(args=[])
+        node.destroy_node.assert_called_once()
+        self.assertFalse(rclpy.ok())
 
 
 if __name__ == '__main__':

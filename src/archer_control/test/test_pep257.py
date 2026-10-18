@@ -1,3 +1,5 @@
+"""检查功能包Python文档字符串是否符合PEP257，不启动任务或连接设备."""
+
 # Copyright 2015 Open Source Robotics Foundation, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

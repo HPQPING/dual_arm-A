@@ -1,8 +1,7 @@
-"""Archer six-axis FK and damped least-squares IK from URDF.
+"""从URDF建立六轴正运动学、雅可比矩阵与阻尼最小二乘逆运动学模型.
 
-All poses are expressed in that arm's base_link, not world. No motion,
-hardware connection, collision check, force control or dynamic compensation.
-"""
+位姿均相对于对应机械臂的base_link表达，不是world。
+不执行运动、硬件连接、碰撞检查、力控制或动力学补偿。"""
 
 from __future__ import annotations
 

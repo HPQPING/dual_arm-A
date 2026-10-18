@@ -1,8 +1,7 @@
-"""Static measured-pose comparison; no ROS topics, physics stepping or hardware.
+"""静态对比机械臂姿态并绘制基座与TCP坐标轴，不连接硬件或推进物理仿真.
 
-Red = +X, green = +Y, blue = +Z. Long axes at bases; short axes at TCPs.
---base-yaw-deg changes only the proposed base-to-world installation rotation.
-"""
+红色表示+X，绿色表示+Y，蓝色表示+Z；基座轴较长，TCP轴较短。
+--base-yaw-deg仅改变候选的基座到世界坐标安装旋转，不发布ROS话题。"""
 
 from __future__ import annotations
 

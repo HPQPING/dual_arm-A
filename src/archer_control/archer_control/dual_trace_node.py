@@ -27,6 +27,10 @@ from .circle_planner import semicircle_points
 from .dual_arm_trajectory import checked_pose, rigid_transform
 from .cooperative_planner import interpolate_pose, pose_error
 from .kinematics import ArmKinematics, rotation_error
+from .result_paths import (
+    DEFAULT_RESULTS_DIR, discard_failed_run, discard_recording,
+    new_recording_directory, publish_recording,
+)
 from .parameter_validation import number, numbers
 from .trajectory import FloatArray, joint_names, validate_joints
 
@@ -70,7 +74,7 @@ class DualTrace(Node):
     def __init__(self) -> None:
         super().__init__('dual_trace')
         self.declare_parameter('config_file', '')
-        self.declare_parameter('output_dir', str(Path.home() / 'archer_ws/dual_results'))
+        self.declare_parameter('output_dir', str(DEFAULT_RESULTS_DIR))
         self.declare_parameter('max_pair_skew_s', .005)
         if not self.has_parameter('use_sim_time'):
             self.declare_parameter('use_sim_time', False)
@@ -132,6 +136,7 @@ class DualTrace(Node):
         self.start_ns: int | None = None
         self.stream: TextIO | None = None
         self.directory: Path | None = None
+        self.started_at: datetime | None = None
         self.task_state = 'WAITING'
         self.last_display_ns = 0
         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
@@ -295,8 +300,8 @@ class DualTrace(Node):
 
     def begin(self, stamp: int) -> None:
         self.start_ns = stamp
-        self.directory = self.output / datetime.now().strftime('%Y%m%d_%H%M%S_%f')
-        self.directory.mkdir(parents=True, exist_ok=False)
+        self.started_at = datetime.now().astimezone()
+        self.directory = new_recording_directory()
         self.stream = (self.directory / 'tracking.csv').open('w', newline='', encoding='utf-8-sig')
         header = ['feedback_stamp_ns', 'elapsed_s', 'side', 'phase']
         header += [f'actual_J{i}_rad' for i in range(1, 7)]
@@ -462,9 +467,24 @@ class DualTrace(Node):
         if self.relative_stream is not None:
             self.relative_stream.close()
             self.relative_stream = None
+        staging = self.directory
+        if state != 'COMPLETED':
+            discard_recording(staging)
+            self.directory = None
+            self.publish_status('NOT_SAVED: ' + state)
+            return
         profile = self.profile
         cooperative = profile is not None and profile.mode == 'cooperative'
+        task_name = '协同抓取' if cooperative else '画圆'
+        try:
+            self.directory = publish_recording(staging, self.output, task_name, self.started_at)
+        except Exception:
+            discard_recording(staging)
+            self.directory = None
+            raise
         summary = {
+            'task_name': task_name,
+            'started_at': self.started_at.isoformat() if self.started_at is not None else None,
             'task_state': state, 'start_stamp_ns': self.start_ns,
             'task_type': profile.mode if profile is not None else None,
             'records': self.counts,
@@ -483,8 +503,13 @@ class DualTrace(Node):
             'reference_object_only': cooperative,
             'source': '实际 TCP 由 ROS 关节反馈和模型正运动学计算，不是实机外部测量',
         }
-        (self.directory / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2),
-                                                    encoding='utf-8')
+        try:
+            (self.directory / 'summary.json').write_text(
+                json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception:
+            discard_failed_run(self.directory, self.output)
+            self.directory = None
+            raise
         self.publish_status('SAVED: ' + str(self.directory))
 
     def destroy_node(self):

@@ -1,13 +1,18 @@
 """离线验证反馈适配器，所有测试均禁止连接实际设备."""
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from importlib import import_module
+import logging
+import threading
 import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from archer_hardware.hex_adapter import HexFeedbackAdapter, report_only
+from archer_hardware.hex_adapter import (
+    HexFeedbackAdapter, managed_sdk_class, report_only,
+)
 
 
 class FakeArm:
@@ -149,6 +154,121 @@ class FeedbackTests(unittest.TestCase):
             adapter.close()
             close.assert_called_once()
         self.assertIsNone(adapter._api)
+
+
+class ShutdownTests(unittest.TestCase):
+    """运行官方主循环与内存传输，始终绕过网络构造函数."""
+
+    def start_api(self, *, failure=False, callback_close=False, delay=0.05):
+        """仅替换连接和收包，保留已安装 SDK 的线程与关闭入口."""
+        from hex_device.hex_device_api import HexDeviceApi
+
+        api = object.__new__(managed_sdk_class(HexDeviceApi))
+        api._logger = logging.getLogger('offline-sdk-shutdown')
+        api._stream_mode = False
+        api._internal_device_list = []
+        api._optional_device_list = []
+        api._HexDeviceApi__loop = None
+        api._HexDeviceApi__loop_ready = threading.Event()
+        api._HexDeviceApi__is_closing = threading.Event()
+        api._HexDeviceApi__shutdown_event = None
+        api._HexDeviceApi__kcp_client = None
+        finished = threading.Event()
+        aborted = threading.Event()
+        started = threading.Event()
+
+        async def close_socket():
+            await asyncio.sleep(delay)
+            if failure:
+                raise OSError('offline injected close failure')
+            finished.set()
+
+        api._HexDeviceApi__websocket = SimpleNamespace(
+            close=close_socket, transport=SimpleNamespace(abort=aborted.set),
+        )
+
+        async def connect():
+            started.set()
+
+        async def parser():
+            if callback_close:
+                api.close()
+            await asyncio.Event().wait()
+
+        async def stop_tasks():
+            return None
+
+        api._HexDeviceApi__connect_ws = connect
+        api._HexDeviceApi__websocket_data_parser = parser
+        api._stop_all_device_tasks = stop_tasks
+        worker = threading.Thread(target=api._HexDeviceApi__loop_start)
+        api._HexDeviceApi__loop_thread = worker
+        worker.start()
+        self.assertTrue(started.wait(1.0))
+
+        def cleanup():
+            try:
+                api.close()
+            except RuntimeError:
+                if not failure and delay <= 2.0:
+                    raise
+
+        self.addCleanup(cleanup)
+        return api, worker, finished, aborted
+
+    def test_handshake_before_loop_exit_and_idempotent_close(self):
+        """等待真实异步挂起后才结束线程，重复关闭不遗留任务."""
+        api, worker, finished, aborted = self.start_api()
+        api.close()
+        self.assertTrue(finished.is_set())
+        self.assertFalse(aborted.is_set())
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(api._HexDeviceApi__loop.is_closed())
+        self.assertFalse(asyncio.all_tasks(api._HexDeviceApi__loop))
+        api.close()
+
+    def test_callback_close_does_not_wait_on_own_thread(self):
+        """模拟解析失败回调，关闭不在事件线程阻塞等待自己."""
+        api, worker, finished, aborted = self.start_api(callback_close=True)
+        worker.join(1.0)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(finished.is_set())
+        self.assertFalse(aborted.is_set())
+        self.assertTrue(api._HexDeviceApi__loop.is_closed())
+
+    def test_concurrent_close_waits_for_one_handshake(self):
+        """两个清理调用共享握手结果，不提前结束正在关闭的连接."""
+        api, worker, finished, aborted = self.start_api()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(api.close) for _ in range(2)]
+            for future in futures:
+                future.result(timeout=4.0)
+        self.assertTrue(finished.is_set())
+        self.assertFalse(aborted.is_set())
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(api._HexDeviceApi__loop.is_closed())
+
+    def test_transport_failure_is_reported_after_cleanup(self):
+        """握手失败时中止本地传输，向上报告而非声称已正常关闭."""
+        api, worker, finished, aborted = self.start_api(failure=True)
+        with self.assertRaisesRegex(RuntimeError, 'OSError'):
+            api.close()
+        self.assertFalse(finished.is_set())
+        self.assertTrue(aborted.is_set())
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(api._HexDeviceApi__loop.is_closed())
+
+    def test_transport_timeout_is_bounded_and_reported(self):
+        """迟迟不完成的握手在限定时间内取消，避免原有五秒假等待."""
+        api, worker, finished, aborted = self.start_api(delay=30.0)
+        start = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, 'TimeoutError'):
+            api.close()
+        self.assertLess(time.monotonic() - start, 4.0)
+        self.assertFalse(finished.is_set())
+        self.assertTrue(aborted.is_set())
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(api._HexDeviceApi__loop.is_closed())
 
 
 if __name__ == '__main__':

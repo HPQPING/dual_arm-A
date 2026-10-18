@@ -1,3 +1,5 @@
+"""安装MuJoCo仿真入口及模型、配置资源，保留资源目录结构."""
+
 from pathlib import Path
 
 from setuptools import find_packages, setup

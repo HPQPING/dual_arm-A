@@ -27,6 +27,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 from .simple_grasp_scene import SimpleGraspDemo
 from .grasp_recording import GraspRunRecorder
+from .result_paths import DEFAULT_RESULTS_DIR
 from .kinematics import rotation_error
 from archer_mujoco.grasp_scene import Viewer, ViewerAPI
 
@@ -42,7 +43,7 @@ class GraspSimulationNode(Node):
         super().__init__('dual_grasp_sim')
         self.declare_parameter('output_file', '')
         self.declare_parameter('show_viewer', False)
-        self.declare_parameter('record_dir', str(Path.home() / 'archer_ws/dual_results/grasp'))
+        self.declare_parameter('record_dir', str(DEFAULT_RESULTS_DIR))
         if not self.has_parameter('use_sim_time'):
             self.declare_parameter('use_sim_time', False)
         if self.get_parameter('use_sim_time').value is not False:
@@ -148,7 +149,7 @@ class GraspSimulationNode(Node):
         result['recording'] = self.finish_recording(result)
         text = json.dumps(result, ensure_ascii=False, allow_nan=False, indent=2)
         self.result_pub.publish(text_message(text))
-        if self.output is not None:
+        if self.output is not None and result.get('state') == 'COMPLETED':
             try:
                 self.output.parent.mkdir(parents=True, exist_ok=True)
                 self.output.write_text(text + '\n', encoding='utf-8')
@@ -239,7 +240,7 @@ class GraspSimulationNode(Node):
         if self.recorder is not None:
             try:
                 self.recorder.begin(self.demo)
-                self.get_logger().info('本轮仿真记录目录：' + str(self.recorder.folder))
+                self.get_logger().info('本轮临时采样目录（成功后归档）：' + str(self.recorder.folder))
             except (OSError, ValueError, RuntimeError) as exc:
                 self.record_error(exc)
         self.planning = self.worker.submit(self.prepare)

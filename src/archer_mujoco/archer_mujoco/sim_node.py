@@ -1,4 +1,4 @@
-"""ROS 2 single-arm MuJoCo simulation. No hardware connection."""
+"""提供ROS单臂MuJoCo仿真、关节反馈与位置轨迹接口，不连接真机."""
 
 from __future__ import annotations
 

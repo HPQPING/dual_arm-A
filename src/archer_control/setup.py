@@ -1,3 +1,5 @@
+"""安装轨迹规划、仿真任务入口与配置资源，不启动任务."""
+
 from glob import glob
 from setuptools import find_packages, setup
 

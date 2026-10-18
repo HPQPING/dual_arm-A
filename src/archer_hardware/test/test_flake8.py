@@ -1,3 +1,5 @@
+"""仅检查当前功能包的 Python 样式，并处理检查器初始化失败."""
+
 # Copyright 2017 Open Source Robotics Foundation, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,7 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""仅检查当前功能包的 Python 样式，并处理检查器初始化失败."""
 
 from pathlib import Path
 

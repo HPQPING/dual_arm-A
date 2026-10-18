@@ -88,11 +88,11 @@ dual_arm_task:
     start_velocity_limit: 0.01
     goal_tolerance: 0.01
 
-# 仅在 record:=true 时由仿真启动文件启动；也可继续使用原来的独立记录命令。
+# 默认由仿真启动文件启用记录；已独立启动记录节点时使用 record:=false。
 dual_trace:
   ros__parameters:
     use_sim_time: false
-    output_dir: "~/archer_ws/dual_results"
+    output_dir: "~/archer_ws/archer_results"
     # 左右反馈时间戳相差不超过 5 ms 才计算相对误差；不是硬件同步保证。
     max_pair_skew_s: 0.005
     # config_file 由启动文件自动设置为本次实际使用的参数文件绝对路径。

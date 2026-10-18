@@ -13,7 +13,7 @@ from typing import cast
 import numpy as np
 
 from ..circle_planner import CIRCLE_CENTER, CIRCLE_RADIUS, MOUNT_XYZ, TCP_XYZ, plan_circle
-from ..dual_arm_trajectory import DualArmKinematics, rigid_transform, peak_target_speeds
+from ..dual_arm_trajectory import DualArmKinematics, rigid_transform, peak_target_speeds, export_paired_plan
 from ..kinematics import ArmKinematics, rotation_error
 from ..trajectory import sample_joint_plan, DEFAULT_SPEED_LIMITS
 # 保留旧导入路径的兼容性；运行程序直接使用公共模块。
@@ -40,6 +40,7 @@ def main() -> int:
     parser.add_argument('--right-start', nargs=6, type=float, default=[0., -.8, 1.6, -.8, 0., 0.])
     parser.add_argument('--clearance', type=float, default=.01)
     parser.add_argument('--check-dt', type=float, default=.02)
+    parser.add_argument('--export-plan', help='预检通过后导出关节计划，仅创建新文件')
     args = parser.parse_args()
     if (not np.isfinite(args.clearance) or not .001 <= args.clearance <= .05
             or not np.isfinite(args.check_dt) or not .001 <= args.check_dt <= .05):
@@ -104,6 +105,9 @@ def main() -> int:
         print(f'Max TCP waypoint orientation error: {max(angle_errors):.6f} rad')
         print(f'Approach duration: {result.plan.left.times[1]:.2f} s; total: {result.plan.duration:.2f} s')
         print('Candidate mounting model only; no motion sent. Self-collision, table and cables are not checked here.')
+        if args.export_plan:
+            target = export_paired_plan(result.plan, args.export_plan)
+            print(f'已导出：{target}；仍需真机限位预检与实际起点核对，未发送动作')
         return 0
     except (ValueError, OSError, RuntimeError) as exc:
         print('FAIL: ' + str(exc))

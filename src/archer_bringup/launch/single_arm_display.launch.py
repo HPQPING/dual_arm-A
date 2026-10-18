@@ -1,3 +1,5 @@
+"""启动单臂模型、关节滑块、TF与RViz，用于姿态显示，不连接真机."""
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import (

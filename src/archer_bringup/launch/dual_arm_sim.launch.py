@@ -158,7 +158,7 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument('task_type', default_value='configured',
                               choices=['configured', 'split_circle', 'cooperative'],
                               description='沿用配置文件或显式选择画圆、协同移动任务'),
-        DeclareLaunchArgument('record', default_value='false', choices=['true', 'false'],
+        DeclareLaunchArgument('record', default_value='true', choices=['true', 'false'],
                               description='同时启动只读记录节点；已手动运行记录节点时保持 false'),
         OpaqueFunction(function=_start),
     ])

@@ -5,6 +5,7 @@ from importlib import import_module
 from threading import Event, Thread
 import time
 from types import SimpleNamespace
+from typing import Any, cast
 import unittest
 from unittest.mock import patch
 
@@ -12,7 +13,10 @@ import numpy as np
 
 from archer_hardware.hex_adapter import HexFeedbackAdapter, JointFeedback
 from archer_hardware.position_adapter import HexPositionAdapter
-from archer_hardware.position_plan import JointPositionMove, PositionLimits, StopAndReturnMove
+from archer_hardware.position_plan import (
+    JointPositionMove, JointPositionTrajectory, PairedTrajectoryStart, PositionLimits,
+    StopAndReturnMove,
+)
 
 
 def fixture_limits() -> PositionLimits:
@@ -134,6 +138,103 @@ class PositionPlanTests(unittest.TestCase):
                                       (0.0,) * 6, 2.0, limits)
 
 
+class FullTrajectoryTests(unittest.TestCase):
+    """验证多段执行使用的解析约束、真实起点对齐和连接处连续性."""
+
+    def prepare(self, **overrides) -> JointPositionTrajectory:
+        """生成只用于测试的轨迹，不代表实机目标."""
+        parameters: dict[str, Any] = {
+            'times_ns': (0, 2_000_000_000, 4_000_000_000),
+            'positions': ((0.0,) * 6, (0.01,) * 6, (0.02,) * 6),
+            'limits': fixture_limits(), 'max_excursion': 0.05,
+            'actual_start': (0.0,) * 6,
+        }
+        parameters.update(overrides)
+        return JointPositionTrajectory.prepare(**parameters)
+
+    def test_sampling_and_connections(self) -> None:
+        """连接点精确到达且两边速度和加速度趋近零，末端保持."""
+        plan = self.prepare()
+        self.assertEqual(plan.sample(-1.0), (0.0,) * 6)
+        self.assertEqual(plan.sample(2.0), (0.01,) * 6)
+        self.assertEqual(plan.sample(100.0), (0.02,) * 6)
+        self.assertEqual(plan.duration, 4.0)
+        h = 1e-3
+        before, center, after = (plan.sample(t)[0] for t in (2 - h, 2.0, 2 + h))
+        self.assertLess(abs((after - before) / (2 * h)), 1e-6)
+        self.assertLess(abs((after - 2 * center + before) / h ** 2), 1e-4)
+
+    def test_actual_start_alignment_and_mismatch(self) -> None:
+        """容差内从实际角度起步，超出容差则拒绝而非自动跳到旧起点."""
+        plan = self.prepare(actual_start=(0.003,) * 6)
+        self.assertEqual(plan.sample(0.0), (0.003,) * 6)
+        with self.assertRaisesRegex(ValueError, '初始角度'):
+            self.prepare(actual_start=(0.006,) * 6)
+
+    def test_alignment_rechecks_first_segment_acceleration(self) -> None:
+        """调整首点增加首段位移后，必须重新验证峰值而非沿用旧报告."""
+        limits = PositionLimits((-1.0,) * 6, (1.0,) * 6, (1.0,) * 6, (0.02,) * 6)
+        with self.assertRaisesRegex(ValueError, '加速度超限'):
+            self.prepare(times_ns=(0, 1_000_000_000),
+                         positions=((0.0,) * 6, (0.003,) * 6),
+                         actual_start=(-0.003,) * 6, limits=limits)
+
+    def test_global_excursion_cannot_be_bypassed_by_small_segments(self) -> None:
+        """每段很小但累计偏离实际起点超限时，完整轨迹仍拒绝."""
+        with self.assertRaisesRegex(ValueError, '完整轨迹超出'):
+            self.prepare(times_ns=(0, 2_000_000_000, 4_000_000_000, 6_000_000_000),
+                         positions=((0.0,) * 6, (0.02,) * 6, (0.04,) * 6, (0.06,) * 6))
+
+    def test_nominal_limits_required_after_initial_preparation(self) -> None:
+        """完整正式计划不沿用初值轻微越界容差，须先完成准备."""
+        limits = PositionLimits((-1.0,) * 6, (1.0,) * 6, (0.1,) * 6, (0.2,) * 6, 0.005)
+        with self.assertRaisesRegex(ValueError, '超出'):
+            self.prepare(limits=limits, actual_start=(-1.001,) * 6)
+
+    def test_invalid_times_and_elapsed(self) -> None:
+        """拒绝浮点纳秒、重复时间、超长计划与非有限采样时间."""
+        for times in ((0, True), (0, 2.0), (0, 0), (1, 2), (0, 3601 * 10 ** 9)):
+            with self.subTest(times=times), self.assertRaises(ValueError):
+                self.prepare(times_ns=times, positions=((0.0,) * 6, (0.01,) * 6))
+        plan = self.prepare()
+        for elapsed in (True, float('nan'), float('inf')):
+            with self.subTest(elapsed=elapsed), self.assertRaises(ValueError):
+                plan.sample(elapsed)
+
+
+class PairedStartTests(unittest.TestCase):
+    """共享门控不访问设备，准备不完整或取消后不能释放启动."""
+
+    def test_both_distinct_sides_required(self) -> None:
+        """两个不同侧准备后才给出共同未来时刻."""
+        with patch('archer_hardware.position_plan.time.monotonic', return_value=100.0):
+            gate = PairedTrajectoryStart()
+            gate.ready('left')
+            self.assertIsNone(gate.start_time())
+            with self.assertRaises(ValueError):
+                gate.ready('left')
+            gate.ready('right')
+            start = gate.start_time()
+            assert start is not None
+            self.assertAlmostEqual(start, 100.2)
+            gate.cancel()
+            with self.assertRaises(RuntimeError):
+                gate.start_time()
+
+    def test_preparation_timeout_cannot_be_reused(self) -> None:
+        """迟到的第二侧不能启动已超时的一次性计划."""
+        with patch('archer_hardware.position_plan.time.monotonic') as clock:
+            clock.return_value = 100.0
+            gate = PairedTrajectoryStart()
+            gate.ready('left')
+            clock.return_value = 100.6
+            with self.assertRaises(RuntimeError):
+                gate.start_time()
+            with self.assertRaises(RuntimeError):
+                gate.ready('right')
+            self.assertTrue(gate.cancelled)
+
+
 class PositionAdapterTests(unittest.TestCase):
     """使用官方 Arm 消息构造器，替换所有反馈与网络发送."""
 
@@ -201,8 +302,8 @@ class PositionAdapterTests(unittest.TestCase):
             self.assertEqual([f.name for f, _ in target.ListFields()], ['position'])
 
     def test_faults_prevent_request(self) -> None:
-        """未校准、其他会话占有和机械臂运动均禁止申请控制."""
-        for field, value in (('_calibrated', False), ('_session_holder', 9)):
+        """其他会话占有和机械臂运动均禁止申请控制."""
+        for field, value in (('_session_holder', 9), ('_my_session_id', 0)):
             with self.subTest(field=field):
                 original = getattr(self.arm, field)
                 setattr(self.arm, field, value)
@@ -213,6 +314,215 @@ class PositionAdapterTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.adapter.request_control()
         self.send.assert_not_called()
+
+    def test_readonly_and_unknown_models_never_request_control(self) -> None:
+        """即使反馈和会话正常，只读 Hello 或未知型号也不发送初始化."""
+        for robot_type in (26, 28, 999):
+            with self.subTest(robot_type=robot_type):
+                self.arm.robot_type = robot_type
+                with self.assertRaisesRegex(RuntimeError, '位置控制型号'):
+                    self.adapter.request_control()
+                self.assertEqual(self.adapter.state, 'CONNECTED')
+        self.send.assert_not_called()
+
+    def test_initialization_is_separate_from_calibrated(self) -> None:
+        """type25可先申请初始化，校准状态未就绪前不发送位置或校准命令."""
+        self.arm.robot_type = 25
+        self.arm._calibrated = False
+        self.adapter.request_control()
+        self.arm._session_holder = 7
+        self.arm._api_control_initialized = True
+        for _ in range(3):
+            self.assertEqual(self.adapter.tick(), 'REQUESTING')
+        self.assertIsNone(self.adapter.initial_positions)
+        self.assertEqual([c.args[1] for c in self.send.call_args_list], ['initialize'])
+        self.arm._calibrated = True
+        self.positions = (0.002,) * 6
+        self.assertEqual(self.adapter.tick(), 'HOLDING')
+        self.assertEqual(self.adapter.initial_positions, self.positions)
+        self.assertEqual([c.args[1] for c in self.send.call_args_list],
+                         ['initialize', 'position'])
+
+    def test_calibrated_does_not_replace_initialization(self) -> None:
+        """校准状态已就绪仍须等会话和API确认，不能提前发送位置."""
+        self.adapter.request_control()
+        self.arm._session_holder = 7
+        self.assertEqual(self.adapter.tick(), 'REQUESTING')
+        self.assertIsNone(self.adapter.initial_positions)
+        self.assertEqual(self.adapter.state, 'REQUESTING')
+        self.assertEqual([c.args[1] for c in self.send.call_args_list], ['initialize'])
+
+    def test_calibration_wait_timeout_reports_reason(self) -> None:
+        """等待校准状态超时明确说明原因，不发送位置或自动校准."""
+        self.arm._calibrated = False
+        self.adapter.request_control()
+        self.arm._session_holder = 7
+        self.arm._api_control_initialized = True
+        self.adapter._requested_at -= self.adapter.readiness_timeout + 1.0
+        with self.assertRaisesRegex(RuntimeError, '就绪超时.*calibrated=true'):
+            self.adapter.tick()
+        self.assertEqual(self.adapter.state, 'FAULT')
+        self.assertNotIn('position', [c.args[1] for c in self.send.call_args_list])
+        self.assertIsNone(self.adapter.initial_positions)
+
+    def test_calibrated_loss_blocks_position_after_acquisition(self) -> None:
+        """取得控制后状态失效立即取消位置发送，沿用已有制动处理."""
+        self.acquire()
+        self.send.reset_mock()
+        self.arm._calibrated = False
+        with self.assertRaisesRegex(RuntimeError, 'calibrated 状态失效'):
+            self.adapter.tick()
+        self.assertEqual(self.adapter.state, 'FAULT')
+        self.assertEqual([c.args[1] for c in self.send.call_args_list], ['brake'])
+
+    def test_one_calibration_only_after_session_and_initialization(self) -> None:
+        """显式允许后，先确认控制会话和初始化，校准只发一次且等待真实确认."""
+        self.adapter.allow_api_calibration = True
+        self.arm._calibrated = False
+        self.adapter.request_control()
+        self.adapter.tick()
+        self.assertEqual(self.adapter.readiness_stage, 'WAITING_SESSION')
+        self.arm._session_holder = 7
+        self.adapter.tick()
+        self.assertEqual(self.adapter.readiness_stage, 'WAITING_INITIALIZATION')
+        self.assertEqual(self.send.call_count, 1)
+        self.arm._api_control_initialized = True
+        self.adapter.tick()
+        packet = self.send.call_args.args[0]
+        exclusive = packet.arm_command.arm_exclusive_command
+        self.assertEqual(exclusive.WhichOneof('exclusive_command'), 'calibrate')
+        self.assertTrue(exclusive.calibrate)
+        for _ in range(5):
+            self.adapter.tick()
+        self.assertEqual(self.adapter.readiness_stage, 'WAITING_CALIBRATION')
+        self.assertEqual([c.args[1] for c in self.send.call_args_list],
+                         ['initialize', 'calibrate'])
+        self.assertIsNone(self.adapter.initial_positions)
+        self.arm._calibrated = True
+        self.adapter.tick()
+        self.assertEqual(self.adapter.readiness_stage, 'READY')
+        self.assertEqual(self.send.call_args.args[1], 'position')
+
+    def test_default_permission_never_sends_calibration(self) -> None:
+        """默认等待明确标记需要允许校准，绝不默认为授权."""
+        self.arm._calibrated = False
+        self.adapter.request_control()
+        self.arm._session_holder = 7
+        self.arm._api_control_initialized = True
+        self.adapter.tick()
+        self.assertEqual(self.adapter.readiness_stage, 'CALIBRATION_PERMISSION_REQUIRED')
+        self.assertEqual([c.args[1] for c in self.send.call_args_list], ['initialize'])
+
+    def test_already_ready_skips_calibration_even_when_allowed(self) -> None:
+        """设备已有校准确认时不重复校准."""
+        self.adapter.allow_api_calibration = True
+        self.acquire()
+        self.assertFalse(self.adapter._calibration_sent)
+        self.assertNotIn('calibrate', [c.args[1] for c in self.send.call_args_list])
+
+    def test_calibration_send_failure_is_not_retried(self) -> None:
+        """校准传输结果不明时结束当前运行，不重发潜在动作."""
+        self.adapter.allow_api_calibration = True
+        self.arm._calibrated = False
+        self.adapter.request_control()
+        self.arm._session_holder = 7
+        self.arm._api_control_initialized = True
+
+        def fail_calibration(message, kind):
+            if kind == 'calibrate':
+                raise RuntimeError('calibration send unconfirmed')
+
+        self.send.side_effect = fail_calibration
+        with self.assertRaisesRegex(RuntimeError, 'send unconfirmed'):
+            self.adapter.tick()
+        self.assertTrue(self.adapter._calibration_sent)
+        self.assertEqual(self.adapter.state, 'FAULT')
+        self.adapter.tick()
+        self.assertEqual([c.args[1] for c in self.send.call_args_list].count('calibrate'), 1)
+        self.assertNotIn('position', [c.args[1] for c in self.send.call_args_list])
+
+    def check_waiting_motion(self, positions, velocity) -> None:
+        """构造等待中异常反馈，验证先取消再沿用停止处理."""
+        self.adapter.allow_api_calibration = True
+        self.arm._calibrated = False
+        self.adapter.request_control()
+        self.arm._session_holder = 7
+        self.arm._api_control_initialized = True
+        self.positions, self.velocity = positions, velocity
+        with self.assertRaisesRegex(RuntimeError, '出现运动|漂移'):
+            self.adapter.tick()
+        self.assertEqual(self.adapter.state, 'FAULT')
+        kinds = [c.args[1] for c in self.send.call_args_list]
+        self.assertNotIn('calibrate', kinds)
+        self.assertNotIn('position', kinds)
+
+    def test_waiting_motion_blocks_calibration(self) -> None:
+        """等待时速度异常先取消，不发送校准和位置目标."""
+        self.check_waiting_motion((0.0,) * 6, (0.03,) * 6)
+
+    def test_waiting_drift_blocks_calibration(self) -> None:
+        """速度为零但累计关节位置漂移超限时仍拒绝继续."""
+        self.check_waiting_motion((0.011,) * 6, (0.0,) * 6)
+
+    def test_calibration_wait_cannot_resume_after_halt(self) -> None:
+        """停止使排队校准失效；随后确认到来不能恢复当前位置发送."""
+        self.adapter.allow_api_calibration = True
+        self.arm._calibrated = False
+        self.adapter.request_control()
+        self.arm._session_holder = 7
+        self.arm._api_control_initialized = True
+        self.adapter.tick()
+        self.adapter.stop()
+        calls = self.send.call_count
+        self.arm._calibrated = True
+        self.adapter.tick()
+        self.assertEqual(self.adapter.state, 'STOPPED')
+        self.assertEqual(self.send.call_count, calls)
+        self.assertIsNone(self.adapter.initial_positions)
+
+    def test_calibration_confirmation_timeout_has_no_retry(self) -> None:
+        """校准消息已发送但未确认时，超时后结束且不重复发送."""
+        self.adapter.allow_api_calibration = True
+        self.arm._calibrated = False
+        self.adapter.request_control()
+        self.arm._session_holder = 7
+        self.arm._api_control_initialized = True
+        self.adapter.tick()
+        self.adapter._requested_at -= self.adapter.readiness_timeout + 1.0
+        with self.assertRaisesRegex(RuntimeError, '就绪超时.*calibrated=true'):
+            self.adapter.tick()
+        self.adapter.tick()
+        kinds = [c.args[1] for c in self.send.call_args_list]
+        self.assertEqual(kinds.count('calibrate'), 1)
+        self.assertNotIn('position', kinds)
+        self.assertEqual(self.adapter.state, 'FAULT')
+
+    def test_lost_initialization_after_calibration_ends_request(self) -> None:
+        """校准请求后初始化状态丢失不重新申请或校准."""
+        self.adapter.allow_api_calibration = True
+        self.arm._calibrated = False
+        self.adapter.request_control()
+        self.arm._session_holder = 7
+        self.arm._api_control_initialized = True
+        self.adapter.tick()
+        self.arm._api_control_initialized = False
+        with self.assertRaisesRegex(RuntimeError, '校准请求后'):
+            self.adapter.tick()
+        kinds = [c.args[1] for c in self.send.call_args_list]
+        self.assertEqual(kinds.count('initialize'), 1)
+        self.assertEqual(kinds.count('calibrate'), 1)
+        self.assertNotIn('position', kinds)
+
+    def test_calibration_parameters_are_validated(self) -> None:
+        """校准许可严格为布尔值，等待时间有界且拒绝非有限数值."""
+        for value in (None, 0, 1, 'true'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                HexPositionAdapter('ws://127.0.0.1:8439', fixture_limits(),
+                                   allow_api_calibration=cast(Any, value))
+        for value in (True, 0, -1, float('nan'), float('inf'), 30.1):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                HexPositionAdapter('ws://127.0.0.1:8439', fixture_limits(),
+                                   readiness_timeout=value)
 
     def test_feedback_stale(self) -> None:
         """过期反馈不允许进入控制流程."""
@@ -352,6 +662,128 @@ class PositionAdapterTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.adapter.return_to_initial(2.0)
 
+    def test_full_trajectory_completes_and_holds_without_auto_return(self) -> None:
+        """推进多段位置指令，到位后保持终点并保留原初值，等待显式归位."""
+        self.acquire()
+        self.positions = (0.001,) * 6
+        with patch('archer_hardware.position_adapter.time.monotonic') as clock:
+            clock.return_value = 100.0
+            self.adapter._last_tick = 100.0
+            self.adapter.follow_trajectory(
+                (0, 2_000_000_000, 4_000_000_000),
+                ((0.0,) * 6, (0.01,) * 6, (0.02,) * 6),
+            )
+            plan = self.adapter._move
+            assert isinstance(plan, JointPositionTrajectory)
+            self.assertEqual(plan.sample(0), self.positions)
+            for step in range(1, 431):
+                elapsed = step / 100
+                clock.return_value = 100 + elapsed
+                self.positions = plan.sample(elapsed)
+                self.adapter.tick()
+        self.assertEqual(self.adapter.state, 'HOLDING')
+        self.assertEqual(self.adapter._target, (0.02,) * 6)
+        self.assertEqual(self.adapter.initial_positions, (0.0,) * 6)
+        self.assertTrue(all(c.args[1] in ('initialize', 'position')
+                            for c in self.send.call_args_list))
+
+    def test_full_trajectory_rejects_initial_mismatch_before_sending(self) -> None:
+        """从当前真实反馈重新预检，起点已变化时不执行旧轨迹."""
+        self.acquire()
+        self.send.reset_mock()
+        self.positions = (0.01,) * 6
+        with self.assertRaisesRegex(ValueError, '初始角度'):
+            self.adapter.follow_trajectory(
+                (0, 2_000_000_000), ((0.0,) * 6, (0.02,) * 6),
+            )
+        self.assertEqual(self.adapter.state, 'HOLDING')
+        self.send.assert_not_called()
+
+    def test_full_trajectory_halt_prevents_remaining_points(self) -> None:
+        """执行中取消整条轨迹，后续tick不再恢复或补发剩余点."""
+        self.acquire()
+        self.adapter.follow_trajectory(
+            (0, 2_000_000_000, 4_000_000_000),
+            ((0.0,) * 6, (0.01,) * 6, (0.02,) * 6),
+        )
+        self.adapter.tick()
+        self.adapter.stop()
+        calls = self.send.call_count
+        self.adapter.tick()
+        self.assertEqual(self.send.call_count, calls)
+        self.assertIsNone(self.adapter._move)
+        with self.assertRaises(RuntimeError):
+            self.adapter.follow_trajectory(
+                (0, 2_000_000_000), ((0.0,) * 6, (0.02,) * 6),
+            )
+
+    def test_armed_trajectory_holds_until_shared_time(self) -> None:
+        """实际适配器准备后先保持位置，使用共同起点而非各自启动时刻."""
+        self.acquire()
+        with patch('archer_hardware.position_adapter.time.monotonic') as clock:
+            clock.return_value = 100.0
+            self.adapter._last_tick = 100.0
+            gate = PairedTrajectoryStart()
+            self.adapter.arm_trajectory((0, 2_000_000_000),
+                                        ((0.0,) * 6, (0.01,) * 6), 'left', gate)
+            gate.ready('right')
+            start = gate.start_time()
+            assert start is not None
+            clock.return_value = 100.01
+            self.adapter.tick()
+            self.assertEqual(self.adapter.state, 'ARMED')
+            self.assertEqual(self.adapter._target, (0.0,) * 6)
+            self.adapter._last_tick = start - 0.005
+            clock.return_value = start + 0.005
+            self.adapter.tick()
+            self.assertEqual(self.adapter.state, 'RUNNING')
+            self.assertEqual(self.adapter.trajectory_start_at, start)
+            self.assertEqual(self.adapter.trajectory_observed_start_at, start + 0.005)
+            assert self.adapter._target is not None
+            self.assertGreater(self.adapter._target[0], 0.0)
+
+    def test_armed_peer_cancellation_prevents_position_messages(self) -> None:
+        """另一臂取消门控时，本臂下一周期先停止，不能继续发位置."""
+        self.acquire()
+        gate = PairedTrajectoryStart()
+        self.adapter.arm_trajectory((0, 2_000_000_000),
+                                    ((0.0,) * 6, (0.01,) * 6), 'left', gate)
+        gate.cancel()
+        self.send.reset_mock()
+        with self.assertRaisesRegex(RuntimeError, '双臂轨迹已取消'):
+            self.adapter.tick()
+        self.assertEqual(self.adapter.state, 'FAULT')
+        self.assertEqual([c.args[1] for c in self.send.call_args_list], ['brake'])
+
+    def test_armed_late_start_is_cancelled(self) -> None:
+        """软件启动迟到超过工程门槛时取消，不追赶发点."""
+        self.acquire()
+        with patch('archer_hardware.position_adapter.time.monotonic') as clock:
+            clock.return_value = 100.0
+            gate = PairedTrajectoryStart()
+            self.adapter.arm_trajectory((0, 2_000_000_000),
+                                        ((0.0,) * 6, (0.01,) * 6), 'left', gate)
+            gate.ready('right')
+            start = gate.start_time()
+            assert start is not None
+            self.adapter._last_tick = start
+            clock.return_value = start + 0.025
+            with self.assertRaisesRegex(RuntimeError, '启动迟到'):
+                self.adapter.tick()
+            self.assertTrue(gate.cancelled)
+            self.assertEqual(self.adapter.state, 'FAULT')
+
+    def test_armed_drift_cancels_shared_gate(self) -> None:
+        """等待启动期间实际角度变化不能继续使用已准备的旧起点."""
+        self.acquire()
+        gate = PairedTrajectoryStart()
+        self.adapter.arm_trajectory((0, 2_000_000_000),
+                                    ((0.0,) * 6, (0.01,) * 6), 'left', gate)
+        self.positions = (0.006,) * 6
+        with self.assertRaisesRegex(RuntimeError, '实际位置或速度'):
+            self.adapter.tick()
+        self.assertTrue(gate.cancelled)
+
     def test_complete_move_then_return_actual_initial(self) -> None:
         """到位需依据实际反馈保持稳定，之后显式归位到本次起点."""
         self.positions = (0.005,) * 6
@@ -391,9 +823,29 @@ class PositionAdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, '不允许'):
                 self.adapter._send(object(), 'position')
             self.assertEqual(sent, [])
+            self.adapter.state = 'REQUESTING'
+            for allowed, latched in ((False, False), (False, True), (True, False)):
+                self.adapter.allow_api_calibration = allowed
+                self.adapter._calibration_sent = latched
+                with self.assertRaisesRegex(RuntimeError, '不允许'):
+                    self.adapter._send(object(), 'calibrate')
+            self.adapter.allow_api_calibration = True
+            self.adapter._calibration_sent = True
+            self.adapter._send(object(), 'calibrate')
+            self.assertEqual(len(sent), 1)
+            sent.clear()
+            self.adapter.state = 'STOPPED'
+            with self.assertRaisesRegex(RuntimeError, '不允许'):
+                self.adapter._send(object(), 'calibrate')
             self.adapter.state = 'HOLDING'
             packet = object()
             self.adapter._send(packet, 'position')
+            self.assertEqual(sent, [packet])
+            gate = PairedTrajectoryStart()
+            self.adapter._trajectory_gate = gate
+            gate.cancel()
+            with self.assertRaisesRegex(RuntimeError, '双臂轨迹已取消'):
+                self.adapter._send(packet, 'position')
             self.assertEqual(sent, [packet])
         finally:
             loop.call_soon_threadsafe(loop.stop)

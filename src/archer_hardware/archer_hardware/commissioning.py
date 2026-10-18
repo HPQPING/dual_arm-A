@@ -1,13 +1,15 @@
-"""集中只读反馈验收和准备文件生成；不连接 SDK、不发送控制命令."""
+"""提供只读反馈验收、小幅试动文件生成及离线轨迹预检与时间调整，不连接SDK或发送控制命令."""
 
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
+import hashlib
 import json
 import math
 from pathlib import Path
 import time
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import rclpy
 from rclpy.node import Node
@@ -16,7 +18,7 @@ from sensor_msgs.msg import JointState
 import yaml
 
 from .hex_adapter import six_values
-from .position_plan import JointPositionMove, PositionLimits, positive
+from .position_plan import JointPositionMove, JointPositionTrajectory, PositionLimits, positive
 
 
 class FeedbackWindow:
@@ -130,9 +132,10 @@ class FeedbackAuditNode(Node):
         return receive
 
 
-def load_limits(path: Path) -> dict[str, PositionLimits]:
+def load_limits(path: Path, *, content: bytes | None = None) -> dict[str, PositionLimits]:
     """读取已有位置配置作比较，不启用其中连接或控制开关."""
-    data = yaml.safe_load(path.read_text(encoding='utf-8'))
+    text = path.read_text(encoding='utf-8') if content is None else content.decode('utf-8')
+    data = yaml.safe_load(text)
     parameters = data['archer_position_driver']['ros__parameters']
     return {
         side: PositionLimits(
@@ -142,6 +145,231 @@ def load_limits(path: Path) -> dict[str, PositionLimits]:
             parameters['feedback_tolerance'],
         ) for side in ('left', 'right')
     }
+
+
+def _measure_joint_plan(
+    data: object, limits: dict[str, PositionLimits],
+) -> tuple[dict[str, Any], dict[str, tuple[list[int], list[tuple[float, ...]]]]]:
+    """解析结构、名义位置和共享时间轴，测量峰值供预检与时间调整共用."""
+    if not isinstance(data, dict) or set(data) != {
+        'version', 'interpolation', 'left', 'right',
+    }:
+        raise ValueError('计划需要 version、interpolation、left、right 四个字段')
+    if type(data['version']) is not int or data['version'] != 1:
+        raise ValueError('计划 version 必须为整数 1')
+    if data['interpolation'] != 'quintic_stop':
+        raise ValueError('仅检查每段端点速度及加速度为零的 quintic_stop 插值')
+    grids: dict[str, list[int]] = {}
+    parsed: dict[str, tuple[list[int], list[tuple[float, ...]]]] = {}
+    arms = {}
+    for side in ('left', 'right'):
+        arm = data[side]
+        if not isinstance(arm, dict) or set(arm) != {'joint_names', 'points'}:
+            raise ValueError(f'{side} 需要 joint_names 和 points')
+        expected = [f'{side}_joint_{i}' for i in range(1, 7)]
+        if arm['joint_names'] != expected:
+            raise ValueError(f'{side} 关节名必须按 joint_1 至 joint_6 顺序排列')
+        points = arm['points']
+        if not isinstance(points, list) or len(points) < 2:
+            raise ValueError(f'{side} 至少需要起点及一个目标点')
+        times: list[int] = []
+        positions: list[tuple[float, ...]] = []
+        peak_speed = [0.0] * 6
+        peak_acceleration = [0.0] * 6
+        bound = limits[side]
+        for index, point in enumerate(points):
+            if not isinstance(point, dict) or set(point) != {'positions', 'time_from_start'}:
+                raise ValueError(f'{side} 第 {index} 点字段不符合位置计划格式')
+            stamp = point['time_from_start']
+            if not isinstance(stamp, dict) or set(stamp) != {'sec', 'nanosec'}:
+                raise ValueError(f'{side} 第 {index} 点需要 sec 和 nanosec')
+            seconds, nanos = stamp['sec'], stamp['nanosec']
+            if (type(seconds) is not int or type(nanos) is not int
+                    or not 0 <= seconds <= 2_147_483_647 or not 0 <= nanos < 10 ** 9):
+                raise ValueError(f'{side} 第 {index} 点时间无效')
+            timestamp = seconds * 10 ** 9 + nanos
+            if (not times and timestamp != 0) or (times and timestamp <= times[-1]):
+                raise ValueError(f'{side} 时间必须从零开始并严格递增')
+            raw = point['positions']
+            if not isinstance(raw, list):
+                raise ValueError(f'{side} 第 {index} 点 positions 必须为六维列表')
+            # 正式计划全程使用名义限位，初值工程偏差另走已有准备流程。
+            current = bound.check_positions(raw)
+            if positions:
+                duration = (timestamp - times[-1]) / 1e9
+                previous = positions[-1]
+                for joint, (a, b) in enumerate(zip(previous, current)):
+                    distance = abs(b - a)
+                    peak_speed[joint] = max(peak_speed[joint], 1.875 * distance / duration)
+                    peak_acceleration[joint] = max(
+                        peak_acceleration[joint], (10 / math.sqrt(3)) * distance / duration ** 2,
+                    )
+            times.append(timestamp)
+            positions.append(current)
+        grids[side] = times
+        excursion = max(
+            abs(q - first) for row in positions for q, first in zip(row, positions[0])
+        )
+        parsed[side] = times, positions
+        arms[side] = {
+            'points': len(times), 'segments': len(times) - 1,
+            'initial_planned_rad': positions[0], 'final_planned_rad': positions[-1],
+            'peak_velocity_rad_s': peak_speed,
+            'peak_acceleration_rad_s2': peak_acceleration,
+            'max_excursion_from_start_rad': excursion,
+        }
+    if grids['left'] != grids['right']:
+        raise ValueError('双臂必须使用相同的纳秒时间轴，不能只比较总时长')
+    return {
+        'passed': True, 'interpolation': 'quintic_stop',
+        'duration_s': grids['left'][-1] / 1e9, 'arms': arms,
+        'execution_supported_by_current_driver': False,
+        'paired_interface_available': True,
+        'scope': '仅关节计划解析预检；不含实际初值、TCP、碰撞或夹紧力验证，不发送动作',
+        'remaining': '成对接口需显式许可、在线初值预检及完整任务几何检查',
+    }, parsed
+
+
+def review_joint_plan(data: object, limits: dict[str, PositionLimits]) -> dict[str, Any]:
+    """完整预检仍使用执行核心的速度、加速度及一小时时长规则."""
+    report, parsed = _measure_joint_plan(data, limits)
+    for side, (times, positions) in parsed.items():
+        excursion = report['arms'][side]['max_excursion_from_start_rad']
+        try:
+            JointPositionTrajectory.prepare(
+                times, positions, limits[side], max(excursion, 1e-12),
+                actual_start=positions[0],
+            )
+        except ValueError as error:
+            raise ValueError(f'{side} {error}') from error
+    return report
+
+
+def retime_joint_plan(
+    data: object, limits: dict[str, PositionLimits], margin: float = 1.05,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """仅放慢共享时间轴；不改关节角、插值、名义限位或驱动配置."""
+    margin = positive(margin, 'margin')
+    if not 1.001 <= margin <= 2.0:
+        raise ValueError('margin 必须在 1.001 到 2.0 之间')
+    measured, parsed = _measure_joint_plan(data, limits)
+    original = parsed['left'][0]
+    if original[-1] > 3600 * 10 ** 9:
+        raise ValueError('原始轨迹总时长已经超过一小时，不能通过放慢修复')
+    required = 0.0
+    for side, bounds in limits.items():
+        arm = measured['arms'][side]
+        for speed, acceleration, vmax, amax in zip(
+            arm['peak_velocity_rad_s'], arm['peak_acceleration_rad_s2'],
+            bounds.max_velocity, bounds.max_acceleration,
+        ):
+            required = max(required, speed / vmax, math.sqrt(acceleration / amax))
+    factor = max(1.0, required * margin)
+    if not math.isfinite(factor) or original[-1] * factor > 3600 * 10 ** 9:
+        raise ValueError('满足限制所需总时长超过一小时，未生成计划')
+    times = [0]
+    for before, after in zip(original, original[1:]):
+        times.append(times[-1] + math.ceil((after - before) * factor))
+    # 输入结构已完成严格解析；深复制以免调用者原始计划被修改。
+    result: dict[str, Any] = deepcopy(cast(dict[str, Any], data))
+    for side in ('left', 'right'):
+        for point, stamp in zip(result[side]['points'], times):
+            point['time_from_start'] = {'sec': stamp // 10 ** 9, 'nanosec': stamp % 10 ** 9}
+    verified = review_joint_plan(result, limits)
+    verified.update({
+        'source_duration_s': original[-1] / 1e9, 'requested_margin': margin,
+        'time_scale': factor, 'positions_unchanged': True,
+        'scope': '仅调整时间并复核关节约束；未验证实际起点、碰撞或夹持，不发送动作',
+    })
+    return result, verified
+
+
+def plan_retime_main(args: list[str] | None = None) -> int:
+    """显式生成新计划与哈希报告，不初始化 ROS、不连接设备或自动执行."""
+    parser = argparse.ArgumentParser(description='离线放慢双臂轨迹，保持关节路径与配合关系')
+    parser.add_argument('--plan-file', type=Path, required=True)
+    parser.add_argument('--limits-file', type=Path, required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--report', type=Path, required=True)
+    parser.add_argument('--margin', type=float, default=1.05)
+    options = parser.parse_args(args)
+    paths = [options.plan_file, options.limits_file, options.output, options.report]
+    if len({p.resolve() for p in paths}) != 4:
+        parser.error('输入、限制、输出计划和报告必须使用四个不同的文件路径')
+    if options.output.exists() or options.report.exists():
+        parser.error('输出计划或报告已存在，请指定新文件名')
+    report: dict[str, Any] = {'passed': False, 'commands_sent': False}
+    plan_created = False
+    try:
+        plan_bytes = options.plan_file.read_bytes()
+        limits_bytes = options.limits_file.read_bytes()
+        report.update({
+            'source_plan': str(options.plan_file.resolve()),
+            'source_sha256': hashlib.sha256(plan_bytes).hexdigest(),
+            'limits_file': str(options.limits_file.resolve()),
+            'limits_sha256': hashlib.sha256(limits_bytes).hexdigest(),
+        })
+        result, verified = retime_joint_plan(
+            yaml.safe_load(plan_bytes.decode('utf-8')),
+            load_limits(options.limits_file, content=limits_bytes), options.margin,
+        )
+        content = (json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False)
+                   + '\n').encode('utf-8')
+        # 先排他保留报告路径，再排他创建计划；不会覆盖输入或其他进程的文件。
+        with options.report.open('x', encoding='utf-8') as evidence:
+            try:
+                with options.output.open('xb') as stream:
+                    plan_created = True
+                    stream.write(content)
+                report.update(verified)
+                report.update({
+                    'output_plan': str(options.output.resolve()),
+                    'output_sha256': hashlib.sha256(content).hexdigest(),
+                })
+                json.dump(report, evidence, ensure_ascii=False, indent=2, allow_nan=False)
+                evidence.write('\n')
+            except (OSError, ValueError, TypeError):
+                if plan_created:
+                    options.output.unlink()
+                raise
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError, yaml.YAMLError) as error:
+        print(f'时间调整失败：{error}；未发送动作')
+        return 1
+    print(f"已生成：{options.output}；{verified['source_duration_s']:.3f}s → "
+          f"{verified['duration_s']:.3f}s；未发送动作")
+    return 0
+
+
+def plan_check_main(args: list[str] | None = None) -> int:
+    """读取显式计划文件，排他写入通过或失败报告，不初始化 ROS."""
+    parser = argparse.ArgumentParser(description='离线双臂关节计划预检，不连接设备或ROS')
+    parser.add_argument('--plan-file', type=Path, required=True)
+    parser.add_argument('--limits-file', type=Path, required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    options = parser.parse_args(args)
+    if options.output.exists():
+        parser.error('报告已存在，请指定新文件名')
+    report: dict[str, Any] = {'passed': False, 'commands_sent': False}
+    try:
+        plan_bytes = options.plan_file.read_bytes()
+        limits_bytes = options.limits_file.read_bytes()
+        report.update({
+            'plan_file': str(options.plan_file.resolve()),
+            'plan_sha256': hashlib.sha256(plan_bytes).hexdigest(),
+            'limits_file': str(options.limits_file.resolve()),
+            'limits_sha256': hashlib.sha256(limits_bytes).hexdigest(),
+        })
+        report.update(review_joint_plan(
+            yaml.safe_load(plan_bytes.decode('utf-8')),
+            load_limits(options.limits_file, content=limits_bytes),
+        ))
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError, yaml.YAMLError) as error:
+        report['error'] = str(error)
+    with options.output.open('x', encoding='utf-8') as stream:
+        json.dump(report, stream, ensure_ascii=False, indent=2, allow_nan=False)
+        stream.write('\n')
+    print(f"{'通过' if report['passed'] else '未通过'}：离线报告 {options.output}；未发送动作")
+    return 0 if report['passed'] else 1
 
 
 def audit_main(args: list[str] | None = None) -> int:

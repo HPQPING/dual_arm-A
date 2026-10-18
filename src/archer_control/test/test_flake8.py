@@ -1,3 +1,5 @@
+"""检查功能包Python代码的格式和静态风格，不启动节点或连接设备."""
+
 # Copyright 2017 Open Source Robotics Foundation, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

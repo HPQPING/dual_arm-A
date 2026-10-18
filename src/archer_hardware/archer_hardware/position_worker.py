@@ -10,12 +10,14 @@ from typing import Callable, Protocol
 from uuid import uuid4
 
 from .hex_adapter import JointFeedback
+from .position_plan import PairedTrajectoryStart
 
 
 ALLOWED_STATES = {
     'connect': ('DISCONNECTED',),
     'enable': ('CONNECTED',),
     'move': ('HOLDING',),
+    'trajectory': ('HOLDING',),
     'return': ('HOLDING', 'RUNNING'),
     'disconnect': ('CONNECTED', 'STOPPED', 'FAULT', 'DISCONNECTED'),
 }
@@ -48,6 +50,13 @@ class PositionBackend(Protocol):
         """显式归位."""
         ...
 
+    def arm_trajectory(
+        self, times_ns: tuple[int, ...], positions: tuple[tuple[float, ...], ...],
+        side: str, gate: PairedTrajectoryStart,
+    ) -> None:
+        """准备完整轨迹，和另一侧共用启动门控."""
+        ...
+
     def tick(self) -> str:
         """推进控制周期."""
         ...
@@ -73,6 +82,9 @@ class WorkerSnapshot:
     command: str = ''
     phase: str = ''
     message: str = ''
+    readiness_stage: str = ''
+    trajectory_start_at: float | None = None
+    trajectory_observed_start_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +97,9 @@ class WorkerCommand:
     expires: float
     goal: tuple[float, ...] = ()
     duration: float = 0.0
+    times_ns: tuple[int, ...] = ()
+    positions: tuple[tuple[float, ...], ...] = ()
+    gate: PairedTrajectoryStart | None = None
 
 
 class PositionWorker:
@@ -134,6 +149,8 @@ class PositionWorker:
 
     def submit(
         self, kind: str, *, goal: tuple[float, ...] = (), duration: float = 0.0,
+        times_ns: tuple[int, ...] = (), positions: tuple[tuple[float, ...], ...] = (),
+        gate: PairedTrajectoryStart | None = None,
     ) -> str:
         """异步受理请求；返回编号不表示设备执行成功."""
         if kind not in ALLOWED_STATES:
@@ -152,7 +169,7 @@ class PositionWorker:
             identifier = uuid4().hex[:12]
             command = WorkerCommand(
                 identifier, kind, self._generation, time.monotonic() + 0.5,
-                goal, duration,
+                goal, duration, times_ns, positions, gate,
             )
             try:
                 self._queue.put_nowait(command)
@@ -194,6 +211,9 @@ class PositionWorker:
             self._error or (backend.last_error if backend else ''),
             self._job.identifier if self._job else '',
             self._job.kind if self._job else '', self._phase, self._message,
+            getattr(backend, 'readiness_stage', '') if backend else '',
+            getattr(backend, 'trajectory_start_at', None) if backend else None,
+            getattr(backend, 'trajectory_observed_start_at', None) if backend else None,
         )
         with self._snapshot_lock:
             self._snapshot = snapshot
@@ -262,6 +282,12 @@ class PositionWorker:
             elif command.kind == 'return':
                 backend.return_to_initial(command.duration)
                 self._phase = 'RUNNING'
+            elif command.kind == 'trajectory':
+                if command.gate is None:
+                    raise ValueError('成对轨迹缺少共同启动门控')
+                backend.arm_trajectory(command.times_ns, command.positions,
+                                       self.side, command.gate)
+                self._message = '本臂已准备，等待两臂共同启动'
             elif command.kind == 'disconnect':
                 backend.close()
                 self._backend = None
@@ -269,7 +295,7 @@ class PositionWorker:
                 self._phase = 'SUCCEEDED'
                 self._message = '连接已关闭，未执行归位'
         except ValueError as error:
-            if command.kind == 'return' and self._backend is not None:
+            if command.kind in ('return', 'trajectory') and self._backend is not None:
                 # 归位预检失败不能继续原动作，转为故障停止并通知另一臂。
                 self._fail(error)
             else:
@@ -277,7 +303,7 @@ class PositionWorker:
                 self._message = str(error)
         except Exception as error:
             if self._backend and self._backend.state in (
-                'REQUESTING', 'HOLDING', 'RUNNING', 'RETURNING', 'FAULT',
+                'REQUESTING', 'HOLDING', 'ARMED', 'RUNNING', 'RETURNING', 'FAULT',
             ):
                 self._fail(error)
             else:
@@ -303,10 +329,13 @@ class PositionWorker:
             elif time.monotonic() - self._connected_at > self.startup_timeout:
                 raise RuntimeError('等待真实反馈首帧超时')
             previous = backend.state
-            if previous in ('REQUESTING', 'HOLDING', 'RUNNING', 'RETURNING'):
+            if previous in ('REQUESTING', 'HOLDING', 'ARMED', 'RUNNING', 'RETURNING'):
                 backend.tick()
+                if backend.state == 'RUNNING' and previous == 'ARMED':
+                    self._phase = 'RUNNING'
+                    self._message = '按共同单调时刻推进轨迹，非控制器硬同步'
                 if backend.state == 'HOLDING' and previous in (
-                    'REQUESTING', 'RUNNING', 'RETURNING',
+                    'REQUESTING', 'ARMED', 'RUNNING', 'RETURNING',
                 ):
                     self._phase = 'SUCCEEDED'
                     self._message = ('控制权已确认，保持实际当前位置' if previous == 'REQUESTING'

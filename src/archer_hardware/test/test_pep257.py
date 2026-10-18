@@ -1,3 +1,5 @@
+"""从任意工作目录运行时，都只检查当前功能包的文档字符串."""
+
 # Copyright 2015 Open Source Robotics Foundation, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,7 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""从任意工作目录运行时，都只检查当前功能包的文档字符串."""
 
 from pathlib import Path
 

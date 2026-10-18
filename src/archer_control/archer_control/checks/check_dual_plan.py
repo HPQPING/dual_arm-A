@@ -1,8 +1,7 @@
-"""Offline paired planning check. Does not publish or connect to robots.
+"""离线检查双臂配对规划，不发布轨迹或连接机械臂.
 
-Run: python3 -m archer_control.checks.check_dual_plan
-Or pass --left-urdf PATH --right-urdf PATH to use expanded URDF files.
-"""
+运行：python3 -m archer_control.checks.check_dual_plan。
+可传入 --left-urdf PATH --right-urdf PATH 使用已展开的URDF文件。"""
 
 from __future__ import annotations
 

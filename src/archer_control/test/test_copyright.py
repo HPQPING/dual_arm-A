@@ -1,3 +1,5 @@
+"""检查功能包源文件的版权声明格式，不启动节点或连接设备."""
+
 # Copyright 2015 Open Source Robotics Foundation, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

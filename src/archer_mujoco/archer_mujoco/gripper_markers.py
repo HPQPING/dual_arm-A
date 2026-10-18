@@ -1,4 +1,4 @@
-"""Display GP80 fingertip coordinates in RViz, without changing its mesh."""
+"""在RViz发布GP80指尖坐标标记，不修改夹爪网格或发送夹爪控制命令."""
 
 import math
 

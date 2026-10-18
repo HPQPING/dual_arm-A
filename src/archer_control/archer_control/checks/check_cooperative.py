@@ -12,7 +12,7 @@ from archer_mujoco.model_loader import mujoco
 from ..model_checks import CollisionModel, validate_tool_chain, cross_arm_failure
 from ..circle_planner import MOUNT_XYZ, TCP_XYZ, inward_rotation
 from ..cooperative_planner import interpolate_pose, plan_cooperative, sample_errors
-from ..dual_arm_trajectory import DualArmKinematics, rigid_transform, peak_target_speeds
+from ..dual_arm_trajectory import DualArmKinematics, rigid_transform, peak_target_speeds, export_paired_plan
 from ..kinematics import ArmKinematics
 from ..trajectory import DEFAULT_SPEED_LIMITS, FloatArray, sample_joint_plan
 
@@ -38,6 +38,7 @@ def main() -> int:
     parser.add_argument('--left-urdf')
     parser.add_argument('--right-urdf')
     parser.add_argument('--samples', type=int, default=32)
+    parser.add_argument('--export-plan', help='预检通过后导出关节计划，仅创建新文件')
     args = parser.parse_args()
     if not 16 <= args.samples <= 128:
         parser.error('samples 必须在 16～128 内')
@@ -96,6 +97,9 @@ def main() -> int:
         print(f"最大两 TCP 相对位置误差：{maxima['relative_position_m'] * 1000:.4f} mm")
         print(f"最大两 TCP 相对姿态误差：{maxima['relative_rotation_rad']:.6f} rad")
         print('仅运动学与离散跨臂预检：未模拟物体、夹紧力、自碰撞、桌面或线缆，未发送动作。')
+        if args.export_plan:
+            target = export_paired_plan(result.paired, args.export_plan)
+            print(f'已导出：{target}；仍需真机限位预检与实际起点核对，未发送动作')
         return 0
     except (ValueError, OSError, RuntimeError) as exc:
         print('预检失败：' + str(exc))

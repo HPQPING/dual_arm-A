@@ -1,4 +1,4 @@
-"""Single-arm joint and sampled Cartesian tasks for the simulation interface."""
+"""提供单臂关节和采样笛卡尔仿真任务，通过ROS接口发布任务轨迹."""
 
 import math
 import time

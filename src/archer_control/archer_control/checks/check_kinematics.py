@@ -1,4 +1,4 @@
-"""Offline FK/Jacobian/IK check. Does not publish robot commands."""
+"""离线检查正运动学、雅可比矩阵和逆运动学，不发布机械臂控制指令."""
 
 import argparse
 

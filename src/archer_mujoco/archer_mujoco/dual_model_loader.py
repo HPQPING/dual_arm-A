@@ -1,8 +1,7 @@
-"""Build one 12-joint MuJoCo scene from the existing single-arm URDFs.
+"""从现有单臂URDF组合十二关节MuJoCo场景，不访问硬件.
 
-No hardware access. GP80 remains a rigid mesh; TCP is the configured candidate.
-Original meshes and URDFs are never modified. Assets are staged temporarily.
-"""
+GP80仍为刚性网格，TCP使用当前配置的候选值。
+原始网格与URDF保持不变，临时整理模型所需资源。"""
 
 from __future__ import annotations
 

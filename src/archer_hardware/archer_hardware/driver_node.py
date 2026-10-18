@@ -70,8 +70,15 @@ class HardwareFeedbackNode(Node):
                 for side, adapter in self.adapters.items():
                     adapter.connect()
                     self.states[side] = 'WAITING'
-            except Exception:
-                self.close_connections()
+            except Exception as error:
+                try:
+                    self.close_connections()
+                except Exception as cleanup_error:
+                    raise RuntimeError(
+                        f'连接失败：{error}；连接清理失败：{cleanup_error}'
+                    ) from error
+                finally:
+                    self.destroy_node()
                 raise
         self.started = time.monotonic()
         self.create_timer(0.02, self.poll_feedback)
@@ -116,13 +123,22 @@ class HardwareFeedbackNode(Node):
                 self.states[side] = 'READY'
             except Exception as error:
                 self.states[side] = f'ERROR: {error}'
-                adapter.close()
+                try:
+                    adapter.close()
+                except Exception as cleanup_error:
+                    self.states[side] += f'；连接清理未确认：{cleanup_error}'
         self.publish_status()
 
     def close_connections(self) -> None:
-        """释放两侧连接，不触发回零或其他退出运动."""
-        for adapter in self.adapters.values():
-            adapter.close()
+        """始终尝试两侧清理，收集失败后统一报告，不触发退出运动."""
+        errors = []
+        for side, adapter in self.adapters.items():
+            try:
+                adapter.close()
+            except Exception as error:
+                errors.append(f'{side}: {error}')
+        if errors:
+            raise RuntimeError('；'.join(errors))
 
 
 def main(args: list[str] | None = None) -> None:
@@ -135,11 +151,15 @@ def main(args: list[str] | None = None) -> None:
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        if node is not None:
-            node.close_connections()
-            node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        try:
+            if node is not None:
+                try:
+                    node.close_connections()
+                finally:
+                    node.destroy_node()
+        finally:
+            if rclpy.ok():
+                rclpy.shutdown()
 
 
 if __name__ == '__main__':

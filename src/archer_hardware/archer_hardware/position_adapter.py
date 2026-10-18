@@ -13,9 +13,12 @@ import time
 from typing import Any, Iterable, cast
 
 from .hex_adapter import (
-    HexFeedbackAdapter, JointFeedback, report_only, verified_sdk,
+    HexFeedbackAdapter, JointFeedback, managed_sdk_class, report_only, verified_sdk,
 )
-from .position_plan import JointPositionMove, PositionLimits, StopAndReturnMove, positive
+from .position_plan import (
+    JointPositionMove, JointPositionTrajectory, PairedTrajectoryStart, PositionLimits,
+    StopAndReturnMove, positive,
+)
 
 
 class HexPositionAdapter(HexFeedbackAdapter):
@@ -24,6 +27,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
     def __init__(
         self, url: str, limits: PositionLimits, *, control_hz: int = 250,
         max_excursion: float = 0.05, tracking_tolerance: float = 0.10,
+        allow_api_calibration: bool = False, readiness_timeout: float = 10.0,
     ) -> None:
         """要求显式传入限位，小幅试运行默认每关节最多变化 0.05 rad."""
         super().__init__(url, stale_timeout=0.1)
@@ -33,12 +37,24 @@ class HexPositionAdapter(HexFeedbackAdapter):
         self.control_hz = control_hz
         self.max_excursion = positive(max_excursion, 'max_excursion')
         self.tracking_tolerance = positive(tracking_tolerance, 'tracking_tolerance')
+        if type(allow_api_calibration) is not bool:
+            raise ValueError('allow_api_calibration 必须为布尔值')
+        self.allow_api_calibration = allow_api_calibration
+        self.readiness_timeout = positive(readiness_timeout, 'readiness_timeout')
+        if self.readiness_timeout > 30.0:
+            raise ValueError('readiness_timeout 不能超过 30 秒')
+        self.readiness_stage = 'IDLE'
+        self._calibration_sent = False
+        self._request_positions: tuple[float, ...] | None = None
         self.state = 'DISCONNECTED'
         self.last_error = ''
         self.initial_positions: tuple[float, ...] | None = None
         self._feedback: JointFeedback | None = None
         self._target: tuple[float, ...] | None = None
-        self._move: JointPositionMove | StopAndReturnMove | None = None
+        self._move: JointPositionMove | JointPositionTrajectory | StopAndReturnMove | None = None
+        self._trajectory_gate: PairedTrajectoryStart | None = None
+        self.trajectory_start_at: float | None = None
+        self.trajectory_observed_start_at: float | None = None
         self._base: Any = None
         self._command_types: Any = None
         self._epoch = 0
@@ -56,7 +72,9 @@ class HexPositionAdapter(HexFeedbackAdapter):
         module = verified_sdk()
         base = cast(Any, module.HexDeviceApi)
 
-        class PositionAPI(base):
+        managed_base = managed_sdk_class(base)
+
+        class PositionAPI(managed_base):
             """官方周期发送关闭；设备回调只能下发反馈频率设置."""
 
             def _start_device_periodic_task(self, device_id: int) -> None:
@@ -77,6 +95,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
         self.last_error = ''
         self._epoch += 1
         self.state = 'CONNECTED'
+        self.readiness_stage = 'CONNECTED'
 
     def _arm(self) -> Any:
         arms = [d for d in self._api.device_list if isinstance(d, self._arm_type)]
@@ -105,8 +124,14 @@ class HexPositionAdapter(HexFeedbackAdapter):
             self.limits.check_positions(frame.positions)
         return frame
 
-    def _health(self) -> tuple[bool, bool]:
+    def _health(self, *, require_calibrated: bool = True) -> tuple[bool, bool, bool]:
         arm = self._arm()
+        # SDK 的 type 26 是只读 HelloArcher；不能因六轴反馈正常而允许控制。
+        if arm.robot_type not in (16, 17, 25):
+            raise RuntimeError(
+                f'设备型号 {arm.robot_type} 不在已核对的位置控制型号中；'
+                '只读 Hello 型号禁止申请控制'
+            )
         if arm.get_parking_stop_detail().ListFields():
             raise RuntimeError('机械臂报告停车故障；本接口不会自动清除')
         errors = arm.get_motor_error_codes()
@@ -119,13 +144,16 @@ class HexPositionAdapter(HexFeedbackAdapter):
             initialized = arm._api_control_initialized
             holder = arm._session_holder
             mine = arm._my_session_id
-        if calibrated is not True:
-            raise RuntimeError('机械臂尚未校准；本接口不会自动校准')
+        if require_calibrated and calibrated is not True:
+            raise RuntimeError(
+                '设备尚未报告 calibrated=true，禁止发送位置目标；'
+                '本接口不会自动校准'
+            )
         if mine <= 0:
             raise RuntimeError('尚未取得有效会话编号')
         if holder not in (0, mine):
             raise RuntimeError('控制权属于其他会话，不抢占')
-        return holder == mine, initialized is True
+        return holder == mine, initialized is True, calibrated is True
 
     def _send(self, message: Any, kind: str) -> None:
         """有界等待官方发送协程，过期排队消息在发送前作废."""
@@ -138,9 +166,16 @@ class HexPositionAdapter(HexFeedbackAdapter):
         async def deliver() -> None:
             if epoch != self._epoch or time.perf_counter() > deadline:
                 raise RuntimeError('控制消息已作废或发送超时')
+            if (kind == 'position' and self._trajectory_gate is not None
+                    and self._trajectory_gate.cancelled):
+                raise RuntimeError('双臂轨迹已取消，禁止发送排队的位置消息')
             permitted = (
                 kind == 'initialize' and self.state == 'REQUESTING'
-                or kind == 'position' and self.state in ('HOLDING', 'RUNNING', 'RETURNING')
+                or kind == 'calibrate' and self.state == 'REQUESTING'
+                and self.allow_api_calibration and self._calibration_sent
+                or kind == 'position' and self.state in (
+                    'HOLDING', 'ARMED', 'RUNNING', 'RETURNING',
+                )
                 or kind == 'brake' and self.state in ('STOPPED', 'FAULT')
             )
             if not permitted:
@@ -164,10 +199,13 @@ class HexPositionAdapter(HexFeedbackAdapter):
         if self.state != 'CONNECTED':
             raise RuntimeError('仅允许从 CONNECTED 状态申请控制')
         frame = self._fresh_feedback()
-        self._health()
+        self._health(require_calibrated=False)
         if max(abs(v) for v in frame.velocities) > 0.02:
             raise RuntimeError('机械臂仍在运动，不能申请初始位置保持')
         self.state = 'REQUESTING'
+        self.readiness_stage = 'WAITING_SESSION'
+        self._calibration_sent = False
+        self._request_positions = frame.positions
         self._requested_at = time.monotonic()
         try:
             self._send(self._arm()._construct_init_message(True), 'initialize')
@@ -181,7 +219,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
         if self.state != 'HOLDING':
             raise RuntimeError('需要先获得控制权并处于 HOLDING 状态')
         frame = self._fresh_feedback()
-        owned, initialized = self._health()
+        owned, initialized, _ = self._health()
         if not owned or not initialized:
             raise RuntimeError('控制会话无效')
         if max(abs(v) for v in frame.velocities) > 0.02:
@@ -192,9 +230,47 @@ class HexPositionAdapter(HexFeedbackAdapter):
         self._recovering_limits = not self.limits.within_nominal(frame.positions)
         self._nominal_required = not self._recovering_limits
         self._move = move
+        self._trajectory_gate = None
         self._move_started = time.monotonic()
         self._settled_since = None
         self.state = 'RUNNING'
+
+    def follow_trajectory(
+        self, times_ns: Iterable[int], positions: Iterable[Iterable[object]],
+    ) -> None:
+        """从新鲜实际反馈执行完整预检轨迹，暂不对外暴露ROS整段入口."""
+        if self.state != 'HOLDING':
+            raise RuntimeError('完整轨迹需要先处于 HOLDING 状态')
+        frame = self._fresh_feedback()
+        owned, initialized, _ = self._health()
+        if not owned or not initialized:
+            raise RuntimeError('完整轨迹开始前控制会话无效')
+        if max(abs(v) for v in frame.velocities) > 0.02:
+            raise RuntimeError('完整轨迹开始前机械臂必须静止')
+        move = JointPositionTrajectory.prepare(
+            times_ns, positions, self.limits, self.max_excursion,
+            actual_start=frame.positions,
+        )
+        self._move = move
+        self._trajectory_gate = None
+        self._target = frame.positions
+        self._move_started = time.monotonic()
+        self._settled_since = None
+        self._recovering_limits = False
+        self._nominal_required = True
+        self.state = 'RUNNING'
+
+    def arm_trajectory(
+        self, times_ns: tuple[int, ...], positions: tuple[tuple[float, ...], ...],
+        side: str, gate: PairedTrajectoryStart,
+    ) -> None:
+        """在线程内重新预检后保持实际位置，双方准备成功才允许共同启动."""
+        self.follow_trajectory(times_ns, positions)
+        self._trajectory_gate = gate
+        self.trajectory_start_at = None
+        self.trajectory_observed_start_at = None
+        self.state = 'ARMED'
+        gate.ready(side)
 
     def return_to_initial(self, duration: float) -> None:
         """普通停止时先按实际速度减速，再受控返回本轮初始位置."""
@@ -202,8 +278,10 @@ class HexPositionAdapter(HexFeedbackAdapter):
             raise RuntimeError('尚未记录真实初始位置')
         if self.state not in ('HOLDING', 'RUNNING'):
             raise RuntimeError('当前不允许受控归位；故障时应立即停止')
+        if self.state == 'RUNNING' and self._trajectory_gate is not None:
+            raise RuntimeError('成对轨迹运行中禁止单臂归位，请使用全局 halt')
         frame = self._fresh_feedback()
-        owned, initialized = self._health()
+        owned, initialized, _ = self._health()
         if not owned or not initialized:
             raise RuntimeError('归位前控制会话无效')
         move = StopAndReturnMove.prepare(
@@ -213,13 +291,14 @@ class HexPositionAdapter(HexFeedbackAdapter):
         self._nominal_required = False
         self._recovering_limits = False
         self._move = move
+        self._trajectory_gate = None
         self._move_started = time.monotonic()
         self._settled_since = None
         self.state = 'RETURNING'
 
     def tick(self) -> str:
         """由单一调用线程按目标频率执行；异常锁存并请求软件制动."""
-        if self.state not in ('REQUESTING', 'HOLDING', 'RUNNING', 'RETURNING'):
+        if self.state not in ('REQUESTING', 'HOLDING', 'ARMED', 'RUNNING', 'RETURNING'):
             return self.state
         try:
             self._tick()
@@ -232,23 +311,72 @@ class HexPositionAdapter(HexFeedbackAdapter):
     def _tick(self) -> None:
         now = time.monotonic()
         frame = self._fresh_feedback()
-        owned, initialized = self._health()
+        owned, initialized, calibrated = self._health(require_calibrated=False)
         if self.state == 'REQUESTING':
-            if now - self._requested_at > 2.0:
-                raise RuntimeError('申请控制权超时')
-            if not owned or not initialized:
-                return
+            if now - self._requested_at > self.readiness_timeout:
+                waiting = []
+                if not owned:
+                    waiting.append('尚未取得控制会话')
+                if not initialized:
+                    waiting.append('API 初始化尚未确认')
+                if not calibrated:
+                    waiting.append('设备尚未报告 calibrated=true')
+                    if not self.allow_api_calibration:
+                        waiting.append('API 校准未获显式允许')
+                raise RuntimeError('等待控制就绪超时：' + '；'.join(waiting))
             if max(abs(v) for v in frame.velocities) > 0.02:
-                raise RuntimeError('取得控制权时机械臂未静止')
+                raise RuntimeError('等待控制就绪期间机械臂出现运动')
+            assert self._request_positions is not None
+            if max(abs(a - b) for a, b in zip(
+                frame.positions, self._request_positions,
+            )) > 0.01:
+                raise RuntimeError('等待控制就绪期间关节漂移超过 0.01 rad')
+            if self._calibration_sent and (not owned or not initialized):
+                raise RuntimeError('API 校准请求后控制会话或初始化状态丢失')
+            if not owned:
+                self.readiness_stage = 'WAITING_SESSION'
+                return
+            if not initialized:
+                self.readiness_stage = 'WAITING_INITIALIZATION'
+                return
+            if not calibrated:
+                if not self.allow_api_calibration:
+                    self.readiness_stage = 'CALIBRATION_PERMISSION_REQUIRED'
+                elif not self._calibration_sent:
+                    # 发送前锁存，传输失败也不自动重试未知的校准操作。
+                    self._calibration_sent = True
+                    self.readiness_stage = 'WAITING_CALIBRATION'
+                    self._send(self._arm()._construct_calibrate_message(), 'calibrate')
+                return
             self.initial_positions = frame.positions
             self._target = frame.positions
             self._last_tick = now
             self.state = 'HOLDING'
+            self.readiness_stage = 'READY'
         if not owned or not initialized:
             raise RuntimeError('控制权已丢失或控制模式未初始化')
+        if not calibrated:
+            raise RuntimeError('设备 calibrated 状态失效，停止发送位置目标')
+        if self._trajectory_gate is not None and self._trajectory_gate.cancelled:
+            raise RuntimeError('双臂轨迹已取消，停止后续位置发送')
         if now - self._last_tick > 0.04:
             raise RuntimeError('调用 tick 的间隔超过 40 ms')
         self._last_tick = now
+        if self.state == 'ARMED':
+            assert self._trajectory_gate is not None
+            start = self._trajectory_gate.start_time()
+            if (max(abs(v) for v in frame.velocities) > 0.02
+                    or self._target is None or max(abs(a - b) for a, b in zip(
+                        frame.positions, self._target,
+                    )) > 0.005):
+                raise RuntimeError('双臂等待启动时实际位置或速度发生变化')
+            if start is not None and now >= start:
+                if now - start > 0.02:
+                    raise RuntimeError('双臂轨迹启动迟到超过 20 ms，取消本次运行')
+                self._move_started = start
+                self.trajectory_start_at = start
+                self.trajectory_observed_start_at = now
+                self.state = 'RUNNING'
         if self.state in ('RUNNING', 'RETURNING'):
             assert self._move is not None
             elapsed = now - self._move_started
@@ -289,10 +417,13 @@ class HexPositionAdapter(HexFeedbackAdapter):
 
         STOPPED 仅表示软件轨迹已取消，不证明实际已制动或锁定。
         """
-        active = self.state in ('REQUESTING', 'HOLDING', 'RUNNING', 'RETURNING')
+        active = self.state in ('REQUESTING', 'HOLDING', 'ARMED', 'RUNNING', 'RETURNING')
+        if self._trajectory_gate is not None:
+            self._trajectory_gate.cancel()
         self._epoch += 1
         self._move = None
         self.state = 'FAULT' if fault else 'STOPPED'
+        self.readiness_stage = self.state
         if active and self._api is not None:
             try:
                 arm = self._arm()
@@ -318,3 +449,4 @@ class HexPositionAdapter(HexFeedbackAdapter):
             self.initial_positions = None
             self._nominal_required = False
             self._recovering_limits = False
+            self.readiness_stage = 'DISCONNECTED'

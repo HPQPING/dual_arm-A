@@ -1,9 +1,12 @@
-"""检查真机关节位置目标，生成速度和加速度连续的单段轨迹."""
+"""检查关节限制并生成位置轨迹、双臂启动屏障和停止归位曲线，不连接设备."""
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass
 import math
+from threading import Lock
+import time
 from typing import Iterable
 
 from .hex_adapter import six_values
@@ -140,6 +143,120 @@ class JointPositionMove:
         u = min(1.0, max(0.0, elapsed / self.duration))
         blend = u ** 3 * (10.0 - 15.0 * u + 6.0 * u ** 2)
         return tuple(a + blend * (b - a) for a, b in zip(self.start, self.goal))
+
+
+@dataclass(frozen=True)
+class JointPositionTrajectory:
+    """共用纳秒时间轴的多段五次轨迹，每个连接点速度和加速度为零."""
+
+    times_ns: tuple[int, ...]
+    segments: tuple[JointPositionMove, ...]
+
+    @property
+    def duration(self) -> float:
+        """从整数纳秒时间轴换算完整计划秒数."""
+        return self.times_ns[-1] / 1e9
+
+    @property
+    def goal(self) -> tuple[float, ...]:
+        """最后一段目标，用于实际到位检查及完成后的保持."""
+        return self.segments[-1].goal
+
+    @classmethod
+    def prepare(
+        cls, times_ns: Iterable[int], positions: Iterable[Iterable[object]],
+        limits: PositionLimits, max_excursion: float, *,
+        actual_start: Iterable[object], start_tolerance: float = 0.005,
+    ) -> JointPositionTrajectory:
+        """比对真实起点后从实际角度起步，重新预检首段及全程约束."""
+        times = tuple(times_ns)
+        points = tuple(limits.check_positions(row) for row in positions)
+        if len(times) < 2 or len(times) != len(points):
+            raise ValueError('轨迹时间和位置数量必须相同且至少有两个点')
+        if any(type(value) is not int or value < 0 for value in times):
+            raise ValueError('轨迹时间必须为非负整数纳秒')
+        if times[0] != 0 or any(b <= a for a, b in zip(times, times[1:])):
+            raise ValueError('轨迹时间必须从零开始并严格递增')
+        if times[-1] > 3600 * 10 ** 9:
+            raise ValueError('轨迹总时长不能超过一小时')
+        tolerance = positive(start_tolerance, 'start_tolerance')
+        if tolerance > 0.01:
+            raise ValueError('轨迹起点容差不能超过 0.01 rad')
+        excursion = positive(max_excursion, 'max_excursion')
+        actual = limits.check_positions(actual_start)
+        if max(abs(a - b) for a, b in zip(actual, points[0])) > tolerance:
+            raise ValueError('实际初始角度与轨迹起点不符，需要重新规划接近段')
+        # 只在起点容差内替换起点，避免执行第一刻跳向记录的旧角度。
+        aligned = (actual,) + points[1:]
+        for row in aligned:
+            if any(abs(q - start) > excursion for q, start in zip(row, actual)):
+                raise ValueError('完整轨迹超出相对实际起点的允许位移')
+        segments = []
+        for index, (first, last, begin, end) in enumerate(zip(
+            aligned, aligned[1:], times, times[1:],
+        ), start=1):
+            try:
+                segments.append(JointPositionMove.prepare(
+                    first, last, (end - begin) / 1e9, limits, excursion,
+                ))
+            except ValueError as error:
+                raise ValueError(f'第 {index} 段：{error}') from error
+        return cls(times, tuple(segments))
+
+    def sample(self, elapsed: float) -> tuple[float, ...]:
+        """按绝对已用时间查找分段，落后时不逐点补发积压命令."""
+        if isinstance(elapsed, bool) or not math.isfinite(elapsed):
+            raise ValueError('elapsed 必须为有限秒数')
+        if elapsed <= 0:
+            return self.segments[0].start
+        if elapsed >= self.duration:
+            return self.goal
+        index = bisect_right(self.times_ns, int(elapsed * 1e9)) - 1
+        return self.segments[index].sample(elapsed - self.times_ns[index] / 1e9)
+
+
+class PairedTrajectoryStart:
+    """两侧准备确认后给出共同单调时刻，取消状态不可恢复."""
+
+    def __init__(self) -> None:
+        """准备最多等待0.5秒，两侧就绪后预留0.2秒软件启动窗口."""
+        self._lock = Lock()
+        self._ready: set[str] = set()
+        self._start: float | None = None
+        self._cancelled = False
+        self._expires = time.monotonic() + 0.5
+
+    def ready(self, side: str) -> None:
+        """必须是两个不同侧的确认，不能重复一侧来提前释放."""
+        with self._lock:
+            if side not in ('left', 'right') or side in self._ready:
+                raise ValueError('双臂准备侧别无效或重复')
+            if self._cancelled or time.monotonic() > self._expires:
+                self._cancelled = True
+                raise RuntimeError('双臂准备已取消或超时')
+            self._ready.add(side)
+            if self._ready == {'left', 'right'}:
+                self._start = time.monotonic() + 0.2
+
+    def start_time(self) -> float | None:
+        """等待双方就绪，准备超时或已取消时拒绝继续."""
+        with self._lock:
+            if self._start is None and time.monotonic() > self._expires:
+                self._cancelled = True
+            if self._cancelled:
+                raise RuntimeError('双臂轨迹启动已取消或准备超时')
+            return self._start
+
+    def cancel(self) -> None:
+        """任何一侧均可取消，已经确定启动时刻也不得恢复."""
+        with self._lock:
+            self._cancelled = True
+
+    @property
+    def cancelled(self) -> bool:
+        """供发送出口和状态监视检查，不隐式解除取消."""
+        with self._lock:
+            return self._cancelled
 
 
 @dataclass(frozen=True)

@@ -1,9 +1,7 @@
-"""Joint trajectory planning. No hardware access; ROS imports are lazy.
+"""规划分段五次关节轨迹并按需转换ROS消息，不访问硬件.
 
-Units: radians, radians/second, seconds. A quintic curve is used for each
-segment, with zero target velocity and acceleration at each waypoint.
-This provides joint-space paths, not Cartesian straight lines or circles.
-"""
+单位为弧度、弧度每秒和秒；每个路径点的目标速度及加速度均为零。
+本模块生成关节空间路径，不保证TCP沿笛卡尔直线或圆运动。"""
 
 from __future__ import annotations
 

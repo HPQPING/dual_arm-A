@@ -1,14 +1,14 @@
-"""Paired trajectory planning only. No ROS commands or hardware access.
+"""双臂轨迹规划与文件导出，不访问硬件或发送 ROS 指令。
 
-World convention: X forward, Y left, Z up. The provisional default has
-the right base at world origin and the left base at Y=0.42 m.
-Shared segment times align target progress, not backend start clocks.
+世界坐标与基座变换由调用者传入；共享时间轴不代表硬件同步启动。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from collections.abc import Iterable
+import json
+from pathlib import Path
 
 import numpy as np
 from numpy.typing import ArrayLike
@@ -67,6 +67,42 @@ class DualArmPlan:
     @property
     def duration(self) -> float:
         return self.left.duration
+
+
+def export_paired_plan(plan: DualArmPlan, destination: str | Path) -> Path:
+    """导出共享时间轴的关节计划；只创建新文件，不覆盖已有计划。"""
+    payload: dict[str, object] = {'version': 1, 'interpolation': 'quintic_stop'}
+    shared_ns: list[int] | None = None
+    for side, arm in (('left', plan.left), ('right', plan.right)):
+        times = np.asarray(arm.times, dtype=np.float64)
+        positions = np.asarray(arm.positions, dtype=np.float64)
+        if (arm.joint_names != joint_names(side) or times.ndim != 1
+                or len(times) < 2 or positions.shape != (len(times), 6)
+                or not np.all(np.isfinite(times)) or not np.all(np.isfinite(positions))
+                or times[0] != 0. or np.any(np.diff(times) <= 0.)
+                or times[-1] > 3600.):
+            raise ValueError(f'{side} 计划必须包含从零开始的递增时间和有限六关节角，最长一小时')
+        rounded = [int(round(float(value) * 1_000_000_000)) for value in times]
+        if any(b <= a for a, b in zip(rounded, rounded[1:])):
+            raise ValueError('时间点舍入为纳秒后重合，不能导出')
+        if shared_ns is not None and rounded != shared_ns:
+            raise ValueError('左右臂导出的时间轴必须一致')
+        shared_ns = rounded
+        payload[side] = {
+            'joint_names': list(arm.joint_names),
+            'points': [
+                {'positions': [float(value) for value in position],
+                 'time_from_start': {'sec': stamp // 1_000_000_000,
+                                     'nanosec': stamp % 1_000_000_000}}
+                for stamp, position in zip(rounded, positions)
+            ],
+        }
+    # 提前完成序列化和校验，避免无效输入留下半份文件。
+    content = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + '\n'
+    target = Path(destination).expanduser()
+    with target.open('x', encoding='utf-8', newline='\n') as stream:
+        stream.write(content)
+    return target.resolve()
 
 
 def plan_paired_joints(

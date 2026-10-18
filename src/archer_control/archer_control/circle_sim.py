@@ -32,6 +32,7 @@ from .circle_visuals import VisualScene, draw_paths
 from .dual_arm_trajectory import DualArmKinematics, rigid_transform
 from .kinematics import ArmKinematics
 from .trajectory import FloatArray, sample_joint_plan
+from .result_paths import DEFAULT_RESULTS_DIR, discard_failed_run, new_run_directory
 
 
 class Camera(Protocol):
@@ -87,6 +88,7 @@ class CircleSimulation:
         self.state = 'READY'
         self.reason = ''
         self.start_time = 0.
+        self.started_at: datetime | None = None
         self.goal_since: float | None = None
         self.last_record = -float('inf')
         self.rows: list[list[object]] = []
@@ -96,6 +98,7 @@ class CircleSimulation:
 
     def start_or_pause(self) -> None:
         if self.state == 'READY':
+            self.started_at = datetime.now().astimezone()
             self.start_time = float(self.loaded.data.time)
             self.state = 'RUNNING'
             print('开始双臂轨迹。')
@@ -121,6 +124,7 @@ class CircleSimulation:
             self.loaded.data.ctrl[arm.actuator_indices] = self.targets[side]
         mujoco.mj_forward(self.loaded.model, self.loaded.data)
         self.state = 'READY'
+        self.started_at = None
         self.reason = ''
         self.goal_since = None
         self.last_record = -float('inf')
@@ -208,7 +212,9 @@ class CircleSimulation:
             writer = csv.writer(stream)
             writer.writerow(header)
             writer.writerows(self.rows)
-        summary = {'state': self.state, 'reason': self.reason,
+        summary = {'task_name': '画圆',
+                   'started_at': self.started_at.isoformat() if self.started_at is not None else None,
+                   'state': self.state, 'reason': self.reason,
                    'planned_duration_s': self.result.plan.duration,
                    'maximum_tracking_error_mm': self.maximum_tracking if self.rows else None,
                    'maximum_distance_to_circle_mm': {
@@ -227,11 +233,27 @@ def main() -> int:
     parser.add_argument('--auto-start', action='store_true', help='显示窗口后自动开始')
     parser.add_argument('--mount-yaw-deg', type=float, default=0., help='候选夹爪安装偏航角')
     parser.add_argument('--tilt-deg', type=float, default=10., help='左右夹爪内倾角')
-    parser.add_argument('--output-dir', type=Path)
+    parser.add_argument('--output-dir', type=Path, help='结果根目录，每轮任务再创建日期时间子目录')
     args = parser.parse_args()
-    output = args.output_dir or Path.home() / 'archer_ws/circle_results' / datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+    output_root = args.output_dir or DEFAULT_RESULTS_DIR
+    saved_run = False
     viewer: Viewer | None = None
     simulation: CircleSimulation | None = None
+
+    def save_run() -> None:
+        """仅归档成功完成的任务；停止、失败或未开始均不生成结果文件。"""
+        nonlocal saved_run
+        if simulation is None or simulation.state == 'READY' or saved_run:
+            return
+        if simulation.state == 'COMPLETED':
+            directory = new_run_directory(output_root, '画圆', simulation.started_at)
+            try:
+                simulation.save(directory)
+            except Exception:
+                discard_failed_run(directory, output_root)
+                raise
+        saved_run = True
+
     try:
         tcp = list(TCP_XYZ)
         mount = list(MOUNT_XYZ)
@@ -296,7 +318,11 @@ def main() -> int:
                     elif key == 83:
                         simulation.stop('用户停止')
                     elif key == 82:
+                        if simulation.state in ('RUNNING', 'SETTLING', 'PAUSED'):
+                            simulation.stop('重置前中断本轮任务')
+                        save_run()
                         simulation.reset()
+                        saved_run = False
                 # 非有限状态出现后冻结物理状态，只保留查看和重置操作。
                 if not (simulation.state == 'FAILED' and (
                         not np.all(np.isfinite(loaded.data.qpos)) or not np.all(np.isfinite(loaded.data.qvel)))):
@@ -304,6 +330,8 @@ def main() -> int:
                 if viewer is not None and began - last_view >= 1. / 30.:
                     draw_paths(viewer.user_scn, result.left_targets, result.right_targets,
                                simulation.traces['left'], simulation.traces['right'])
+            if simulation.state in ('COMPLETED', 'FAILED', 'STOPPED'):
+                save_run()
             if viewer is not None:
                 if began - last_view >= 1. / 30.:
                     viewer.sync()
@@ -326,7 +354,7 @@ def main() -> int:
         if simulation is not None:
             if simulation.state in ('RUNNING', 'SETTLING', 'PAUSED'):
                 simulation.stop('窗口在轨迹完成前关闭')
-            simulation.save(output)
+            save_run()
     return 0 if simulation is not None and simulation.state == 'COMPLETED' else 1
 
 

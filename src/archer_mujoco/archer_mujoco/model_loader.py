@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from importlib import import_module
 import hashlib
+from math import isfinite
 from pathlib import Path
 import shutil
 import subprocess
@@ -170,7 +171,7 @@ def load_single_arm(
 
     values = (timestep, position_kp, position_kv)
 
-    if not all(np.isfinite(v) and v > 0 for v in values):
+    if not all(isfinite(v) and v > 0 for v in values):
         raise ValueError(
             "Timestep and position gains must be finite and positive"
         )
@@ -290,7 +291,7 @@ def load_single_arm(
             )
 
             if (
-                not np.all(np.isfinite(bounds))
+                not all(isfinite(value) for value in bounds)
                 or bounds[0] >= bounds[1]
             ):
                 raise ValueError(

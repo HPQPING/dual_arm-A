@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import hashlib
 from importlib import import_module
 import math
 import os
 from pathlib import Path
+import threading
 import time
 from typing import Any, Iterable, cast
 from urllib.parse import urlparse
@@ -67,6 +69,96 @@ def verified_sdk() -> Any:
     return module
 
 
+def managed_sdk_class(base: Any) -> Any:
+    """修正已核对 SDK 的退出顺序，不修改厂商文件或发送控制消息."""
+
+    class ManagedAPI(base):
+        """先完成传输清理，再允许 SDK 主循环退出."""
+
+        async def _HexDeviceApi__async_close(self) -> None:
+            """关闭握手有界等待，失败时记录异常并中止本地传输."""
+            waiter = getattr(self, '_project_close_waiter', None)
+            if waiter is not None:
+                await asyncio.shield(waiter)
+                return
+            waiter = asyncio.get_running_loop().create_future()
+            self._project_close_waiter = waiter
+            self._HexDeviceApi__is_closing.set()
+            try:
+                client = self._HexDeviceApi__kcp_client
+                if client is not None:
+                    client.stop()
+                    self._HexDeviceApi__kcp_client = None
+                websocket = self._HexDeviceApi__websocket
+                if websocket is not None:
+                    try:
+                        await asyncio.wait_for(websocket.close(), timeout=2.0)
+                    except Exception:
+                        # 官方当前版本使用 websockets 的 asyncio 传输。
+                        transport = getattr(websocket, 'transport', None)
+                        if transport is not None:
+                            transport.abort()
+                        raise
+                    finally:
+                        self._HexDeviceApi__websocket = None
+            except Exception as error:
+                self._project_close_error = (
+                    f'{type(error).__name__}: {error}'
+                )
+                raise
+            finally:
+                waiter.set_result(None)
+                event = self._HexDeviceApi__shutdown_event
+                if event is not None:
+                    event.set()
+
+        def _HexDeviceApi__loop_start(self) -> None:
+            """保留 SDK 主循环，退出时回收残留任务并释放事件循环."""
+            try:
+                super()._HexDeviceApi__loop_start()
+            finally:
+                loop = self._HexDeviceApi__loop
+                if loop is not None and not loop.is_closed():
+                    pending = asyncio.all_tasks(loop)
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        done, remaining = loop.run_until_complete(
+                            asyncio.wait(pending, timeout=1.0)
+                        )
+                        for task in done:
+                            if not task.cancelled():
+                                task.exception()
+                        if remaining:
+                            self._project_close_error = '后台异步任务未在期限内退出'
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                    loop.close()
+
+        def close(self) -> None:
+            """回调线程内不阻塞自身；外部调用确认后台线程已退出."""
+            loop = getattr(self, '_HexDeviceApi__loop', None)
+            worker = getattr(self, '_HexDeviceApi__loop_thread', None)
+            if worker is threading.current_thread():
+                if (loop is not None and loop.is_running()
+                        and not self._HexDeviceApi__is_closing.is_set()):
+                    # SDK 解析失败时会在自己的事件线程调用 close。
+                    task = loop.create_task(self._HexDeviceApi__async_close())
+                    task.add_done_callback(
+                        lambda done: None if done.cancelled() else done.exception()
+                    )
+                return
+            super().close()
+            if worker is not None:
+                worker.join(timeout=1.5)
+                if worker.is_alive():
+                    raise RuntimeError('SDK 后台线程未退出，连接清理尚未确认')
+            error = getattr(self, '_project_close_error', '')
+            if error:
+                raise RuntimeError(f'SDK 连接清理失败：{error}')
+
+    return ManagedAPI
+
+
 class HexFeedbackAdapter:
     """显式连接后读取反馈；本类没有运动、使能或清故障接口."""
 
@@ -91,7 +183,7 @@ class HexFeedbackAdapter:
         if self._api is not None:
             raise RuntimeError('已经连接，不能重复连接')
         module = verified_sdk()
-        base = cast(Any, module.HexDeviceApi)
+        base = managed_sdk_class(module.HexDeviceApi)
 
         class FeedbackAPI(base):
             """隔离官方默认后台校准、清错及控制权申请行为."""
