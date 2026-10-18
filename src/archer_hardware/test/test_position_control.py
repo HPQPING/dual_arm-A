@@ -15,7 +15,6 @@ from archer_hardware.hex_adapter import HexFeedbackAdapter, JointFeedback
 from archer_hardware.position_adapter import HexPositionAdapter
 from archer_hardware.position_plan import (
     JointPositionMove, JointPositionTrajectory, PairedTrajectoryStart, PositionLimits,
-    StopAndReturnMove,
 )
 
 
@@ -83,10 +82,8 @@ class PositionPlanTests(unittest.TestCase):
         limits = PositionLimits((-1.0,) * 6, (1.0,) * 6, (0.1,) * 6,
                                 (0.2,) * 6, feedback_tolerance=0.002)
         home = (-1.001,) * 6
-        plan = StopAndReturnMove.prepare([0.0] * 6, [0.0] * 6, home, 1.0, limits)
-        self.assertEqual(plan.sample(plan.duration), (-1.0,) * 6)
+        self.assertEqual(limits.return_goal(home), (-1.0,) * 6)
         self.assertEqual(home, (-1.001,) * 6)
-        self.assertGreater(plan.duration, 1.0)
 
     def test_recovery_only_moves_outside_joints(self) -> None:
         """越界起步先收回，不夹带其他关节的任务运动."""
@@ -111,31 +108,6 @@ class PositionPlanTests(unittest.TestCase):
         plan = JointPositionMove.prepare((-1.99,) * 6, (-1.96,) * 6, 2.0, limits, 0.05)
         for step in range(101):
             limits.check_positions(plan.sample(step / 50.0))
-
-    def test_deceleration_uses_actual_velocity(self) -> None:
-        """减速段从实际速度起步并在连接归位段时降为零."""
-        limits = fixture_limits()
-        plan = StopAndReturnMove.prepare([0.2] * 6, [0.05] * 6,
-                                         (0.0,) * 6, 1.0, limits)
-        self.assertAlmostEqual(plan.deceleration_time, 0.25)
-        self.assertAlmostEqual(plan.sample(plan.deceleration_time)[0], 0.20625)
-        step = 1e-6
-        first_speed = (plan.sample(step)[0] - plan.sample(0.0)[0]) / step
-        self.assertAlmostEqual(first_speed, 0.05, places=5)
-        boundary_speed = (
-            plan.sample(plan.deceleration_time + step)[0]
-            - plan.sample(plan.deceleration_time - step)[0]
-        ) / (2 * step)
-        self.assertAlmostEqual(boundary_speed, 0.0, places=5)
-        self.assertEqual(plan.sample(plan.duration), (0.0,) * 6)
-
-    def test_unsafe_stopping_distance_is_rejected(self) -> None:
-        """预计减速距离超出容差包络时，普通归位不继续执行."""
-        limits = PositionLimits((-1.0,) * 6, (1.0,) * 6, (0.1,) * 6,
-                                (0.2,) * 6, feedback_tolerance=0.002)
-        with self.assertRaises(ValueError):
-            StopAndReturnMove.prepare([0.999] * 6, [0.1] * 6,
-                                      (0.0,) * 6, 2.0, limits)
 
 
 class FullTrajectoryTests(unittest.TestCase):
@@ -608,9 +580,9 @@ class PositionAdapterTests(unittest.TestCase):
             self.assertEqual(self.adapter.state, 'HOLDING')
             self.assertTrue(self.adapter._nominal_required)
             self.assertEqual(self.adapter.initial_positions, (-2.003,) * 6)
-        self.adapter.return_to_initial(2.0)
-        assert self.adapter._move is not None
-        self.assertEqual(self.adapter._move.goal, (-2.0,) * 6)
+        initial = self.adapter.initial_positions
+        assert initial is not None
+        self.assertEqual(self.adapter.limits.return_goal(initial), (-2.0,) * 6)
         self.assertEqual(self.adapter.initial_positions, (-2.003,) * 6)
 
     def test_stop_packet_contains_only_true_brakes(self) -> None:
@@ -651,19 +623,19 @@ class PositionAdapterTests(unittest.TestCase):
         self.assertEqual(self.send.call_count, 1)
         self.assertEqual(self.send.call_args.args[1], 'brake')
 
-    def test_move_and_explicit_return(self) -> None:
-        """归位目标来自记录的真实起点，停止后不自动执行归位."""
+    def test_stop_cannot_start_another_move(self) -> None:
+        """停止清空轨迹；不提供独立归位入口，也不能继续发送目标."""
         self.acquire()
         self.adapter.move_to([0.02] * 6, 2.0)
-        self.assertEqual(self.adapter.state, 'RUNNING')
         self.adapter.stop()
         self.assertEqual(self.adapter.state, 'STOPPED')
         self.assertIsNone(self.adapter._move)
+        self.assertFalse(hasattr(self.adapter, 'return_to_initial'))
         with self.assertRaises(RuntimeError):
-            self.adapter.return_to_initial(2.0)
+            self.adapter.move_to([0.0] * 6, 2.0)
 
     def test_full_trajectory_completes_and_holds_without_auto_return(self) -> None:
-        """推进多段位置指令，到位后保持终点并保留原初值，等待显式归位."""
+        """完整接口只执行提交的多段轨迹，到位保持，不追加其他动作."""
         self.acquire()
         self.positions = (0.001,) * 6
         with patch('archer_hardware.position_adapter.time.monotonic') as clock:
@@ -784,24 +756,29 @@ class PositionAdapterTests(unittest.TestCase):
             self.adapter.tick()
         self.assertTrue(gate.cancelled)
 
-    def test_complete_move_then_return_actual_initial(self) -> None:
-        """到位需依据实际反馈保持稳定，之后显式归位到本次起点."""
+    def test_full_cycle_holds_recorded_initial_without_extra_return(self) -> None:
+        """归位是完整轨迹的最后一段，按实际初值结束并保持位置模式."""
         self.positions = (0.005,) * 6
         self.acquire()
         with patch('archer_hardware.position_adapter.time.monotonic') as clock:
             clock.return_value = 100.0
             self.adapter._last_tick = 100.0
-            self.adapter.move_to([0.025] * 6, 2.0)
-            for step in range(1, 231):
-                clock.return_value = 100.0 + step * 0.01
-                target = self.adapter._target
-                assert target is not None
-                self.positions = target
+            self.adapter.follow_trajectory(
+                (0, 2_000_000_000, 4_000_000_000),
+                ((0.005,) * 6, (0.025,) * 6, (0.005,) * 6),
+            )
+            plan = self.adapter._move
+            assert isinstance(plan, JointPositionTrajectory)
+            for step in range(1, 431):
+                elapsed = step / 100.
+                clock.return_value = 100.0 + elapsed
+                self.positions = plan.sample(elapsed)
                 self.adapter.tick()
-            self.assertEqual(self.adapter.state, 'HOLDING')
-            self.adapter.return_to_initial(2.0)
-            assert self.adapter._move is not None
-            self.assertEqual(self.adapter._move.goal, (0.005,) * 6)
+        self.assertEqual(self.adapter.state, 'HOLDING')
+        self.assertEqual(self.adapter._target, (0.005,) * 6)
+        self.assertEqual(self.adapter.initial_positions, (0.005,) * 6)
+        self.assertTrue(all(call.args[1] in ('initialize', 'position')
+                            for call in self.send.call_args_list))
 
     def test_actual_send_boundary_checks_state(self) -> None:
         """执行真实发送协程入口，但只向内存替身发送，不建立 socket."""
@@ -851,42 +828,6 @@ class PositionAdapterTests(unittest.TestCase):
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2.0)
             loop.close()
-
-    def test_return_interrupts_running_move_using_actual_velocity(self) -> None:
-        """显式归位取消原轨迹，保留本轮初始角度和实际减速起点."""
-        self.acquire()
-        self.adapter.move_to([0.02] * 6, 2.0)
-        self.positions = (0.01,) * 6
-        self.velocity = (0.03,) * 6
-        self.adapter.return_to_initial(2.0)
-        self.assertEqual(self.adapter.state, 'RETURNING')
-        plan = self.adapter._move
-        assert isinstance(plan, StopAndReturnMove)
-        self.assertEqual(plan.sample(0.0), self.positions)
-        self.assertEqual(plan.velocities, self.velocity)
-        self.assertEqual(plan.goal, (0.0,) * 6)
-
-    def test_controlled_return_finishes_in_holding_at_recorded_initial(self) -> None:
-        """完整推进 RETURNING 状态，实际到位后保持初始位置而不重复归位."""
-        self.acquire()
-        self.positions = (0.01,) * 6
-        self.velocity = (0.03,) * 6
-        with patch('archer_hardware.position_adapter.time.monotonic') as clock:
-            clock.return_value = 100.0
-            self.adapter._last_tick = 100.0
-            self.adapter.return_to_initial(1.0)
-            plan = self.adapter._move
-            assert isinstance(plan, StopAndReturnMove)
-            steps = int((plan.duration + 0.3) / 0.005) + 1
-            for step in range(1, steps + 1):
-                elapsed = step * 0.005
-                clock.return_value = 100.0 + elapsed
-                self.positions = plan.sample(elapsed)
-                self.velocity = (0.0,) * 6
-                self.adapter.tick()
-        self.assertEqual(self.adapter.state, 'HOLDING')
-        self.assertEqual(self.adapter.initial_positions, (0.0,) * 6)
-        self.assertEqual(self.adapter._target, (0.0,) * 6)
 
     def test_invalid_frequency_and_limit_isolation(self) -> None:
         """频率不接受布尔值，左右实例不共享初始角度或轨迹."""

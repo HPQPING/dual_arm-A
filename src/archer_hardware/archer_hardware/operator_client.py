@@ -51,7 +51,7 @@ def operation_result(
     if phase != 'SUCCEEDED':
         return None
     expected = {'connect': 'CONNECTED', 'enable': 'HOLDING', 'move': 'HOLDING',
-                'return': 'HOLDING', 'disconnect': 'DISCONNECTED'}[command]
+                'disconnect': 'DISCONNECTED'}[command]
     if frame.get('state') != expected:
         raise RuntimeError('操作编号已完成，但当前状态已改变，请检查完整状态')
     return True

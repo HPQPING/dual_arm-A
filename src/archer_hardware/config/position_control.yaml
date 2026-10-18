@@ -24,7 +24,6 @@ archer_position_driver:
     control_hz: 250
     startup_timeout: 10.0
     target_timeout: 5.0
-    return_duration: 5.0
     max_excursion: 0.05
     tracking_tolerance: 0.10
     feedback_tolerance: 0.005

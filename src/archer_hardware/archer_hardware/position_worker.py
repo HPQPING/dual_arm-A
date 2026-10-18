@@ -18,7 +18,6 @@ ALLOWED_STATES = {
     'enable': ('CONNECTED',),
     'move': ('HOLDING',),
     'trajectory': ('HOLDING',),
-    'return': ('HOLDING', 'RUNNING'),
     'disconnect': ('CONNECTED', 'STOPPED', 'FAULT', 'DISCONNECTED'),
 }
 
@@ -44,10 +43,6 @@ class PositionBackend(Protocol):
 
     def move_to(self, goal: tuple[float, ...], duration: float) -> None:
         """从实际反馈规划移动."""
-        ...
-
-    def return_to_initial(self, duration: float) -> None:
-        """显式归位."""
         ...
 
     def arm_trajectory(
@@ -279,9 +274,6 @@ class PositionWorker:
             elif command.kind == 'move':
                 backend.move_to(command.goal, command.duration)
                 self._phase = 'RUNNING'
-            elif command.kind == 'return':
-                backend.return_to_initial(command.duration)
-                self._phase = 'RUNNING'
             elif command.kind == 'trajectory':
                 if command.gate is None:
                     raise ValueError('成对轨迹缺少共同启动门控')
@@ -295,15 +287,15 @@ class PositionWorker:
                 self._phase = 'SUCCEEDED'
                 self._message = '连接已关闭，未执行归位'
         except ValueError as error:
-            if command.kind in ('return', 'trajectory') and self._backend is not None:
-                # 归位预检失败不能继续原动作，转为故障停止并通知另一臂。
+            if command.kind == 'trajectory' and self._backend is not None:
+                # 成对轨迹准备失败需取消双方，不能让另一侧继续等待或执行。
                 self._fail(error)
             else:
                 self._phase = 'REJECTED'
                 self._message = str(error)
         except Exception as error:
             if self._backend and self._backend.state in (
-                'REQUESTING', 'HOLDING', 'ARMED', 'RUNNING', 'RETURNING', 'FAULT',
+                'REQUESTING', 'HOLDING', 'ARMED', 'RUNNING', 'FAULT',
             ):
                 self._fail(error)
             else:
@@ -329,13 +321,13 @@ class PositionWorker:
             elif time.monotonic() - self._connected_at > self.startup_timeout:
                 raise RuntimeError('等待真实反馈首帧超时')
             previous = backend.state
-            if previous in ('REQUESTING', 'HOLDING', 'ARMED', 'RUNNING', 'RETURNING'):
+            if previous in ('REQUESTING', 'HOLDING', 'ARMED', 'RUNNING'):
                 backend.tick()
                 if backend.state == 'RUNNING' and previous == 'ARMED':
                     self._phase = 'RUNNING'
                     self._message = '按共同单调时刻推进轨迹，非控制器硬同步'
                 if backend.state == 'HOLDING' and previous in (
-                    'REQUESTING', 'ARMED', 'RUNNING', 'RETURNING',
+                    'REQUESTING', 'ARMED', 'RUNNING',
                 ):
                     self._phase = 'SUCCEEDED'
                     self._message = ('控制权已确认，保持实际当前位置' if previous == 'REQUESTING'

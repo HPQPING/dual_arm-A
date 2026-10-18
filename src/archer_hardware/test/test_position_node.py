@@ -83,14 +83,6 @@ class FakeBackend:
         self.goal = goal
         self.state = 'RUNNING'
 
-    def return_to_initial(self, duration: float) -> None:
-        """模拟显式归位请求."""
-        if self.initial_positions is None:
-            raise RuntimeError('尚未记录初始位置')
-        self.calls.append(('return', self.initial_positions))
-        self.goal = self.initial_positions
-        self.state = 'RETURNING'
-
     def arm_trajectory(self, times_ns, positions, side, gate) -> None:
         """验证真实轨迹数学，但启动和位置变化仅写入内存."""
         if self.reject_trajectory:
@@ -122,7 +114,7 @@ class FakeBackend:
             self.initial_positions = self.positions
             self.state = 'HOLDING'
             self.readiness_stage = 'READY'
-        elif self.state in ('RUNNING', 'RETURNING') and self.complete_move.is_set():
+        elif self.state in ('RUNNING',) and self.complete_move.is_set():
             if (self._paired_plan is not None and self.trajectory_start_at is not None
                     and time.monotonic() < self.trajectory_start_at + self._paired_plan.duration):
                 return self.state
@@ -220,16 +212,28 @@ class PositionWorkerTests(unittest.TestCase):
         self.assertEqual(faults, [])
         self.assertEqual(fake.state, 'STOPPED')
 
-    def test_failed_return_stops_original_motion(self) -> None:
-        """归位预检失败后锁存故障，不能继续被用户取消的原动作."""
+    def test_legacy_return_rejected_before_queue(self) -> None:
+        """旧return已从调度器删除，不会隐藏触发单臂动作或改变当前运动."""
         fake = FakeBackend()
         fake.state = 'RUNNING'
-        fake.initial_positions = (0.1,) * 6
+        worker = PositionWorker('left', lambda: fake, lambda error: None)
+        worker._backend = fake
+        with self.assertRaisesRegex(ValueError, '未知控制请求'):
+            worker.submit('return', duration=2.0)
+        self.assertTrue(worker._queue.empty())
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(fake.state, 'RUNNING')
+
+    def test_failed_pair_prepare_faults_worker(self) -> None:
+        """清理旧归位后，成对轨迹准备失败仍必须故障取消并通知调用者."""
+        fake = FakeBackend()
+        fake.state = 'HOLDING'
         faults = []
         worker = PositionWorker('left', lambda: fake, faults.append)
         worker._backend = fake
-        job = WorkerCommand('return', 'return', 0, time.monotonic() + 1.0, duration=2.0)
-        with patch.object(fake, 'return_to_initial', side_effect=ValueError('减速距离超界')):
+        job = WorkerCommand('pair', 'trajectory', 0, time.monotonic() + 1.0,
+                            gate=PairedTrajectoryStart())
+        with patch.object(fake, 'arm_trajectory', side_effect=ValueError('invalid pair')):
             worker._execute(job)
         self.assertEqual(fake.state, 'FAULT')
         self.assertEqual(worker._phase, 'FAILED')

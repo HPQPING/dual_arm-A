@@ -1,4 +1,4 @@
-"""检查关节限制并生成位置轨迹、双臂启动屏障和停止归位曲线，不连接设备."""
+"""检查关节限制并生成位置轨迹与双臂启动屏障，不连接设备."""
 
 from __future__ import annotations
 
@@ -66,14 +66,11 @@ class PositionLimits:
 
     def check_goal(
         self, start: tuple[float, ...], goal: Iterable[object],
-        reference: tuple[float, ...] | None = None,
     ) -> tuple[float, ...]:
         """目标必须在名义限位内；越界起步只允许收回越界关节."""
         first = self.check_feedback(start)
         last = self.check_positions(goal)
-        if reference is not None:
-            self.check_feedback(reference)
-        elif not self.within_nominal(first):
+        if not self.within_nominal(first):
             for index, (q, a, low, high) in enumerate(zip(last, first, self.lower, self.upper)):
                 if low <= a <= high and q != a:
                     raise ValueError(f'准备阶段只能收回越界关节，joint_{index + 1} 应保持原位')
@@ -116,11 +113,10 @@ class JointPositionMove:
     def prepare(
         cls, start: Iterable[object], goal: Iterable[object], duration: float,
         limits: PositionLimits, max_excursion: float,
-        reference: tuple[float, ...] | None = None,
     ) -> JointPositionMove:
         """用解析峰值检查整段轨迹，拒绝过短时长或过大试运行幅度."""
         first = limits.check_feedback(start)
-        last = limits.check_goal(first, goal, reference)
+        last = limits.check_goal(first, goal)
         seconds = positive(duration, 'duration')
         excursion = positive(max_excursion, 'max_excursion')
         for index, (a, b, vmax, amax) in enumerate(zip(
@@ -257,66 +253,3 @@ class PairedTrajectoryStart:
         """供发送出口和状态监视检查，不隐式解除取消."""
         with self._lock:
             return self._cancelled
-
-
-@dataclass(frozen=True)
-class StopAndReturnMove:
-    """先按实际速度减速，再返回记录的初始位置，目标速度连续."""
-
-    start: tuple[float, ...]
-    velocities: tuple[float, ...]
-    deceleration_time: float
-    return_move: JointPositionMove
-
-    @property
-    def duration(self) -> float:
-        """完整减速和归位的计划时长."""
-        return self.deceleration_time + self.return_move.duration
-
-    @property
-    def goal(self) -> tuple[float, ...]:
-        """本轮初始角度对应的名义限位内归位目标."""
-        return self.return_move.goal
-
-    @classmethod
-    def prepare(
-        cls, positions: Iterable[object], velocities: Iterable[object],
-        initial: tuple[float, ...], minimum_duration: float, limits: PositionLimits,
-    ) -> StopAndReturnMove:
-        """检查减速距离及整段约束，必要时延长归位时长."""
-        first = limits.check_feedback(positions)
-        speeds = six_values(velocities)
-        home = limits.return_goal(initial)
-        minimum = positive(minimum_duration, '归位最小时长')
-        if any(abs(v) > cap for v, cap in zip(speeds, limits.max_velocity)):
-            raise ValueError('实际速度超过配置上限，不能按普通停止归位')
-        stop_time = max(abs(v) / cap for v, cap in zip(speeds, limits.max_acceleration))
-        stop_position = tuple(q + 0.5 * v * stop_time for q, v in zip(first, speeds))
-        # 减速的必要停止距离只能落在名义范围加反馈容差以内。
-        limits.check_feedback(stop_position)
-        duration = max(minimum - stop_time, 1e-6)
-        for q, h, vmax, amax in zip(
-            stop_position, home, limits.max_velocity, limits.max_acceleration,
-        ):
-            distance = abs(h - q)
-            duration = max(
-                duration, 1.875 * distance / vmax,
-                math.sqrt((10.0 / math.sqrt(3.0)) * distance / amax),
-            )
-        # 避免峰值公式在浮点临界点因舍入被判超限。
-        duration *= 1.0 + 1e-9
-        excursion = max(1e-9, max(abs(h - q) for q, h in zip(stop_position, home)))
-        returning = JointPositionMove.prepare(
-            stop_position, home, duration, limits, excursion, reference=home,
-        )
-        return cls(first, speeds, stop_time, returning)
-
-    def sample(self, elapsed: float) -> tuple[float, ...]:
-        """减速段采用有界恒加速度，归位段采用五次时间插值."""
-        if isinstance(elapsed, bool) or not math.isfinite(elapsed):
-            raise ValueError('elapsed 必须为有限秒数')
-        t = max(0.0, elapsed)
-        if self.deceleration_time > 0 and t < self.deceleration_time:
-            factor = t - 0.5 * t * t / self.deceleration_time
-            return tuple(q + v * factor for q, v in zip(self.start, self.velocities))
-        return self.return_move.sample(t - self.deceleration_time)

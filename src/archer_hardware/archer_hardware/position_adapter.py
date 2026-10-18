@@ -17,7 +17,7 @@ from .hex_adapter import (
 )
 from .position_plan import (
     JointPositionMove, JointPositionTrajectory, PairedTrajectoryStart, PositionLimits,
-    StopAndReturnMove, positive,
+    positive,
 )
 
 
@@ -51,7 +51,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
         self.initial_positions: tuple[float, ...] | None = None
         self._feedback: JointFeedback | None = None
         self._target: tuple[float, ...] | None = None
-        self._move: JointPositionMove | JointPositionTrajectory | StopAndReturnMove | None = None
+        self._move: JointPositionMove | JointPositionTrajectory | None = None
         self._trajectory_gate: PairedTrajectoryStart | None = None
         self.trajectory_start_at: float | None = None
         self.trajectory_observed_start_at: float | None = None
@@ -174,7 +174,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
                 or kind == 'calibrate' and self.state == 'REQUESTING'
                 and self.allow_api_calibration and self._calibration_sent
                 or kind == 'position' and self.state in (
-                    'HOLDING', 'ARMED', 'RUNNING', 'RETURNING',
+                    'HOLDING', 'ARMED', 'RUNNING',
                 )
                 or kind == 'brake' and self.state in ('STOPPED', 'FAULT')
             )
@@ -272,33 +272,9 @@ class HexPositionAdapter(HexFeedbackAdapter):
         self.state = 'ARMED'
         gate.ready(side)
 
-    def return_to_initial(self, duration: float) -> None:
-        """普通停止时先按实际速度减速，再受控返回本轮初始位置."""
-        if self.initial_positions is None:
-            raise RuntimeError('尚未记录真实初始位置')
-        if self.state not in ('HOLDING', 'RUNNING'):
-            raise RuntimeError('当前不允许受控归位；故障时应立即停止')
-        if self.state == 'RUNNING' and self._trajectory_gate is not None:
-            raise RuntimeError('成对轨迹运行中禁止单臂归位，请使用全局 halt')
-        frame = self._fresh_feedback()
-        owned, initialized, _ = self._health()
-        if not owned or not initialized:
-            raise RuntimeError('归位前控制会话无效')
-        move = StopAndReturnMove.prepare(
-            frame.positions, frame.velocities, self.initial_positions, duration, self.limits,
-        )
-        self._epoch += 1
-        self._nominal_required = False
-        self._recovering_limits = False
-        self._move = move
-        self._trajectory_gate = None
-        self._move_started = time.monotonic()
-        self._settled_since = None
-        self.state = 'RETURNING'
-
     def tick(self) -> str:
         """由单一调用线程按目标频率执行；异常锁存并请求软件制动."""
-        if self.state not in ('REQUESTING', 'HOLDING', 'ARMED', 'RUNNING', 'RETURNING'):
+        if self.state not in ('REQUESTING', 'HOLDING', 'ARMED', 'RUNNING'):
             return self.state
         try:
             self._tick()
@@ -377,7 +353,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
                 self.trajectory_start_at = start
                 self.trajectory_observed_start_at = now
                 self.state = 'RUNNING'
-        if self.state in ('RUNNING', 'RETURNING'):
+        if self.state == 'RUNNING':
             assert self._move is not None
             elapsed = now - self._move_started
             self._target = self._move.sample(elapsed)
@@ -397,7 +373,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
                         self._recovering_limits = False
                 else:
                     self._settled_since = None
-                if self.state in ('RUNNING', 'RETURNING') and elapsed > self._move.duration + 2.0:
+                if self.state == 'RUNNING' and elapsed > self._move.duration + 2.0:
                     raise RuntimeError('目标位置未在允许时间内到位')
         assert self._target is not None
         if max(abs(a - b) for a, b in zip(frame.positions, self._target)) > (
@@ -417,7 +393,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
 
         STOPPED 仅表示软件轨迹已取消，不证明实际已制动或锁定。
         """
-        active = self.state in ('REQUESTING', 'HOLDING', 'ARMED', 'RUNNING', 'RETURNING')
+        active = self.state in ('REQUESTING', 'HOLDING', 'ARMED', 'RUNNING')
         if self._trajectory_gate is not None:
             self._trajectory_gate.cancel()
         self._epoch += 1
