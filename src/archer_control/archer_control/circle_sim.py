@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import argparse
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
@@ -25,6 +27,7 @@ from archer_mujoco.model_loader import DataInterface, ModelInterface, mujoco
 from .model_checks import CollisionModel, validate_tool_chain
 # 兼容原先从 circle_sim 导入间隙检查的外部脚本。
 from .model_checks import cross_arm_failure as cross_arm_failure
+from .dual_arm_trajectory import append_return_home
 from .circle_planner import (
     CIRCLE_CENTER, CIRCLE_RADIUS, MOUNT_XYZ, TCP_XYZ, CircleResult, plan_circle,
 )
@@ -175,7 +178,7 @@ class CircleSimulation:
                     self.goal_since = now
                 elif now - self.goal_since >= .3:
                     self.state = 'COMPLETED'
-                    print('双臂轨迹完成，保持终点。')
+                    print('双臂画圆及归位完成，保持本次起点。')
             else:
                 self.goal_since = None
             if self.state != 'COMPLETED' and elapsed > self.result.plan.duration + 5.:
@@ -183,7 +186,10 @@ class CircleSimulation:
 
     def record(self, elapsed: float) -> None:
         expected = self.kinematics.forward_world(self.targets['left'], self.targets['right'])
-        on_arc = elapsed >= float(self.result.plan.left.times[self.result.arc_first_index])
+        arc_end = float(self.result.plan.left.times[
+            self.result.arc_first_index + len(self.result.left_targets) - 1])
+        on_arc = float(self.result.plan.left.times[self.result.arc_first_index]) <= elapsed <= arc_end
+        phase = 'RETURN_HOME' if elapsed > arc_end else ('ARC' if on_arc else 'APPROACH')
         for side, pose in zip(('left', 'right'), expected):
             arm = self.loaded.arms[side]
             actual = self.loaded.data.site_xpos[arm.tcp_site_id].copy()
@@ -196,7 +202,7 @@ class CircleSimulation:
                 self.maximum_circle[side] = max(self.maximum_circle[side], circle_error)
                 self.traces[side].append(actual)
             self.maximum_tracking[side] = max(self.maximum_tracking[side], tracking)
-            self.rows.append([float(self.loaded.data.time), elapsed, 'ARC' if on_arc else 'APPROACH', side,
+            self.rows.append([float(self.loaded.data.time), elapsed, phase, side,
                               *[float(q) for q in self.targets[side]],
                               *[float(q) for q in self.loaded.data.qpos[arm.qpos_indices]],
                               *[float(x) for x in desired], *[float(x) for x in actual], tracking, circle_error])
@@ -216,6 +222,7 @@ class CircleSimulation:
                    'started_at': self.started_at.isoformat() if self.started_at is not None else None,
                    'state': self.state, 'reason': self.reason,
                    'planned_duration_s': self.result.plan.duration,
+                   'completion_policy': 'planned_home_then_hold',
                    'maximum_tracking_error_mm': self.maximum_tracking if self.rows else None,
                    'maximum_distance_to_circle_mm': {
                        side: self.maximum_circle[side] if self.traces[side] else None for side in ('left', 'right')},
@@ -284,6 +291,9 @@ def main() -> int:
                 raise ValueError(f'{side} 运动学与仿真 TCP 不一致，请检查 Xacro 和安装参数')
         result = plan_circle(kinematics, loaded.data.qpos[loaded.arms['left'].qpos_indices],
                              loaded.data.qpos[loaded.arms['right'].qpos_indices], inward_tilt=float(np.deg2rad(args.tilt_deg)))
+        result = replace(result, plan=append_return_home(
+            result.plan, left.limits, right.limits,
+        ))
         collision_model = load(True)
         preflight(collision_model, result, .01)
         print(f'预检通过，候选安装偏航角 {args.mount_yaw_deg:.3f}°；轨迹约 {result.plan.duration:.2f} 秒。')

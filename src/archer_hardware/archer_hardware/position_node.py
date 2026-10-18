@@ -122,15 +122,12 @@ class PositionControlNode(Node):
             raise ValueError('readiness_timeout 不能超过 30 秒')
         self._lock = Lock()
         self._interlock_reason = ''
-        self._return_active = False
-        self._return_ids: dict[str, str] = {}
         self._paired_target: StagedPair | None = None
         self._paired_active = False
         self._paired_gate: PairedTrajectoryStart | None = None
         self._paired_ids: dict[str, str] = {}
         self._paired_requested_at = 0.0
         self._paired_phase = 'IDLE'
-        self._return_requested_at = 0.0
         self._targets: dict[str, StagedTarget] = {}
         self._target_messages: dict[str, str] = {}
         self.limits: dict[str, PositionLimits] = {}
@@ -195,7 +192,7 @@ class PositionControlNode(Node):
         self._subscription_handles.append(self.create_subscription(
             String, '/hardware/position/paired_target', self._paired_target_callback, 1,
         ))
-        for kind in ('stop', 'halt', 'paired_move'):
+        for kind in ('halt', 'paired_move'):
             self._service_handles.append(self.create_service(
                 Trigger, f'/hardware/position/{kind}', self._service_callback(None, kind),
             ))
@@ -226,8 +223,7 @@ class PositionControlNode(Node):
         with self._lock:
             if not self._interlock_reason:
                 self._interlock_reason = reason
-            self._return_active = False
-            self._targets.clear()
+                self._targets.clear()
             self._paired_target = None
             self._paired_active = False
             self._paired_phase = 'CANCELLED'
@@ -254,8 +250,6 @@ class PositionControlNode(Node):
         if kind == 'halt':
             self._trip('立即停止：本次运行已结束，后续由人工断电及复位')
             return '已请求两臂停止后续目标；不代表物理停止已确认'
-        if kind == 'stop':
-            return self.request_return_after_completion()
         if kind == 'paired_move':
             if side is not None:
                 raise ValueError('成对执行必须使用全局入口')
@@ -267,8 +261,6 @@ class PositionControlNode(Node):
         with self._lock:
             if self._interlock_reason and kind != 'disconnect':
                 raise RuntimeError(f'本次运行已结束：{self._interlock_reason}')
-            if self._return_active:
-                raise RuntimeError('停止并归位正在执行；如遇异常请使用 halt')
             if self._paired_active:
                 raise RuntimeError('成对轨迹正在准备或执行；如遇异常请使用 halt')
             if kind == 'move':
@@ -290,65 +282,6 @@ class PositionControlNode(Node):
                     self._targets.pop(side, None)
         return f'已受理编号 {identifier}，请查看状态话题；不代表动作已完成'
 
-    def request_return_after_completion(self) -> str:
-        """所有配置臂已完成并保持时才受理归位，一侧失败则联停."""
-        failure: Exception | None = None
-        identifiers: dict[str, str] = {}
-        with self._lock:
-            if self._interlock_reason:
-                raise RuntimeError('本次运行已结束，禁止归位')
-            if self._return_active:
-                raise RuntimeError('停止并归位已经受理，请勿重复提交')
-            if self._paired_active:
-                raise RuntimeError('成对轨迹尚未完成，不能归位；异常请使用 halt')
-            for side, worker in self.workers.items():
-                snapshot = worker.snapshot()
-                frame = snapshot.feedback
-                if (snapshot.state != 'HOLDING' or snapshot.phase != 'SUCCEEDED'
-                        or snapshot.command not in ('enable', 'move', 'return', 'trajectory')):
-                    raise RuntimeError(f'{side} 尚未完成运动；运动中异常请使用 halt')
-                if (snapshot.initial_positions is None or frame is None
-                        or not 0 <= (time.perf_counter_ns() - frame.source_ns) / 1e9 <= 0.1
-                        or max(abs(v) for v in frame.velocities) > 0.02):
-                    raise RuntimeError(f'{side} 缺少新鲜静止反馈或本次初始记录')
-            self._targets.clear()
-            self._paired_target = None
-            try:
-                for side, worker in self.workers.items():
-                    identifiers[side] = worker.submit('return', duration=self.return_duration)
-                self._return_ids = dict(identifiers)
-                self._return_active = True
-                self._return_requested_at = time.monotonic()
-            except Exception as error:
-                failure = error
-        if failure is not None:
-            self._trip(f'停止并归位受理失败：{failure}')
-            raise RuntimeError('归位请求未完整受理，已请求两臂 halt') from failure
-        return json.dumps({'operation': 'stop', 'commands': identifiers}, ensure_ascii=False)
-
-    def check_return_progress(self) -> None:
-        """归位期间禁止新目标，一侧拒绝或丢失请求时终止本次运行."""
-        with self._lock:
-            if not self._return_active:
-                return
-            identifiers = dict(self._return_ids)
-            requested = self._return_requested_at
-        completed = True
-        for side, identifier in identifiers.items():
-            snapshot = self.workers[side].snapshot()
-            if snapshot.command_id != identifier:
-                completed = False
-                if time.monotonic() - requested > 1.0:
-                    self._trip(f'{side} 归位请求未执行，本次运行结束')
-                    return
-            elif snapshot.phase in ('FAILED', 'REJECTED', 'CANCELLED'):
-                self._trip(f'{side} 归位失败，本次运行结束：{snapshot.message}')
-                return
-            elif snapshot.phase != 'SUCCEEDED' or snapshot.state != 'HOLDING':
-                completed = False
-        if completed:
-            with self._lock:
-                self._return_active = False
 
     def _paired_target_callback(self, message: String) -> None:
         """接收完整JSON计划只暂存；错误消息作废此前成对暂存."""
@@ -365,8 +298,8 @@ class PositionControlNode(Node):
         with self._lock:
             if not self.allow_paired_trajectory or self.sides != ('left', 'right'):
                 raise RuntimeError('需显式允许成对轨迹并配置both，两臂不会自动连接或使能')
-            if self._interlock_reason or self._return_active or self._paired_active:
-                raise RuntimeError('停止、归位或成对执行期间禁止暂存计划')
+            if self._interlock_reason or self._paired_active:
+                raise RuntimeError('停止或成对执行期间禁止暂存计划')
             if set(self.limits) != {'left', 'right'}:
                 raise RuntimeError('两臂限位尚未确认')
             review_joint_plan(data, self.limits)
@@ -401,8 +334,8 @@ class PositionControlNode(Node):
             if (not self.allow_paired_trajectory or self.sides != ('left', 'right')
                     or self._interlock_reason):
                 raise RuntimeError('成对执行未允许或本次运行已结束')
-            if self._return_active or self._paired_active:
-                raise RuntimeError('正在归位或成对执行，禁止重复提交')
+            if self._paired_active:
+                raise RuntimeError('正在成对执行，禁止重复提交')
             plan = self._paired_target
             self._paired_target = None
             if plan is None or time.monotonic() - plan.received > self.target_timeout:
@@ -485,8 +418,6 @@ class PositionControlNode(Node):
         with self._lock:
             if self._interlock_reason:
                 raise RuntimeError('本次运行已结束，禁止暂存目标')
-            if self._return_active:
-                raise RuntimeError('停止并归位期间禁止暂存新目标')
             if self._paired_active:
                 raise RuntimeError('成对轨迹期间禁止暂存单臂目标')
             if side not in self.limits:
@@ -529,14 +460,12 @@ class PositionControlNode(Node):
 
     def publish_state(self) -> None:
         """发布独立反馈和可供晚加入订阅者读取的执行状态."""
-        self.check_return_progress()
         self.check_paired_progress()
         states = {}
         with self._lock:
             interlock = self._interlock_reason
             targets = {side: side in self._targets for side in self.sides}
             target_messages = dict(self._target_messages)
-            normal_stop = {'active': self._return_active, 'commands': dict(self._return_ids)}
             paired = {'active': self._paired_active, 'phase': self._paired_phase,
                       'staged': self._paired_target is not None,
                       'commands': dict(self._paired_ids),
@@ -575,7 +504,7 @@ class PositionControlNode(Node):
                 self.feedback_pubs[side].publish(message)
                 self._published_source[side] = frame.source_ns
         text = json.dumps({'interlock': interlock, 'session_ended': bool(interlock),
-                           'normal_stop': normal_stop, 'paired_trajectory': paired,
+                           'completion_policy': 'planned_home_then_hold', 'paired_trajectory': paired,
                            'arms': states}, ensure_ascii=False)
         now = time.monotonic()
         if text != self._last_status or now - self._last_status_time >= 1.0:

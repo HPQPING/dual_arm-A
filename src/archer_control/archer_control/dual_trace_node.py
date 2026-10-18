@@ -57,6 +57,7 @@ class TaskProfile:
     objects: tuple[FloatArray, ...]
     left_grasp: FloatArray
     right_grasp: FloatArray
+    return_home_start: float | None = None
 
     def object_at(self, elapsed: float) -> FloatArray:
         if not self.objects:
@@ -199,6 +200,10 @@ class DualTrace(Node):
             approach = number(data['approach_duration_s'], 'approach_duration_s')
             if approach < 0.:
                 raise ValueError('接近时间不能为负数')
+            raw_return = data.get('return_home_start_s')
+            return_start = None if raw_return is None else number(raw_return, 'return_home_start_s')
+            if return_start is not None and return_start <= approach:
+                raise ValueError('归位开始时间必须晚于接近阶段')
             poses: tuple[FloatArray, ...] = ()
             times = np.zeros(0, dtype=np.float64)
             left, right = np.eye(4, dtype=np.float64), np.eye(4, dtype=np.float64)
@@ -218,7 +223,7 @@ class DualTrace(Node):
                 radius = number(data['circle_radius'], 'circle_radius')
                 a, b = semicircle_points(center, radius, 64)
                 reference = np.asarray(np.concatenate((a, b[1:]), axis=0), dtype=np.float64)
-            profile = TaskProfile(str(mode), stamp, approach, times, poses, left, right)
+            profile = TaskProfile(str(mode), stamp, approach, times, poses, left, right, return_start)
         except (ValueError, TypeError, KeyError, OverflowError) as exc:
             self.get_logger().error('任务说明无法用于记录：' + str(exc))
             return
@@ -346,9 +351,11 @@ class DualTrace(Node):
                 return
             cooperative = profile.mode == 'cooperative'
             boundary = profile.approach if cooperative else float(plan[0][1])
-            on_arc = elapsed >= boundary
+            returning = profile.return_home_start is not None and elapsed > profile.return_home_start
+            on_arc = elapsed >= boundary and not returning
             object_error: float | None = None
-            phase = 'APPROACH' if not on_arc else ('COOPERATIVE' if cooperative else 'ARC')
+            phase = ('RETURN_HOME' if returning else
+                     ('APPROACH' if not on_arc else ('COOPERATIVE' if cooperative else 'ARC')))
             self.visual_elapsed = elapsed
             if cooperative and on_arc:
                 grasp = profile.left_grasp if side == 'left' else profile.right_grasp

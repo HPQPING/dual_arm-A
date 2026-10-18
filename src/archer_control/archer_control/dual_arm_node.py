@@ -10,7 +10,7 @@ import time
 import json
 from threading import Event
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import cast
 
 import numpy as np
@@ -25,6 +25,7 @@ from trajectory_msgs.msg import JointTrajectory
 
 from .dual_arm_trajectory import (
     DualArmKinematics, DualArmPlan, rigid_transform, peak_target_speeds, plan_paired_joints,
+    append_return_home,
 )
 from .kinematics import ArmKinematics
 from .circle_planner import plan_circle, semicircle_points, inward_rotation
@@ -42,6 +43,7 @@ class PreparedTask:
     paired: DualArmPlan
     approach_duration: float = 0.
     cooperative: CooperativePlan | None = None
+    return_home_start: float | None = None
 
 
 class DualArmTask(Node):
@@ -143,6 +145,7 @@ class DualArmTask(Node):
         if min(self.cooperative_position_tolerance, self.cooperative_rotation_tolerance) <= 0.:
             raise ValueError('协同执行误差阈值必须为正数')
         self.approach_duration = 0.
+        self.return_home_start: float | None = None
         self.cooperative_plan: CooperativePlan | None = None
         self.stage = ''
         self.current: dict[str, FloatArray] = {}
@@ -311,6 +314,11 @@ class DualArmTask(Node):
         )
         if self.cancel_event.is_set():
             raise ValueError('规划已取消')
+        return_start = result.plan.duration
+        result = replace(result, plan=append_return_home(
+            result.plan, self.kinematics.left.limits, self.kinematics.right.limits,
+            self.speeds, self.speeds, self.minimum, self.margin,
+        ))
         for arm_plan in (result.plan.left, result.plan.right):
             if np.any(peak_target_speeds(arm_plan) > np.asarray(self.speeds) + 1e-10):
                 raise ValueError('规划速度超出任务 speed_limits，请提高 time_margin 后重试')
@@ -322,7 +330,10 @@ class DualArmTask(Node):
         preflight(loaded, result, self.clearance)
         if self.cancel_event.is_set():
             raise ValueError('规划已取消')
-        return PreparedTask(result.plan)
+        return PreparedTask(
+            result.plan, approach_duration=float(result.plan.left.times[result.arc_first_index]),
+            return_home_start=return_start,
+        )
 
     def build_cooperative(self, left_start: FloatArray, right_start: FloatArray) -> PreparedTask:
         """先空载接近示例抓取位姿，再拼接固定抓取关系的协同移动。
@@ -416,6 +427,7 @@ class DualArmTask(Node):
         self.cancel_event = Event()
         self.cooperative_plan = None
         self.approach_duration = 0.
+        self.return_home_start: float | None = None
         self.planning_started = time.monotonic()
         self.planning = self.planner.submit(self.build_plan, snapshot)
         self.set_status('PLANNING')
@@ -467,6 +479,7 @@ class DualArmTask(Node):
             'version': 1, 'task_type': self.task_type, 'start_stamp_ns': start_ns,
             'geometry': self.geometry, 'speed_limits': self.speeds,
             'approach_duration_s': self.approach_duration,
+            'return_home_start_s': self.return_home_start,
             'circle_center': self.circle_center.tolist(), 'circle_radius': self.circle_radius,
         }
         cooperative = self.cooperative_plan
@@ -541,6 +554,7 @@ class DualArmTask(Node):
                 try:
                     prepared = future.result()
                     self.approach_duration = prepared.approach_duration
+                    self.return_home_start = prepared.return_home_start
                     self.cooperative_plan = prepared.cooperative
                     self.dispatch_plan(prepared.paired)
                 except Exception as exc:
@@ -574,7 +588,12 @@ class DualArmTask(Node):
         elapsed = (now_ns - start_ns) * 1e-9
         cooperative = self.cooperative_plan
         if cooperative is None:
-            self.set_stage('DRAW_CIRCLE')
+            if elapsed < self.approach_duration:
+                self.set_stage('APPROACH')
+            elif self.return_home_start is not None and elapsed > self.return_home_start:
+                self.set_stage('RETURN_HOME')
+            else:
+                self.set_stage('DRAW_CIRCLE')
         elif elapsed < self.approach_duration:
             self.set_stage('APPROACH')
         else:

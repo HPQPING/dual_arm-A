@@ -136,6 +136,32 @@ def plan_paired_joints(
     )
 
 
+def append_return_home(
+    plan: DualArmPlan,
+    left_limits: ArrayLike,
+    right_limits: ArrayLike,
+    left_speeds: ArrayLike = DEFAULT_SPEED_LIMITS,
+    right_speeds: ArrayLike = DEFAULT_SPEED_LIMITS,
+    minimum_duration: float = 1.0,
+    time_margin: float = 1.1,
+) -> DualArmPlan:
+    """将本次起点作为归位目标；返回新计划，调用者须对完整路径重新预检。"""
+    home = plan_paired_joints(
+        plan.left.positions[-1], plan.right.positions[-1],
+        [plan.left.positions[0]], [plan.right.positions[0]],
+        left_speeds, right_speeds, left_limits, right_limits,
+        minimum_duration, time_margin,
+    )
+    times = np.asarray(np.concatenate((plan.left.times, home.left.times[1:] + plan.duration)),
+                       dtype=np.float64)
+    return DualArmPlan(*(
+        JointPlan(original.joint_names, times.copy(), np.asarray(
+            np.concatenate((original.positions, returning.positions[1:]), axis=0),
+            dtype=np.float64,
+        )) for original, returning in ((plan.left, home.left), (plan.right, home.right))
+    ))
+
+
 class DualArmKinematics:
     """Convert world TCP poses to each arm's base, then solve paired IK.
 

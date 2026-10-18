@@ -6,7 +6,7 @@ from threading import Event
 import time
 from typing import Callable, cast
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
@@ -349,7 +349,7 @@ class PositionNodeTests(unittest.TestCase):
         self.assertEqual(received[-1]['arms']['left']['state'], 'UNCONFIGURED')
 
     def test_target_topic_requires_explicit_move_and_is_single_use(self) -> None:
-        """发布目标不运动，move 只执行一次，归位使用实际初始角度."""
+        """发布目标不运动，move只执行一次；halt不追加归位."""
         node = self.make_node()
         self.enable_both(node)
         publisher = self.observer.create_publisher(
@@ -366,8 +366,8 @@ class PositionNodeTests(unittest.TestCase):
         self.wait_until(lambda: any(kind == 'move' for kind, _ in backend.calls))
         self.wait_until(lambda: node.workers['left'].snapshot().phase == 'SUCCEEDED')
         self.assertFalse(self.service('left/move').success)
-        self.assertTrue(self.service('stop').success)
-        self.wait_until(lambda: ('return', (0.1,) * 6) in backend.calls)
+        self.assertTrue(self.service('halt').success)
+        self.assertFalse(any(kind == 'return' for kind, _ in backend.calls))
 
     def test_target_validation_and_reordering(self) -> None:
         """按关节名重新排序，拒绝重复名字、多点、其他控制字段和越界目标."""
@@ -396,7 +396,7 @@ class PositionNodeTests(unittest.TestCase):
                 node.stage_target('left', target)
 
     def test_completion_holds_goal_and_does_not_return_automatically(self) -> None:
-        """正常完成后保持目标位置，归位仅在明确请求时发生."""
+        """底层单点完成后保持；任务归位必须已包含在上层完整计划中."""
         node = self.make_node()
         self.enable_both(node)
         backend = self.backend(node, 'left')
@@ -408,8 +408,8 @@ class PositionNodeTests(unittest.TestCase):
         self.assertFalse(any(kind == 'return' for kind, _ in backend.calls))
         self.assertEqual(backend.initial_positions, (0.1,) * 6)
 
-    def test_normal_stop_rejects_running_motion_without_return(self) -> None:
-        """普通停止只用于完成后归位，运动中只接受独立 halt."""
+    def test_removed_stop_does_not_interrupt_motion(self) -> None:
+        """旧stop命令被拒绝，运行中halt可以取消运动."""
         node = self.make_node()
         self.enable_both(node)
         backend = self.backend(node, 'left')
@@ -417,7 +417,8 @@ class PositionNodeTests(unittest.TestCase):
         node.stage_target('left', self.target('left'))
         self.assertTrue(self.service('left/move').success)
         self.wait_until(lambda: node.workers['left'].snapshot().state == 'RUNNING')
-        self.assertFalse(self.service('stop').success)
+        with self.assertRaises(ValueError):
+            node.handle_request(None, 'stop')
         self.assertFalse(any(kind == 'return' for kind, _ in backend.calls))
         self.assertEqual(node.workers['left'].snapshot().state, 'RUNNING')
         self.assertTrue(self.service('halt').success)
@@ -434,16 +435,17 @@ class PositionNodeTests(unittest.TestCase):
         for side in ('left', 'right'):
             calls = self.backend(node, side).calls
             self.assertFalse(any(kind in ('return', 'close') for kind, _ in calls))
-        self.assertFalse(self.service('stop').success)
+        with self.assertRaises(ValueError):
+            node.handle_request(None, 'stop')
         self.assertFalse(self.service('left/enable').success)
         with self.assertRaises(ValueError):
             node.handle_request(None, 'reset')
 
-    def test_only_two_stop_services_are_exposed(self) -> None:
-        """移除复位和单臂停止别名，公开停止入口只有 stop/halt."""
+    def test_only_fault_halt_service_is_exposed(self) -> None:
+        """移除键盘stop归位接口；保留全局故障halt，归位属于任务轨迹."""
         node = self.make_node()
         names = {name for name, _ in node.get_service_names_and_types()}
-        self.assertIn('/hardware/position/stop', names)
+        self.assertNotIn('/hardware/position/stop', names)
         self.assertIn('/hardware/position/halt', names)
         self.assertNotIn('/hardware/position/reset', names)
         for side in ('left', 'right'):
@@ -455,69 +457,54 @@ class PositionNodeTests(unittest.TestCase):
         node = self.make_node(configured=False)
         self.assertTrue(self.service('halt').success)
         self.assertTrue(node._interlock_reason)
-        self.assertFalse(self.service('stop').success)
+        with self.assertRaises(ValueError):
+            node.handle_request(None, 'stop')
         self.assertFalse(self.service('left/connect').success)
 
-    def test_normal_stop_returns_both_without_ending_session(self) -> None:
-        """运动完成后按普通停止，两臂归位并保持，不自动断开."""
-        node = self.make_node()
+    def test_complete_paired_cycle_returns_inside_plan(self) -> None:
+        """完整轨迹含归位点，双臂正常结束保持，不追加独立return或close."""
+        node = self.make_node(allow_paired_trajectory=True)
         self.enable_both(node)
-        for side in ('left', 'right'):
-            node.stage_target(side, self.target(side))
-            self.assertTrue(self.service(side + '/move').success)
-        self.wait_until(lambda: all(
-            w.snapshot().phase == 'SUCCEEDED'
-            for w in node.workers.values()
-        ))
-        response = self.service('stop')
-        self.assertTrue(response.success)
-        identifiers = json.loads(response.message)['commands']
-        self.assertEqual(set(identifiers), {'left', 'right'})
-        self.wait_until(lambda: all(
-            w.snapshot().command == 'return'
-            and w.snapshot().phase == 'SUCCEEDED'
-            for w in node.workers.values()
-        ))
-        self.wait_until(lambda: not node._return_active)
-        self.assertEqual(node._interlock_reason, '')
-        for side in ('left', 'right'):
+        plan = self.paired_plan()
+        for side in node.sides:
+            plan[side]['points'].append({
+                'positions': [0.1] * 6,
+                'time_from_start': {'sec': 0, 'nanosec': 400_000_000},
+            })
+        node.stage_paired_target(plan)
+        self.assertTrue(self.service('paired_move').success)
+        self.wait_until(lambda: node._paired_phase == 'FINISHED')
+        for side in node.sides:
             backend = self.backend(node, side)
             self.assertEqual(backend.positions, (0.1,) * 6)
-            self.assertFalse(any(kind == 'close' for kind, _ in backend.calls))
+            self.assertFalse(any(kind in ('return', 'close') for kind, _ in backend.calls))
+        self.assertEqual(node._interlock_reason, '')
 
-    def test_partial_return_acceptance_halts_both(self) -> None:
-        """一侧归位入队失败，不能留另一侧独自继续执行."""
+    def test_removed_return_request_never_queues_a_worker(self) -> None:
+        """旧stop不会悄悄转成单臂归位或联锁，完整轨迹由任务层提供."""
         node = self.make_node()
         self.enable_both(node)
-        with patch.object(node.workers['right'], 'submit', side_effect=RuntimeError('queue busy')):
-            self.assertFalse(self.service('stop').success)
-        self.wait_until(lambda: all(
-            w.snapshot().state == 'STOPPED'
-            for w in node.workers.values()
-        ))
-        self.assertTrue(node._interlock_reason)
+        with patch.object(node.workers['left'], 'submit') as submit:
+            with self.assertRaises(ValueError):
+                node.handle_request(None, 'stop')
+            submit.assert_not_called()
+        self.assertEqual(node._interlock_reason, '')
 
-    def test_halt_cancels_return_and_never_allows_resume(self) -> None:
-        """归位过程中 halt 仍可抢占；结束后没有复位继续入口."""
-        node = self.make_node()
-        self.enable_both(node)
-        for side in ('left', 'right'):
-            self.backend(node, side).complete_move.clear()
-        self.assertTrue(self.service('stop').success)
-        self.wait_until(lambda: all(
-            w.snapshot().state == 'RETURNING'
-            for w in node.workers.values()
-        ))
-        with self.assertRaises(RuntimeError):
-            node.stage_target('left', self.target('left'))
-        self.assertFalse(self.service('stop').success)
-        self.assertTrue(self.service('halt').success)
-        self.wait_until(lambda: all(
-            w.snapshot().state == 'STOPPED'
-            for w in node.workers.values()
-        ))
-        self.assertFalse(node._return_active)
-        self.assertFalse(self.service('stop').success)
+    def test_driver_ctrl_c_closes_workers_before_destroy(self) -> None:
+        """Ctrl+C走驱动退出清理，不调用归位服务或启动新的任务."""
+        from archer_hardware import position_node
+        fake = Mock()
+        order = []
+        fake.close_workers.side_effect = lambda: order.append('close')
+        fake.destroy_node.side_effect = lambda: order.append('destroy')
+        with patch.object(position_node.rclpy, 'init'), patch.object(
+            position_node, 'PositionControlNode', return_value=fake,
+        ), patch.object(position_node.rclpy, 'spin', side_effect=KeyboardInterrupt), patch.object(
+            position_node.rclpy, 'ok', return_value=True,
+        ), patch.object(position_node.rclpy, 'shutdown') as shutdown:
+            position_node.main([])
+            shutdown.assert_called_once()
+        self.assertEqual(order, ['close', 'destroy'])
 
     def test_expired_target_never_moves(self) -> None:
         """目标过期后必须重新发布，不能重用旧坐标."""
@@ -548,7 +535,8 @@ class PositionNodeTests(unittest.TestCase):
             self.wait_until(lambda: node.workers[side].snapshot().state == 'DISCONNECTED')
         self.assertTrue(node._interlock_reason)
         self.assertFalse(self.service('left/connect').success)
-        self.assertFalse(self.service('stop').success)
+        with self.assertRaises(ValueError):
+            node.handle_request(None, 'stop')
 
     def test_manual_stop_and_immutable_parameters(self) -> None:
         """停止请求联锁两臂，运行时不能改限位或启用仿真时钟."""
@@ -586,7 +574,7 @@ class PositionNodeTests(unittest.TestCase):
         self.assertFalse(self.service('paired_move').success)
         self.assertTrue(all(w._backend is None for w in node.workers.values()))
 
-    def test_paired_topic_stage_start_complete_and_explicit_return(self) -> None:
+    def test_paired_topic_stage_start_complete_and_hold(self) -> None:
         """经真实ROS话题和服务暂存再执行，双方共用启动时间，完成后保持."""
         node = self.make_node(allow_paired_trajectory=True)
         self.enable_both(node)
@@ -605,10 +593,9 @@ class PositionNodeTests(unittest.TestCase):
         self.assertEqual(left.positions, (0.1002,) * 6)
         self.assertEqual(right.positions, (0.1002,) * 6)
         self.assertFalse(any(kind == 'return' for kind, _ in left.calls))
-        self.assertTrue(self.service('stop').success)
-        self.wait_until(lambda: not node._return_active)
-        self.assertEqual(left.positions, (0.1,) * 6)
-        self.assertEqual(right.positions, (0.1,) * 6)
+        self.assertTrue(self.service('halt').success)
+        self.assertEqual(left.positions, (0.1002,) * 6)
+        self.assertEqual(right.positions, (0.1002,) * 6)
 
     def test_one_prepare_rejection_prevents_both_starts(self) -> None:
         """一侧执行线程拒绝准备时共同门控不释放，两侧均取消."""
@@ -633,7 +620,8 @@ class PositionNodeTests(unittest.TestCase):
         self.wait_until(lambda: all(w.snapshot().state == 'ARMED' for w in node.workers.values()))
         self.assertFalse(self.service('paired_move').success)
         self.assertFalse(self.service('left/enable').success)
-        self.assertFalse(self.service('stop').success)
+        with self.assertRaises(ValueError):
+            node.handle_request(None, 'stop')
         self.assertTrue(self.service('halt').success)
         self.wait_until(lambda: all(
             w.snapshot().state == 'STOPPED' for w in node.workers.values()
@@ -671,7 +659,8 @@ class PositionNodeTests(unittest.TestCase):
         self.wait_until(lambda: all(w.snapshot().state in ('STOPPED', 'FAULT')
                                     for w in node.workers.values()))
         self.assertFalse(self.service('paired_move').success)
-        self.assertFalse(self.service('stop').success)
+        with self.assertRaises(ValueError):
+            node.handle_request(None, 'stop')
 
     def test_bad_paired_message_invalidates_previous_stage(self) -> None:
         """收到无效新消息后不能误执行此前有效但已被替换的计划."""
