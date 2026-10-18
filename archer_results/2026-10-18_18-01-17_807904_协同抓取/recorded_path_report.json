@@ -1,0 +1,63 @@
+{
+  "import_succeeded": true,
+  "execution_ready": false,
+  "commands_sent": false,
+  "source_csv": "/home/user/archer_ws/archer_results/2026-10-18_18-01-17_807904_协同抓取/state.csv",
+  "csv_sha256": "6ce29adc52e10ff2371700a47d4b934333ad4551c7ade60c8b38b448db5ec1fd",
+  "summary_sha256": "ba8271fb6813f9eba386e66ad45d1f57353f90edbf7b13b87b1156ef745eba71",
+  "limits_sha256": "8eb53899159f8064f998769cbe412863d0b165063e7b6a4863322077dec6d3ae",
+  "source_rows": 1799,
+  "paired_samples": 1799,
+  "duration_s": 89.624,
+  "contains_home_phase": true,
+  "phase_execution_policy_verified": false,
+  "duplicate_identical_arm_samples_removed": 0,
+  "source_time_origin_ns": 0,
+  "source_time_basis": "simulation_time_s",
+  "max_pair_skew_ms": 0.0,
+  "max_gap_s": 0.05,
+  "requires_time_adjustment_by_sample_differences": true,
+  "arms": {
+    "left": {
+      "finite_difference_peak_velocity_rad_s": [
+        0.09132782227228464,
+        0.3258396724695145,
+        0.4092099388098003,
+        0.44385507713319505,
+        0.22704639825419815,
+        0.45453429031686365
+      ],
+      "finite_difference_peak_acceleration_rad_s2": [
+        1.2272633912118192,
+        1.267751920287591,
+        2.3316839458947136,
+        1.3477640803027935,
+        1.1904470536929779,
+        0.20339131940696475
+      ],
+      "sample_difference_within_limits": false
+    },
+    "right": {
+      "finite_difference_peak_velocity_rad_s": [
+        0.08585417844405918,
+        0.4546280239921807,
+        0.1098717377911207,
+        0.09215298288185014,
+        0.19534489969505575,
+        0.39429964891425806
+      ],
+      "finite_difference_peak_acceleration_rad_s2": [
+        0.8168192131354779,
+        1.0211462705983436,
+        1.0506742180695028,
+        1.0363710180382846,
+        0.7876349728934695,
+        0.1764380123784548
+      ],
+      "sample_difference_within_limits": false
+    }
+  },
+  "selected_data": "实际position_rad或actual_J*_rad；从未读取drive_input_rad",
+  "scope": "名义角度与采样差分诊断；未选择连续插值，未验证段内峰值、碰撞、实际起点或夹持",
+  "output_sha256": "8af666bbbef16c9ecf9167e461a36b67d1ede5ec19357a5e5546ca8734dc3907"
+}

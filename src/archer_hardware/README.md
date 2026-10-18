@@ -370,3 +370,18 @@ ros2 run archer_hardware hardware_operator plan-retime --plan-file dual_results/
 输出前使用执行核心重新检查名义角度、速度、加速度及一小时上限；输入、配置、输出和报告必须为不同路径，输出文件不能已存在。成功报告包含原文件、配置及新计划SHA256。失败不会返回可执行计划；不会初始化ROS、连接设备、暂存或执行。`--margin`可选范围为1.001～2.0，默认1.05。
 
 时间调整保留同段进度下的关节空间路径和双臂关系；此前通过的几何假设没有得到新的实物验证，也不意味着动态接触、跟踪误差或实际起点已经验收。当前驱动的最大试动幅度仍保持0.05 rad，完整大幅度任务不会因离线时间预检通过而自动放行。
+
+
+## 成功仿真任务的CSV路径导入
+
+```bash
+ros2 run archer_hardware hardware_operator csv-import --run-dir "archer_results/实际日期_开始时间_微秒_协同抓取" --limits-file src/archer_hardware/config/position_control.yaml
+```
+
+此命令只读源文件，在同一目录新增`recorded_path.json`和`recorded_path_report.json`，不覆盖已有文件，不创建新的任务文件夹。摘要必须明确标记COMPLETED。支持同一行包含左右臂的`state.csv`、左右分行的独立画圆`tracking.csv`和ROS反馈`tracking.csv`；目录同时有两种文件时须用`--csv-name`明确选择。
+
+只提取实际`position_rad`或`actual_J*_rad`，不使用仿真`drive_input_rad`。优先采用仿真时间；ROS反馈格式使用整数纳秒时间戳，按左右对应样本配对，最大允许时差默认5 ms。保留采样间隔，仅将第一点时间平移为零。相同时间且角度完全相同的重复记录可以合并；倒退、同刻不同角、缺口超过0.2 s、未配对数据、非法列或名义角度越界均拒绝，不静默丢帧、夹紧角度或补造数据。两个间隔参数可显式设置：`--max-gap`范围0.001～1秒，`--pair-skew-ms`范围0～5毫秒。
+
+候选为版本三`recorded_joint_samples`，插值标记`unassigned`。导入检查与采样差分诊断不等同于连续运动峰值、碰撞、实际初值或夹持验证；报告始终`execution_ready=false`。差分超限时保留原始时序并标记需要调整，不能把导入成功当作速度校验通过。旧执行接口会拒绝该格式，尚不发送运动。参考阶段和夹爪示意状态仅保留供分析，不转成实机夹爪指令。
+
+通过报告内CSV、摘要、限位配置及输出SHA256核对文件身份；输入CSV和summary.json保持不变。离线命令不会初始化ROS、连接SDK或自动使能。

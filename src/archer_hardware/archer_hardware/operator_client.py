@@ -357,6 +357,9 @@ def keyboard_loop(node: OperatorClient, timeout: float) -> int:
 def main(args: list[str] | None = None) -> int:
     """默认只看状态；异常时对已发出的活动请求尽力补发全局 halt."""
     arguments = list(sys.argv[1:] if args is None else args)
+    if arguments and arguments[0] == 'csv-import':
+        from .csv_import import main as csv_import_main
+        return csv_import_main(arguments[1:])
     # 联调工具只在显式选择时载入；不创建操作客户端或控制服务请求。
     if arguments and arguments[0] in ('audit', 'trial', 'plan-check', 'plan-retime'):
         from .commissioning import audit_main, plan_check_main, plan_retime_main, trial_main
@@ -370,14 +373,16 @@ def main(args: list[str] | None = None) -> int:
         epilog='离线计划检查：hardware_operator plan-check --help；另有audit/trial子命令',
     )
     parser.add_argument(
-        'command', choices=COMMANDS + ('audit', 'trial', 'plan-check', 'plan-retime', 'keyboard'),
+        'command', choices=COMMANDS + (
+            'audit', 'trial', 'plan-check', 'plan-retime', 'csv-import', 'keyboard',
+        ),
         nargs='?', default='status',
     )
     parser.add_argument('--side', choices=['left', 'right'])
     parser.add_argument('--timeout', type=float, default=30.0)
     options = parser.parse_args(arguments)
-    if options.command in ('audit', 'trial', 'plan-check', 'plan-retime'):
-        parser.error('audit/trial/plan-check/plan-retime 子命令必须放在参数最前面')
+    if options.command in ('audit', 'trial', 'plan-check', 'plan-retime', 'csv-import'):
+        parser.error('audit/trial/plan-check/plan-retime/csv-import 子命令必须放在参数最前面')
     positive(options.timeout, 'timeout')
     if options.command == 'keyboard' and (options.side is not None or not sys.stdin.isatty()):
         parser.error('keyboard须在前台交互终端运行，不加--side；不接受管道或后台输入')
