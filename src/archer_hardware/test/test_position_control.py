@@ -1,6 +1,7 @@
 """离线验证位置控制，所有发送均被替身接收，不连接实际设备."""
 
 import asyncio
+from copy import deepcopy
 from importlib import import_module
 from threading import Event, Thread
 import time
@@ -15,6 +16,7 @@ from archer_hardware.hex_adapter import HexFeedbackAdapter, JointFeedback
 from archer_hardware.position_adapter import HexPositionAdapter
 from archer_hardware.position_plan import (
     JointPositionMove, JointPositionTrajectory, PairedTrajectoryStart, PositionLimits,
+    prepare_continuous_pair,
 )
 
 
@@ -174,6 +176,122 @@ class FullTrajectoryTests(unittest.TestCase):
                 plan.sample(elapsed)
 
 
+class ContinuousExecutionTests(unittest.TestCase):
+    """版本二文件重新解析并验证，计算过程中没有SDK连接或ROS初始化."""
+
+    def setUp(self) -> None:
+        """创建含非零内部速度的合成闭合轨迹，只用于测试."""
+        from archer_control.continuous_trajectory import retime_recorded_pair
+
+        self.bound = fixture_limits()
+        self.bounds = {'left': self.bound, 'right': self.bound}
+        q = np.repeat(np.array([0., .005, .012, .02, .018, 0.])[:, None], 6, axis=1)
+        self.reference, _ = retime_recorded_pair(
+            (0, 10 ** 9, 2 * 10 ** 9, 3 * 10 ** 9, 4 * 10 ** 9, 5 * 10 ** 9),
+            q, q, [self.bound.lower] * 2, [self.bound.upper] * 2,
+            [self.bound.max_velocity] * 2, [self.bound.max_acceleration] * 2,
+        )
+        self.payload = self.reference.payload()
+
+    def test_payload_reconstructs_same_continuous_curve(self) -> None:
+        """读取文件后的取样与准备阶段一致，内部点不被改成逐点停车."""
+        plans = prepare_continuous_pair(self.payload, self.bounds, .05)
+        self.assertGreater(abs(plans['left'].sample(float(self.reference.times[1]), 1)[0]), 0.)
+        for side in ('left', 'right'):
+            for elapsed in np.linspace(0., self.reference.times[-1], 101):
+                for order in (0, 1, 2):
+                    np.testing.assert_allclose(
+                        plans[side].sample(float(elapsed), order),
+                        self.reference.sample(side, float(elapsed), order), atol=1e-12, rtol=0.,
+                    )
+            np.testing.assert_array_equal(plans[side].sample(plans[side].duration + 1.), [0.] * 6)
+            self.assertFalse(plans[side].polynomials[0].flags.writeable)
+
+    def test_actual_start_alignment_only_rebuilds_first_segment(self) -> None:
+        """允许容差内的实际起点并重检首段，保留其余多项式及共同时间轴."""
+        plan = prepare_continuous_pair(self.payload, self.bounds, .05)['left']
+        aligned = plan.aligned_start((.001,) * 6, self.bound, .05)
+        self.assertEqual(aligned.sample(0.), (.001,) * 6)
+        self.assertEqual(aligned.times_ns, plan.times_ns)
+        self.assertEqual(plan.initial, (0.,) * 6)
+        for old, new in zip(plan.polynomials[1:], aligned.polynomials[1:]):
+            self.assertIs(old, new)
+        with self.assertRaisesRegex(ValueError, '实际初始角度'):
+            plan.aligned_start((.006,) * 6, self.bound, .05)
+        changed = PositionLimits(self.bound.lower, self.bound.upper,
+                                 (.09,) * 6, self.bound.max_acceleration)
+        with self.assertRaisesRegex(ValueError, '限制'):
+            plan.aligned_start((0.,) * 6, changed, .05)
+        with self.assertRaisesRegex(ValueError, '允许位移'):
+            plan.aligned_start((0.,) * 6, self.bound, .001)
+
+    def test_forged_derivatives_times_and_stops_are_rejected(self) -> None:
+        """拒绝错误版本、不共用时间、缺失导数、假停点及段内超速."""
+        cases = []
+        for variant in ('version', 'time', 'field', 'stop', 'velocity', 'initial_speed'):
+            data = deepcopy(self.payload)
+            if variant == 'version':
+                data['version'] = True
+            elif variant == 'time':
+                data['right']['points'][1]['time_from_start']['nanosec'] += 1
+            elif variant == 'field':
+                del data['left']['points'][1]['accelerations']
+            elif variant == 'stop':
+                data['stop_indices'] = [0, 1, 5]
+            elif variant == 'velocity':
+                data['left']['points'][1]['velocities'] = [2.] * 6
+            else:
+                data['left']['points'][0]['velocities'] = [.001] * 6
+            cases.append(data)
+        for data in cases:
+            with self.subTest(data=str(data)[:50]), self.assertRaises(ValueError):
+                prepare_continuous_pair(data, self.bounds, .05)
+
+    def test_interior_overshoot_is_checked_not_only_waypoints(self) -> None:
+        """端点都在限制内，但导数造成段内过冲时仍须拒绝."""
+        data = deepcopy(self.payload)
+        for side in ('left', 'right'):
+            points = data[side]['points']
+            points[1]['positions'] = points[2]['positions'] = [.99] * 6
+            points[1]['velocities'] = [.1] * 6
+            points[2]['velocities'] = [-.1] * 6
+        wide = PositionLimits((-1.,) * 6, (1.,) * 6, (10.,) * 6, (100.,) * 6)
+        with self.assertRaisesRegex(ValueError, '角度'):
+            prepare_continuous_pair(data, {'left': wide, 'right': wide}, 2.)
+
+    def test_alignment_rechecks_first_segment_speed(self) -> None:
+        """即使初值差在容差内，首段太短也不能通过瞬间跳转对齐."""
+        data = deepcopy(self.payload)
+        for side in ('left', 'right'):
+            for i, point in enumerate(data[side]['points']):
+                point['positions'] = point['velocities'] = point['accelerations'] = [0.] * 6
+                point['time_from_start'] = {'sec': 0, 'nanosec': i * 20000000}
+        plan = prepare_continuous_pair(data, self.bounds, .05)['left']
+        with self.assertRaisesRegex(ValueError, '速度或加速度'):
+            plan.aligned_start((.004,) * 6, self.bound, .05)
+
+    def test_sampling_does_not_repeat_peak_preflight(self) -> None:
+        """发送周期不重复调用多项式实根预检，避免阻塞位置目标发送."""
+        plan = prepare_continuous_pair(self.payload, self.bounds, .05)['left']
+        with patch('archer_control.continuous_trajectory._extrema',
+                   side_effect=AssertionError('cycle repeated preflight')):
+            for elapsed in np.linspace(0., plan.duration, 100):
+                plan.sample(float(elapsed))
+
+    def test_cancelled_preflight_stops_during_segment_work(self) -> None:
+        """取消检查覆盖段内实根计算循环，不必把整条轨迹计算完再丢弃."""
+        calls = 0
+
+        def cancelled():
+            nonlocal calls
+            calls += 1
+            return calls >= 8
+
+        with self.assertRaisesRegex(ValueError, '已取消'):
+            prepare_continuous_pair(self.payload, self.bounds, .05, cancelled=cancelled)
+        self.assertEqual(calls, 8)
+
+
 class PairedStartTests(unittest.TestCase):
     """共享门控不访问设备，准备不完整或取消后不能释放启动."""
 
@@ -244,6 +362,72 @@ class PositionAdapterTests(unittest.TestCase):
         self.arm._session_holder = 7
         self.arm._api_control_initialized = True
         self.adapter.tick()
+
+    def continuous_plan(self):
+        """准备小幅合成连续轨迹，完整预检先于模拟申请控制."""
+        from archer_control.continuous_trajectory import retime_recorded_pair
+
+        limits = self.adapter.limits
+        q = np.repeat(np.array([0., .005, .012, .02, .018, 0.])[:, None], 6, axis=1)
+        plan, _ = retime_recorded_pair(
+            (0, 10 ** 9, 2 * 10 ** 9, 3 * 10 ** 9, 4 * 10 ** 9, 5 * 10 ** 9),
+            q, q, [limits.lower] * 2, [limits.upper] * 2,
+            [limits.max_velocity] * 2, [limits.max_acceleration] * 2,
+        )
+        return prepare_continuous_pair(plan.payload(), {'left': limits, 'right': limits}, .05)
+
+    def test_continuous_cycle_shared_start_and_home_hold(self) -> None:
+        """连续轨迹按共同时刻启动，返回记录起点并保持，仅发送位置模式字段."""
+        plan = self.continuous_plan()['left']
+        self.acquire()
+        with patch('archer_hardware.position_adapter.time.monotonic') as clock:
+            clock.return_value = 100.
+            self.adapter._last_tick = 100.
+            gate = PairedTrajectoryStart()
+            self.adapter.arm_continuous(plan, 'left', gate)
+            self.assertEqual(self.adapter.state, 'ARMED')
+            self.adapter.tick()
+            self.assertIsNone(self.adapter.trajectory_start_at)
+            gate.ready('right')
+            start = gate.start_time()
+            assert start is not None
+            for step in range(1, int((plan.duration + .6) / .005) + 1):
+                clock.return_value = 100. + step * .005
+                self.positions = plan.sample(max(0., clock.return_value - start))
+                self.adapter.tick()
+            self.assertEqual(self.adapter.trajectory_start_at, start)
+        self.assertEqual(self.adapter.state, 'HOLDING')
+        self.assertEqual(self.adapter._target, (0.,) * 6)
+        self.assertEqual(self.adapter.initial_positions, (0.,) * 6)
+        self.assertTrue(all(call.args[1] in ('initialize', 'position')
+                            for call in self.send.call_args_list))
+        packet = self.send.call_args.args[0]
+        targets = packet.arm_command.arm_exclusive_command.arm_api_control_command
+        for target in targets.motor_targets.targets:
+            self.assertEqual([field.name for field, _ in target.ListFields()], ['position'])
+
+    def test_continuous_halt_prevents_further_positions(self) -> None:
+        """连续运动中停止取消共同门控，后续周期不发送位置或自动归位."""
+        plan = self.continuous_plan()['left']
+        self.acquire()
+        with patch('archer_hardware.position_adapter.time.monotonic') as clock:
+            clock.return_value = 100.
+            self.adapter._last_tick = 100.
+            gate = PairedTrajectoryStart()
+            self.adapter.arm_continuous(plan, 'left', gate)
+            gate.ready('right')
+            for i in range(1, 81):
+                clock.return_value = 100. + i * .005
+                self.positions = self.adapter._target or (0.,) * 6
+                self.adapter.tick()
+            self.assertEqual(self.adapter.state, 'RUNNING')
+            self.adapter.stop()
+            self.assertTrue(gate.cancelled)
+            self.send.reset_mock()
+            for _ in range(5):
+                self.assertEqual(self.adapter.tick(), 'STOPPED')
+            self.send.assert_not_called()
+            self.assertIsNone(self.adapter._move)
 
     def test_no_position_before_acknowledgement(self) -> None:
         """申请后等待设备确认，尚未确认时不发送位置指令."""

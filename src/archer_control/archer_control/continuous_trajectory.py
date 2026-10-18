@@ -210,3 +210,104 @@ def plan_continuous_pair(
     for values in arrays:
         values.setflags(write=False)
     return ContinuousPair(times, q, velocities, accelerations, polys, stops), report
+
+
+def retime_recorded_pair(
+    source_times_ns: tuple[int, ...], left: ArrayLike, right: ArrayLike,
+    lower: ArrayLike, upper: ArrayLike, max_velocity: ArrayLike,
+    max_acceleration: ArrayLike, *, stops: tuple[int, ...] = (), margin: float = 1.05,
+) -> tuple[ContinuousPair, dict[str, Any]]:
+    """保留非均匀采样位置及相对时序，统一放慢并解析检查连续五次插值。"""
+    count = len(source_times_ns)
+    if (not 2 <= count <= 20000 or any(type(t) is not int for t in source_times_ns)
+            or source_times_ns[0] != 0 or source_times_ns[-1] > 3600 * 10 ** 9
+            or any(b <= a for a, b in zip(source_times_ns, source_times_ns[1:]))):
+        raise ValueError('需要2到20000个从零开始递增的整数纳秒采样，最长一小时')
+    if (isinstance(margin, bool) or not math.isfinite(margin)
+            or not 1.001 <= margin <= 2.):
+        raise ValueError('时间余量必须在1.001到2之间')
+    if (any(type(i) is not int or not 0 <= i < count for i in stops)
+            or any(b <= a for a, b in zip(stops, stops[1:]))):
+        raise ValueError('停止点必须为范围内严格递增的整数索引')
+    stops = tuple(sorted({0, count - 1, *stops}))
+    q = {'left': np.asarray(left, dtype=np.float64).copy(),
+         'right': np.asarray(right, dtype=np.float64).copy()}
+    if any(p.shape != (count, 6) or not np.all(np.isfinite(p)) for p in q.values()):
+        raise ValueError('两臂采样必须是相同数量的有限六关节角')
+    low, high, speed, accel = [np.asarray(p, dtype=np.float64)
+                              for p in (lower, upper, max_velocity, max_acceleration)]
+    if (any(p.shape != (2, 6) or not np.all(np.isfinite(p))
+            for p in (low, high, speed, accel)) or np.any(low >= high)
+            or np.any(speed <= 0.) or np.any(accel <= 0.)):
+        raise ValueError('限制需要两臂各六维有限数，速度和加速度为正')
+    source_times = np.asarray(source_times_ns, dtype=np.float64) / 1e9
+    gaps = np.diff(source_times)
+    velocities = {side: np.zeros_like(p) for side, p in q.items()}
+    accelerations = {side: np.zeros_like(p) for side, p in q.items()}
+    for arm, side in enumerate(('left', 'right')):
+        if np.any(q[side] < low[arm]) or np.any(q[side] > high[arm]):
+            raise ValueError(f'{side} 原始角度超出名义限制')
+        slopes = np.diff(q[side], axis=0) / gaps[:, None]
+        before, after = slopes[:-1], slopes[1:]
+        # 同向时取较小斜率；反向、停顿或显式阶段边界处速度为零。
+        # 两端加速度为零，且端速度不超过本段割线，避免段内位置过冲。
+        velocities[side][1:-1] = np.where(
+            np.sign(before) == np.sign(after),
+            np.sign(before) * np.minimum(np.abs(before), np.abs(after)), 0.,
+        )
+        velocities[side][list(stops)] = 0.
+
+    def build(times: FloatArray) -> dict[str, FloatArray]:
+        return {side: np.stack([
+            coefficients(q[side][i], q[side][i + 1], velocities[side][i],
+                         velocities[side][i + 1], accelerations[side][i],
+                         accelerations[side][i + 1], float(times[i + 1] - times[i]))
+            for i in range(count - 1)
+        ]) for side in ('left', 'right')}
+
+    def measure(polys: dict[str, FloatArray], times: FloatArray) -> dict[str, Any]:
+        measured: dict[str, Any] = {}
+        for arm, side in enumerate(('left', 'right')):
+            peak_v, peak_a = np.zeros(6), np.zeros(6)
+            for i, c in enumerate(polys[side]):
+                duration = float(times[i + 1] - times[i])
+                positions = _extrema(c, duration, 0)
+                if (np.any(positions[:, 0] < low[arm] - 1e-12)
+                        or np.any(positions[:, 1] > high[arm] + 1e-12)):
+                    raise ValueError(f'{side} 第{i + 1}段连续插值角度超限')
+                peak_v = np.maximum(peak_v, np.max(np.abs(_extrema(c, duration, 1)), axis=1))
+                peak_a = np.maximum(peak_a, np.max(np.abs(_extrema(c, duration, 2)), axis=1))
+            measured[side] = {'peak_velocity_rad_s': peak_v.tolist(),
+                              'peak_acceleration_rad_s2': peak_a.tolist()}
+        return measured
+
+    original_peaks = measure(build(source_times), source_times)
+    required = 0.
+    for arm, side in enumerate(('left', 'right')):
+        required = max(required,
+                       float(np.max(np.asarray(original_peaks[side]['peak_velocity_rad_s'])
+                                    / speed[arm])),
+                       math.sqrt(float(np.max(np.asarray(
+                           original_peaks[side]['peak_acceleration_rad_s2']) / accel[arm]))))
+    scale = max(1., required * margin)
+    if not math.isfinite(scale) or source_times[-1] * scale > 3600.:
+        raise ValueError('满足限速后的轨迹超过一小时，未生成')
+    times = np.asarray([math.ceil(t * scale) / 1e9 for t in source_times_ns], dtype=np.float64)
+    for side in ('left', 'right'):
+        velocities[side] /= scale
+        accelerations[side] /= scale ** 2
+    polys = build(times)
+    peaks = measure(polys, times)
+    for arm, side in enumerate(('left', 'right')):
+        if (np.any(np.asarray(peaks[side]['peak_velocity_rad_s']) > speed[arm] * (1. + 1e-10))
+                or np.any(np.asarray(peaks[side]['peak_acceleration_rad_s2'])
+                          > accel[arm] * (1. + 1e-10))):
+            raise ValueError('纳秒时间舍入后峰值超限，未生成轨迹')
+    for array in (times, *q.values(), *velocities.values(),
+                  *accelerations.values(), *polys.values()):
+        array.setflags(write=False)
+    return ContinuousPair(times, q, velocities, accelerations, polys, stops), {
+        'continuous_constraints_passed': True, 'samples_preserved': count,
+        'source_duration_s': float(source_times[-1]), 'duration_s': float(times[-1]),
+        'uniform_time_scale': scale, 'stop_indices': list(stops), 'arms': peaks,
+    }

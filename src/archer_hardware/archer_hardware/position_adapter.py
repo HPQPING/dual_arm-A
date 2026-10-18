@@ -16,7 +16,8 @@ from .hex_adapter import (
     HexFeedbackAdapter, JointFeedback, managed_sdk_class, report_only, verified_sdk,
 )
 from .position_plan import (
-    JointPositionMove, JointPositionTrajectory, PairedTrajectoryStart, PositionLimits,
+    ContinuousPositionTrajectory, JointPositionMove, JointPositionTrajectory,
+    PairedTrajectoryStart, PositionLimits,
     positive,
 )
 
@@ -51,7 +52,9 @@ class HexPositionAdapter(HexFeedbackAdapter):
         self.initial_positions: tuple[float, ...] | None = None
         self._feedback: JointFeedback | None = None
         self._target: tuple[float, ...] | None = None
-        self._move: JointPositionMove | JointPositionTrajectory | None = None
+        self._move: (
+            JointPositionMove | JointPositionTrajectory | ContinuousPositionTrajectory | None
+        ) = None
         self._trajectory_gate: PairedTrajectoryStart | None = None
         self.trajectory_start_at: float | None = None
         self.trajectory_observed_start_at: float | None = None
@@ -235,10 +238,8 @@ class HexPositionAdapter(HexFeedbackAdapter):
         self._settled_since = None
         self.state = 'RUNNING'
 
-    def follow_trajectory(
-        self, times_ns: Iterable[int], positions: Iterable[Iterable[object]],
-    ) -> None:
-        """从新鲜实际反馈执行完整预检轨迹，暂不对外暴露ROS整段入口."""
+    def _trajectory_feedback(self) -> JointFeedback:
+        """两类完整轨迹共用起步条件，要求控制会话有效及新鲜静止反馈."""
         if self.state != 'HOLDING':
             raise RuntimeError('完整轨迹需要先处于 HOLDING 状态')
         frame = self._fresh_feedback()
@@ -247,6 +248,13 @@ class HexPositionAdapter(HexFeedbackAdapter):
             raise RuntimeError('完整轨迹开始前控制会话无效')
         if max(abs(v) for v in frame.velocities) > 0.02:
             raise RuntimeError('完整轨迹开始前机械臂必须静止')
+        return frame
+
+    def follow_trajectory(
+        self, times_ns: Iterable[int], positions: Iterable[Iterable[object]],
+    ) -> None:
+        """执行版本一逐点停车轨迹，保留原有接口及预检行为."""
+        frame = self._trajectory_feedback()
         move = JointPositionTrajectory.prepare(
             times_ns, positions, self.limits, self.max_excursion,
             actual_start=frame.positions,
@@ -259,6 +267,25 @@ class HexPositionAdapter(HexFeedbackAdapter):
         self._recovering_limits = False
         self._nominal_required = True
         self.state = 'RUNNING'
+
+    def arm_continuous(
+        self, plan: ContinuousPositionTrajectory, side: str, gate: PairedTrajectoryStart,
+    ) -> None:
+        """接收已预检连续轨迹，核对实际起点后等待双臂共同启动，不进行全程重算."""
+        if side not in ('left', 'right') or gate.cancelled:
+            raise ValueError('连续轨迹侧别错误或共同启动已取消')
+        frame = self._trajectory_feedback()
+        move = plan.aligned_start(frame.positions, self.limits, self.max_excursion)
+        self._move = move
+        self._target = frame.positions
+        self._trajectory_gate = gate
+        self._settled_since = None
+        self._recovering_limits = False
+        self._nominal_required = True
+        self.trajectory_start_at = None
+        self.trajectory_observed_start_at = None
+        self.state = 'ARMED'
+        gate.ready(side)
 
     def arm_trajectory(
         self, times_ns: tuple[int, ...], positions: tuple[tuple[float, ...], ...],

@@ -12,7 +12,7 @@ from unittest.mock import patch
 import yaml
 
 from archer_hardware.commissioning import review_joint_plan
-from archer_hardware.csv_import import import_samples
+from archer_hardware.csv_import import import_samples, prepare_samples
 from archer_hardware.operator_client import main
 from archer_hardware.position_plan import PositionLimits
 
@@ -115,6 +115,48 @@ class CsvImportTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             import_samples(content, self.limits)
 
+    def test_prepare_preserves_angles_and_retimes_events(self) -> None:
+        """连续准备保留全部实际角度，事件时间同步放慢但不声明可以执行夹爪."""
+        samples, _ = import_samples(state_csv(positions=(0., .01, .02)), self.limits)
+        before = json.dumps(samples, sort_keys=True)
+        plan, report = prepare_samples(samples, self.limits)
+        self.assertEqual(plan['version'], 2)
+        self.assertEqual(plan['interpolation'], 'quintic_c2')
+        self.assertGreater(report['uniform_time_scale'], 1.)
+        self.assertTrue(report['continuous_constraints_passed'])
+        self.assertFalse(report['execution_ready'])
+        self.assertFalse(report['phase_execution_policy_verified'])
+        self.assertFalse(report['actual_start_verified'])
+        self.assertFalse(report['geometry_preflight_passed'])
+        for side in ('left', 'right'):
+            self.assertEqual([p['positions'] for p in plan[side]['points']],
+                             [p['positions'] for p in samples[side]['points']])
+        self.assertGreater(report['reference_events'][-1]['prepared_time_ns'], 100000000)
+        self.assertEqual(json.dumps(samples, sort_keys=True), before)
+        with self.assertRaises(ValueError):
+            review_joint_plan(plan, self.limits)
+
+    def test_gripper_event_remains_reference_and_requires_a_stop(self) -> None:
+        """阶段未变但夹爪参考值改变时，也不能跨过事件不停顿."""
+        content = state_csv().replace(b'0.05,RUNNING,2.0', b'0.05,RUNNING,1.0')
+        samples, _ = import_samples(content, self.limits)
+        plan, report = prepare_samples(samples, self.limits)
+        self.assertIn(1, plan['stop_indices'])
+        self.assertEqual(plan['left']['points'][1]['velocities'], [0.] * 6)
+        self.assertEqual(report['reference_events'][1]['gripper_command'], 1.)
+        self.assertNotIn('gripper_command', plan)
+        self.assertFalse(report['commands_sent'])
+
+    def test_prepare_rejects_unpaired_or_unusable_candidates(self) -> None:
+        """准备步骤重新检查共享时间，不静默修复不同步的输入."""
+        samples, _ = import_samples(state_csv(), self.limits)
+        samples['right']['points'][1]['time_from_start']['nanosec'] += 1
+        with self.assertRaisesRegex(ValueError, '共用时间轴'):
+            prepare_samples(samples, self.limits)
+        samples['version'] = 1
+        with self.assertRaises(ValueError):
+            prepare_samples(samples, self.limits)
+
     def test_cli_uses_completed_run_no_ros_sdk_or_overwrite(self) -> None:
         """仅在同一成功目录增加两个JSON，保留原始文件，禁止初始化ROS和SDK."""
         with TemporaryDirectory() as folder:
@@ -145,6 +187,28 @@ class CsvImportTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 main(args)
             self.assertEqual((root / 'recorded_path.json').read_bytes(), saved)
+            with patch('rclpy.init') as initialize, patch(
+                'archer_hardware.hex_adapter.verified_sdk', side_effect=AssertionError('SDK'),
+            ):
+                self.assertEqual(main(args + ['--prepare']), 0)
+                initialize.assert_not_called()
+            prepared = json.loads((root / 'prepared_path.json').read_text())
+            self.assertEqual(prepared['version'], 2)
+            prepared_report = json.loads((root / 'prepared_path_report.json').read_text())
+            self.assertTrue(prepared_report['preparation_succeeded'])
+            self.assertFalse(prepared_report['execution_ready'])
+            self.assertEqual((source.read_bytes(), summary.read_bytes()), before)
+            params['left_max_velocity'] = [1e-8] * 6
+            config.write_text(yaml.safe_dump({
+                'archer_position_driver': {'ros__parameters': params},
+            }))
+            self.assertEqual(main(args + [
+                '--prepare', '--output', str(root / 'too_slow.json'),
+                '--report', str(root / 'too_slow_report.json'),
+            ]), 1)
+            self.assertFalse((root / 'too_slow.json').exists())
+            rejected = json.loads((root / 'too_slow_report.json').read_text())
+            self.assertFalse(rejected['import_succeeded'])
             summary.write_text(json.dumps({'state': 'FAILED'}))
             failure_args = args + ['--output', str(root / 'rejected.json'),
                                    '--report', str(root / 'failed_report.json')]

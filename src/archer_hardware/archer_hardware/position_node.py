@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from array import array
-from dataclasses import dataclass
+from concurrent.futures import Executor, Future, ProcessPoolExecutor
+from dataclasses import dataclass, replace
 from functools import partial
+from importlib import import_module
 import json
-from threading import Lock
+from multiprocessing import get_context
+from multiprocessing.managers import SyncManager
+from threading import Event, Lock
 import time
-from typing import Callable
+from typing import Callable, Protocol
 
 import rclpy
 from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
@@ -21,13 +25,26 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from trajectory_msgs.msg import JointTrajectory
 
-from .hex_adapter import six_values
+from .hex_adapter import JointFeedback, six_values
 from .commissioning import review_joint_plan
 from .position_adapter import HexPositionAdapter
 from .position_plan import (
     JointPositionMove, JointPositionTrajectory, PairedTrajectoryStart, PositionLimits, positive,
+    ContinuousPositionTrajectory, prepare_continuous_pair,
 )
 from .position_worker import PositionBackend, PositionWorker
+
+
+class PreparationCancellation(Protocol):
+    """兼容本机事件和跨进程事件代理，只暴露取消所需的最小接口."""
+
+    def is_set(self) -> bool:
+        """读取是否已经取消."""
+        ...
+
+    def set(self) -> None:
+        """通知计算任务取消."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -46,6 +63,7 @@ class StagedPair:
     times_ns: tuple[int, ...]
     positions: dict[str, tuple[tuple[float, ...], ...]]
     received: float
+    continuous: dict[str, ContinuousPositionTrajectory] | None = None
 
 
 def vector_parameter(value: object, name: str) -> tuple[float, ...]:
@@ -53,6 +71,41 @@ def vector_parameter(value: object, name: str) -> tuple[float, ...]:
     if not isinstance(value, (list, tuple, array)):
         raise ValueError(f'{name} 必须为六维数组')
     return six_values(value)
+
+
+def prepare_pair_message(
+    text: str, limits: dict[str, PositionLimits], max_excursion: float,
+    allow_continuous: bool, cancelled: PreparationCancellation,
+) -> StagedPair:
+    """后台仅解析数据与限制，不读取ROS节点或SDK；停止后结果不得进入暂存."""
+    data = json.loads(text)
+    if cancelled.is_set():
+        raise ValueError('成对预检已取消')
+    if isinstance(data, dict) and data.get('version') == 2:
+        if not allow_continuous:
+            raise ValueError('版本二连续轨迹尚未显式允许')
+        plans = prepare_continuous_pair(
+            data, limits, max_excursion, cancelled=cancelled.is_set,
+        )
+        return StagedPair(plans['left'].times_ns, {}, 0., plans)
+    review_joint_plan(data, limits)
+    assert isinstance(data, dict)
+    times = tuple(p['time_from_start']['sec'] * 10 ** 9 + p['time_from_start']['nanosec']
+                  for p in data['left']['points'])
+    positions = {side: tuple(six_values(p['positions']) for p in data[side]['points'])
+                 for side in ('left', 'right')}
+    return StagedPair(times, positions, 0.)
+
+
+def create_preparation_resources() -> tuple[Executor, SyncManager | None]:
+    """使用spawn进程隔离数值计算，避免fork带有ROS及设备线程的进程."""
+    context = get_context('spawn')
+    manager = context.Manager()
+    try:
+        return ProcessPoolExecutor(max_workers=1, mp_context=context), manager
+    except Exception:
+        manager.shutdown()
+        raise
 
 
 class PositionControlNode(Node):
@@ -69,6 +122,7 @@ class PositionControlNode(Node):
             'feedback_tolerance': 0.005,
             'allow_api_calibration': False, 'readiness_timeout': 10.0,
             'allow_paired_trajectory': False,
+            'allow_continuous_trajectory': False,
             'left_url': 'ws://192.168.1.100:8439',
             'right_url': 'ws://192.168.1.100:9439',
             'left_limits_confirmed': False, 'right_limits_confirmed': False,
@@ -112,6 +166,13 @@ class PositionControlNode(Node):
         self.allow_paired_trajectory = self.get_parameter('allow_paired_trajectory').value
         if type(self.allow_paired_trajectory) is not bool:
             raise ValueError('allow_paired_trajectory 必须为布尔值')
+        allow_continuous = self.get_parameter('allow_continuous_trajectory').value
+        if not isinstance(allow_continuous, bool):
+            raise ValueError('allow_continuous_trajectory 必须为布尔值')
+        self.allow_continuous_trajectory: bool = allow_continuous
+        if allow_continuous:
+            # 在启动工作线程及连接设备之前加载数值库，避免持有控制时首次导入争用GIL。
+            import_module('archer_control.continuous_trajectory')
         readiness_timeout = positive(
             self.get_parameter('readiness_timeout').value, 'readiness_timeout',
         )
@@ -196,6 +257,14 @@ class PositionControlNode(Node):
         self._last_status = ''
         self._last_status_time = 0.0
         self._published_source: dict[str, int] = {}
+        self._preparer: Executor | None = None
+        self._preparation_manager: SyncManager | None = None
+        if self.allow_paired_trajectory:
+            self._preparer, self._preparation_manager = create_preparation_resources()
+        self._preparation: Future[StagedPair] | None = None
+        self._preparation_cancel: PreparationCancellation = Event()
+        self._preparation_valid = False
+        self._preparation_started = 0.
         self.create_timer(0.02, self.publish_state)
         try:
             for worker in self.workers.values():
@@ -222,12 +291,14 @@ class PositionControlNode(Node):
                 self._interlock_reason = reason
             self._targets.clear()
             self._paired_target = None
+            self._cancel_preparation_locked(signal=False)
             self._paired_active = False
             self._paired_phase = 'CANCELLED'
             if self._paired_gate is not None:
                 self._paired_gate.cancel()
         for worker in self.workers.values():
             worker.request_stop()
+        self._signal_preparation_cancel()
 
     def _service_callback(
         self, side: str | None, kind: str,
@@ -258,6 +329,11 @@ class PositionControlNode(Node):
         with self._lock:
             if self._interlock_reason and kind != 'disconnect':
                 raise RuntimeError(f'本次运行已结束：{self._interlock_reason}')
+            if self._preparation is not None:
+                if kind != 'disconnect':
+                    raise RuntimeError('后台预检尚未结束；如需取消请使用 halt')
+                self._cancel_preparation_locked()
+                self._paired_phase = 'REJECTED: 预检期间显式断开'
             if self._paired_active:
                 raise RuntimeError('成对轨迹正在准备或执行；如遇异常请使用 halt')
             if kind == 'move':
@@ -278,18 +354,125 @@ class PositionControlNode(Node):
         return f'已受理编号 {identifier}，请查看状态话题；不代表动作已完成'
 
     def _paired_target_callback(self, message: String) -> None:
-        """接收完整JSON计划只暂存；错误消息作废此前成对暂存."""
+        """ROS回调仅提交字符串；耗时JSON解析及多项式检查放在独立后台进程."""
         try:
-            self.stage_paired_target(json.loads(message.data))
+            self.queue_pair_preparation(message.data)
         except (ValueError, RuntimeError, TypeError) as error:
             with self._lock:
                 self._paired_target = None
                 if not self._paired_active:
                     self._paired_phase = f'REJECTED: {error}'
 
+    def _cancel_preparation_locked(self, signal: bool = True) -> None:
+        """只作废后台结果，不排队新的预检；调用者已持有节点锁."""
+        self._preparation_valid = False
+        if self._preparation is not None:
+            self._preparation.cancel()
+        if signal:
+            self._signal_preparation_cancel()
+
+    def _signal_preparation_cancel(self) -> None:
+        """取消计算进程失败也不能恢复旧结果，故障联停先请求设备线程停止."""
+        try:
+            self._preparation_cancel.set()
+        except Exception as error:
+            self.get_logger().error('后台取消信号未确认，结果仍已作废：' + str(error))
+
+    def _pair_feedback(self) -> dict[str, JointFeedback]:
+        """同时核对两侧新鲜静止反馈；不会主动连接或申请控制."""
+        result = {}
+        for side in self.sides:
+            snapshot = self.workers[side].snapshot()
+            frame = snapshot.feedback
+            if (snapshot.state != 'HOLDING' or frame is None
+                    or not 0 <= (time.perf_counter_ns() - frame.source_ns) / 1e9 <= .1
+                    or max(abs(v) for v in frame.velocities) > .02):
+                raise RuntimeError(f'{side} 需要新鲜静止反馈及HOLDING状态')
+            result[side] = frame
+        return result
+
+    def _check_pair_starts(self, plan: StagedPair) -> None:
+        """后台完成后用最新反馈复核起点，不沿用提交时的旧反馈."""
+        for side, frame in self._pair_feedback().items():
+            if plan.continuous is None:
+                JointPositionTrajectory.prepare(
+                    plan.times_ns, plan.positions[side], self.limits[side], self.max_excursion,
+                    actual_start=frame.positions,
+                )
+            else:
+                # 此处只检查；执行线程仍须相对文件原起点独立对齐，避免累计放宽容差。
+                plan.continuous[side].aligned_start(
+                    frame.positions, self.limits[side], self.max_excursion,
+                )
+
+    def queue_pair_preparation(self, text: str) -> None:
+        """至多保留一个后台任务；新消息到来先作废旧暂存，忙时拒绝而不堆积."""
+        with self._lock:
+            self._paired_target = None
+            if self._preparation is not None:
+                self._cancel_preparation_locked()
+                raise RuntimeError('后台预检尚未结束，已作废旧结果，请等待后重新提交')
+            if (not self.allow_paired_trajectory or self.sides != ('left', 'right')
+                    or set(self.limits) != {'left', 'right'}):
+                raise RuntimeError('需允许成对轨迹并配置两臂已确认限位')
+            if self._interlock_reason or self._paired_active:
+                raise RuntimeError('停止或成对执行期间禁止预检新计划')
+            if not isinstance(text, str) or len(text) > 50 * 1024 * 1024:
+                raise ValueError('计划字符串无效或超过50Mi字符上限')
+            self._pair_feedback()
+            self._targets.clear()
+            self._paired_ids = {}
+            self._preparation_cancel = (self._preparation_manager.Event()
+                                        if self._preparation_manager is not None else Event())
+            self._preparation_valid = True
+            self._preparation_started = time.monotonic()
+            self._paired_phase = 'VALIDATING'
+            assert self._preparer is not None
+            self._preparation = self._preparer.submit(
+                prepare_pair_message, text, dict(self.limits), self.max_excursion,
+                self.allow_continuous_trajectory, self._preparation_cancel,
+            )
+
+    def check_preparation_progress(self) -> None:
+        """只消费已完成结果；取消、超时或起点变动都不能产生可执行暂存."""
+        with self._lock:
+            future = self._preparation
+            if future is None:
+                return
+            if self._preparation_valid and time.monotonic() - self._preparation_started > 30.:
+                self._cancel_preparation_locked()
+                self._paired_phase = 'REJECTED: 后台预检超过30秒'
+            if not future.done():
+                return
+            self._preparation = None
+            if not self._preparation_valid or self._interlock_reason:
+                return
+            self._preparation_valid = False
+            try:
+                plan = future.result()
+                if plan.continuous is not None:
+                    # NumPy数组跨进程序列化后可能恢复可写；进入暂存前重新冻结。
+                    for curve in plan.continuous.values():
+                        for polynomial in curve.polynomials:
+                            polynomial.setflags(write=False)
+                self._check_pair_starts(plan)
+                self._paired_target = replace(plan, received=time.monotonic())
+                self._paired_phase = 'STAGED'
+            except Exception as error:
+                self._paired_target = None
+                self._paired_phase = f'REJECTED: {error}'
+
     def stage_paired_target(self, data: object) -> None:
         """沿用离线计划格式，使用两臂实际反馈和当前位移约束重新预检."""
+        if isinstance(data, dict) and data.get('version') == 2:
+            self.queue_pair_preparation(json.dumps(data, allow_nan=False))
+            return
         with self._lock:
+            if self._preparation is not None:
+                self._cancel_preparation_locked()
+                self._paired_target = None
+                self._paired_phase = 'REJECTED: 新计划作废正在预检的旧结果'
+                raise RuntimeError('后台预检尚未结束，请等待后重新提交')
             if not self.allow_paired_trajectory or self.sides != ('left', 'right'):
                 raise RuntimeError('需显式允许成对轨迹并配置both，两臂不会自动连接或使能')
             if self._interlock_reason or self._paired_active:
@@ -330,6 +513,8 @@ class PositionControlNode(Node):
                 raise RuntimeError('成对执行未允许或本次运行已结束')
             if self._paired_active:
                 raise RuntimeError('正在成对执行，禁止重复提交')
+            if self._preparation is not None:
+                raise RuntimeError('后台预检尚未结束，不能开始执行')
             plan = self._paired_target
             self._paired_target = None
             if plan is None or time.monotonic() - plan.received > self.target_timeout:
@@ -342,10 +527,15 @@ class PositionControlNode(Node):
             self._paired_requested_at = time.monotonic()
             try:
                 for side in self.sides:
-                    identifiers[side] = self.workers[side].submit(
-                        'trajectory', times_ns=plan.times_ns, positions=plan.positions[side],
-                        gate=gate,
-                    )
+                    if plan.continuous is None:
+                        identifiers[side] = self.workers[side].submit(
+                            'trajectory', times_ns=plan.times_ns, positions=plan.positions[side],
+                            gate=gate,
+                        )
+                    else:
+                        identifiers[side] = self.workers[side].submit(
+                            'trajectory', continuous=plan.continuous[side], gate=gate,
+                        )
                 self._paired_ids = dict(identifiers)
             except Exception as error:
                 gate.cancel()
@@ -412,6 +602,8 @@ class PositionControlNode(Node):
         with self._lock:
             if self._interlock_reason:
                 raise RuntimeError('本次运行已结束，禁止暂存目标')
+            if self._preparation is not None:
+                raise RuntimeError('后台预检期间禁止暂存单臂目标')
             if self._paired_active:
                 raise RuntimeError('成对轨迹期间禁止暂存单臂目标')
             if side not in self.limits:
@@ -454,6 +646,7 @@ class PositionControlNode(Node):
 
     def publish_state(self) -> None:
         """发布独立反馈和可供晚加入订阅者读取的执行状态."""
+        self.check_preparation_progress()
         self.check_paired_progress()
         states = {}
         with self._lock:
@@ -463,7 +656,9 @@ class PositionControlNode(Node):
             paired = {'active': self._paired_active, 'phase': self._paired_phase,
                       'staged': self._paired_target is not None,
                       'commands': dict(self._paired_ids),
-                      'allowed': self.allow_paired_trajectory}
+                      'allowed': self.allow_paired_trajectory,
+                      'continuous_allowed': self.allow_continuous_trajectory,
+                      'preflight_busy': self._preparation is not None}
         for side, worker in self.workers.items():
             snapshot = worker.snapshot()
             frame = snapshot.feedback
@@ -510,14 +705,22 @@ class PositionControlNode(Node):
 
     def close_workers(self) -> None:
         """两臂先同时请求停止，再分别等待线程退出."""
+        with self._lock:
+            self._cancel_preparation_locked(signal=False)
+            self._paired_target = None
         for worker in self.workers.values():
             worker.request_stop()
+        self._signal_preparation_cancel()
         errors = []
         for worker in self.workers.values():
             try:
                 worker.shutdown()
             except RuntimeError as error:
                 errors.append(str(error))
+        if self._preparer is not None:
+            self._preparer.shutdown(wait=True, cancel_futures=True)
+        if self._preparation_manager is not None:
+            self._preparation_manager.shutdown()
         if errors:
             raise RuntimeError('；'.join(errors))
 

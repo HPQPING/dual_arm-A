@@ -1,8 +1,9 @@
-"""离线导入仿真CSV的实际关节角与原始时间，生成待定插值的路径候选."""
+"""离线导入仿真CSV，按需保留采样或准备连续限速轨迹，不发送设备指令."""
 
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_left
 import csv
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
@@ -197,10 +198,13 @@ def main(args: list[str] | None = None) -> int:
     parser.add_argument('--report', type=Path)
     parser.add_argument('--max-gap', type=float, default=.2)
     parser.add_argument('--pair-skew-ms', type=float, default=5.)
+    parser.add_argument('--prepare', action='store_true', help='生成连续插值及限速后的版本二候选')
+    parser.add_argument('--margin', type=float, default=1.05, help='连续轨迹限速时间余量')
     options = parser.parse_args(args)
     root = options.run_dir.expanduser()
-    output = options.output or root / 'recorded_path.json'
-    report_path = options.report or root / 'recorded_path_report.json'
+    stem = 'prepared_path' if options.prepare else 'recorded_path'
+    output = options.output or root / (stem + '.json')
+    report_path = options.report or root / (stem + '_report.json')
     existing = [name for name in ('state.csv', 'tracking.csv') if (root / name).is_file()]
     selected = options.csv_name or (existing[0] if len(existing) == 1 else None)
     if selected is None:
@@ -229,13 +233,19 @@ def main(args: list[str] | None = None) -> int:
             'summary_sha256': hashlib.sha256(summary_bytes).hexdigest(),
             'limits_sha256': hashlib.sha256(limits_bytes).hexdigest(),
         })
+        limits = load_limits(options.limits_file, content=limits_bytes)
         candidate, measured = import_samples(
-            source_bytes, load_limits(options.limits_file, content=limits_bytes),
+            source_bytes, limits,
             max_gap_s=options.max_gap, pair_skew_ms=options.pair_skew_ms,
         )
         report.update(measured)
+        if options.prepare:
+            candidate, timing = prepare_samples(candidate, limits, margin=options.margin)
+            report.update(timing)
     except (OSError, ValueError, TypeError, KeyError, UnicodeError,
             csv.Error, yaml.YAMLError) as error:
+        candidate = None
+        report['import_succeeded'] = False
         report['error'] = str(error)
     created_output = created_report = False
     try:
@@ -257,6 +267,74 @@ def main(args: list[str] | None = None) -> int:
             report_path.unlink(missing_ok=True)
         print(f'写入失败：{error}；未发送动作')
         return 1
-    print(f"{'已导入候选' if report['import_succeeded'] else '导入失败'}：{report_path}；"
-          '尚未选择连续插值，未发送动作')
+    action = '已准备连续候选' if options.prepare else '已导入采样候选'
+    print(f"{action if report['import_succeeded'] else '导入或准备失败'}：{report_path}；未发送动作")
     return 0 if report['import_succeeded'] else 1
+
+
+def prepare_samples(
+    samples: dict[str, Any], limits: dict[str, PositionLimits], *, margin: float = 1.05,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """接续本模块的采样结果，保留位置并调整双臂时间；事件仍只作为参考."""
+    from archer_control.continuous_trajectory import retime_recorded_pair
+
+    if (samples.get('version') != 3 or samples.get('kind') != 'recorded_joint_samples'
+            or samples.get('interpolation') != 'unassigned'):
+        raise ValueError('只能准备本模块导出的版本三原始采样')
+    grids: list[tuple[int, ...]] = []
+    positions = {}
+    stages = {}
+    for side in ('left', 'right'):
+        arm = samples[side]
+        if arm['joint_names'] != [f'{side}_joint_{i}' for i in range(1, 7)]:
+            raise ValueError('采样关节顺序无效')
+        points = arm['points']
+        if not isinstance(points, list) or not 2 <= len(points) <= 20000:
+            raise ValueError('准备轨迹需要2到20000个双臂采样点，不会自动删点')
+        stamps = []
+        for point in points:
+            stamp = point['time_from_start']
+            sec, ns = stamp['sec'], stamp['nanosec']
+            if type(sec) is not int or type(ns) is not int or sec < 0 or not 0 <= ns < 10 ** 9:
+                raise ValueError('时间字段必须是非负整数秒和合法纳秒')
+            stamps.append(sec * 10 ** 9 + ns)
+        grids.append(tuple(stamps))
+        positions[side] = [limits[side].check_positions(p['positions']) for p in points]
+        stages[side] = [p['source_stage'] for p in points]
+    if grids[0] != grids[1]:
+        raise ValueError('双臂采样必须共用时间轴')
+    source_times = grids[0]
+    stops = {0, len(source_times) - 1}
+    for labels in stages.values():
+        for i in range(1, len(labels)):
+            if labels[i] != labels[i - 1]:
+                stops.update((i - 1, i))
+    events = samples['reference_events']
+    origin = samples['source_time_origin_ns']
+    for event in events:
+        relative = event['source_time_ns'] - origin
+        if not 0 <= relative <= source_times[-1]:
+            raise ValueError('参考事件超出记录时间范围')
+        index = min(len(source_times) - 1, bisect_left(source_times, relative))
+        stops.update((max(0, index - 1), index))
+    plan, measured = retime_recorded_pair(
+        source_times, positions['left'], positions['right'],
+        [limits[s].lower for s in ('left', 'right')],
+        [limits[s].upper for s in ('left', 'right')],
+        [limits[s].max_velocity for s in ('left', 'right')],
+        [limits[s].max_acceleration for s in ('left', 'right')],
+        stops=tuple(sorted(stops)), margin=margin,
+    )
+    payload = plan.payload()
+    # 版本二执行字段保持原格式；来源、阶段和事件放在报告中，避免伪装成已实现的夹爪指令。
+    remapped = []
+    for event in events:
+        elapsed_ns = math.ceil((event['source_time_ns'] - origin) * measured['uniform_time_scale'])
+        remapped.append({**event, 'prepared_time_ns': elapsed_ns})
+    return payload, {
+        **measured, 'preparation_succeeded': True, 'execution_ready': False,
+        'commands_sent': False, 'phase_execution_policy_verified': False,
+        'source_stages': stages, 'reference_events': remapped,
+        'geometry_preflight_passed': False, 'actual_start_verified': False,
+        'scope': '保留实际关节路径并解析验证段内角度、速度及加速度；未验证碰撞、实际起点或夹爪事件执行',
+    }

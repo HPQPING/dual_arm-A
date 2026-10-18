@@ -19,6 +19,8 @@ archer_position_driver:
     allow_api_calibration: false
     # 与同一控制器的can0/8439左臂、can1/9439右臂进行软件同步；默认不开放。
     allow_paired_trajectory: false
+    # 连续轨迹接入仍默认关闭，不会自动连接或使能；完整任务尚需几何与夹爪事件衔接。
+    allow_continuous_trajectory: false
     # 工程等待上限，覆盖会话、初始化及校准全部步骤，并非厂商承诺耗时。
     readiness_timeout: 10.0
     control_hz: 250

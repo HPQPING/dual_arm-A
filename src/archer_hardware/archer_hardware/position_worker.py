@@ -10,7 +10,7 @@ from typing import Callable, Protocol
 from uuid import uuid4
 
 from .hex_adapter import JointFeedback
-from .position_plan import PairedTrajectoryStart
+from .position_plan import ContinuousPositionTrajectory, PairedTrajectoryStart
 
 
 ALLOWED_STATES = {
@@ -56,6 +56,12 @@ class PositionBackend(Protocol):
         """推进控制周期."""
         ...
 
+    def arm_continuous(
+        self, plan: ContinuousPositionTrajectory, side: str, gate: PairedTrajectoryStart,
+    ) -> None:
+        """核对实际起点后准备已预检的连续曲线，不重算全程多项式."""
+        ...
+
     def stop(self, *, fault: bool = False) -> None:
         """取消目标并尽力制动."""
         ...
@@ -95,6 +101,7 @@ class WorkerCommand:
     times_ns: tuple[int, ...] = ()
     positions: tuple[tuple[float, ...], ...] = ()
     gate: PairedTrajectoryStart | None = None
+    continuous: ContinuousPositionTrajectory | None = None
 
 
 class PositionWorker:
@@ -146,10 +153,16 @@ class PositionWorker:
         self, kind: str, *, goal: tuple[float, ...] = (), duration: float = 0.0,
         times_ns: tuple[int, ...] = (), positions: tuple[tuple[float, ...], ...] = (),
         gate: PairedTrajectoryStart | None = None,
+        continuous: ContinuousPositionTrajectory | None = None,
     ) -> str:
         """异步受理请求；返回编号不表示设备执行成功."""
         if kind not in ALLOWED_STATES:
             raise ValueError('未知控制请求')
+        if continuous is not None and (
+            kind != 'trajectory' or times_ns or positions
+            or not isinstance(continuous, ContinuousPositionTrajectory)
+        ):
+            raise ValueError('连续对象只能用于轨迹请求，不能混入旧格式点数组')
         with self._command_lock:
             if self._shutdown.is_set():
                 raise RuntimeError('线程正在退出')
@@ -164,7 +177,7 @@ class PositionWorker:
             identifier = uuid4().hex[:12]
             command = WorkerCommand(
                 identifier, kind, self._generation, time.monotonic() + 0.5,
-                goal, duration, times_ns, positions, gate,
+                goal, duration, times_ns, positions, gate, continuous,
             )
             try:
                 self._queue.put_nowait(command)
@@ -277,8 +290,11 @@ class PositionWorker:
             elif command.kind == 'trajectory':
                 if command.gate is None:
                     raise ValueError('成对轨迹缺少共同启动门控')
-                backend.arm_trajectory(command.times_ns, command.positions,
-                                       self.side, command.gate)
+                if command.continuous is None:
+                    backend.arm_trajectory(command.times_ns, command.positions,
+                                           self.side, command.gate)
+                else:
+                    backend.arm_continuous(command.continuous, self.side, command.gate)
                 self._message = '本臂已准备，等待两臂共同启动'
             elif command.kind == 'disconnect':
                 backend.close()

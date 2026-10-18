@@ -14,6 +14,8 @@
   <exec_depend>trajectory_msgs</exec_depend>
   <exec_depend>rcl_interfaces</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>archer_control</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
   <!-- hex_device 使用 Ubuntu 上已核对的厂商 SDK，不由 pip 自动替换。 -->
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

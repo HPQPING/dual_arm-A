@@ -1,6 +1,7 @@
 """通过真实 ROS 服务和线程验证位置节点，设备始终使用离线替身."""
 
 from dataclasses import replace
+from concurrent.futures import ThreadPoolExecutor
 import json
 from threading import Event
 import time
@@ -20,7 +21,7 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from archer_hardware.hex_adapter import JointFeedback
 from archer_hardware.position_node import PositionControlNode
 from archer_hardware.position_plan import (
-    JointPositionTrajectory, PairedTrajectoryStart, PositionLimits,
+    ContinuousPositionTrajectory, JointPositionTrajectory, PairedTrajectoryStart, PositionLimits,
 )
 from archer_hardware.position_worker import PositionWorker, WorkerCommand
 
@@ -36,7 +37,7 @@ class FakeBackend:
         self.limits = limits
         self.reject_trajectory = False
         self._gate: PairedTrajectoryStart | None = None
-        self._paired_plan: JointPositionTrajectory | None = None
+        self._paired_plan: JointPositionTrajectory | ContinuousPositionTrajectory | None = None
         self.trajectory_start_at: float | None = None
         self.trajectory_observed_start_at: float | None = None
         self.last_error = ''
@@ -121,6 +122,23 @@ class FakeBackend:
             self.positions = self.goal
             self.state = 'HOLDING'
         return self.state
+
+    def arm_continuous(
+        self, plan: ContinuousPositionTrajectory, side: str, gate: PairedTrajectoryStart,
+    ) -> None:
+        """连续对象使用真实起点对齐，但执行只改变内存状态，不接触设备."""
+        if self.reject_trajectory:
+            raise ValueError('模拟一侧连续准备失败')
+        assert self.limits is not None
+        prepared = plan.aligned_start(
+            self.positions, self.limits, self.options.get('max_excursion', .05),
+        )
+        self._paired_plan = prepared
+        self.goal = prepared.goal
+        self._gate = gate
+        self.state = 'ARMED'
+        self.calls.append(('continuous_armed', ()))
+        gate.ready(side)
 
     def stop(self, *, fault: bool = False) -> None:
         """记录停止，不自动归位."""
@@ -264,11 +282,13 @@ class PositionNodeTests(unittest.TestCase):
     def make_node(
         self, configured: bool = True, *, allow_api_calibration: bool = False,
         allow_paired_trajectory: bool = False,
+        allow_continuous_trajectory: bool = False,
     ) -> PositionControlNode:
         """虚构测试限位只通过参数传入，不写入正式配置."""
         args = ['--ros-args', '-p',
                 f'allow_api_calibration:={str(allow_api_calibration).lower()}', '-p',
-                f'allow_paired_trajectory:={str(allow_paired_trajectory).lower()}']
+                f'allow_paired_trajectory:={str(allow_paired_trajectory).lower()}', '-p',
+                f'allow_continuous_trajectory:={str(allow_continuous_trajectory).lower()}']
         if configured:
             for side in ('left', 'right'):
                 args.extend(['-p', f'{side}_limits_confirmed:=true'])
@@ -278,7 +298,10 @@ class PositionNodeTests(unittest.TestCase):
                 ):
                     args.extend(['-p', f'{side}_{suffix}:={json.dumps(values)}'])
         rclpy.init(args=args)
-        with patch('archer_hardware.position_node.HexPositionAdapter', FakeBackend):
+        with patch('archer_hardware.position_node.HexPositionAdapter', FakeBackend), patch(
+            'archer_hardware.position_node.create_preparation_resources',
+            side_effect=lambda: (ThreadPoolExecutor(max_workers=1), None),
+        ):
             node = PositionControlNode()
         self.nodes.append(node)
         self.executor = SingleThreadedExecutor()
@@ -713,6 +736,232 @@ class PositionNodeTests(unittest.TestCase):
         status = json.loads(node._last_status)
         self.assertEqual(status['arms']['left']['readiness_stage'], 'CONNECTED')
         self.assertTrue(status['arms']['left']['allow_api_calibration'])
+
+    def continuous_payload(self) -> dict:
+        """合成小幅闭合路径，不使用实机或仿真任务初值."""
+        from archer_control.continuous_trajectory import retime_recorded_pair
+        import numpy as np
+
+        q = np.repeat(np.asarray([.1, .1002, .1004, .1001, .1])[:, None], 6, axis=1)
+        bound = PositionLimits((-2.,) * 6, (2.,) * 6, (.1,) * 6, (.2,) * 6)
+        plan, _ = retime_recorded_pair(
+            (0, 100000000, 200000000, 300000000, 400000000), q, q,
+            [bound.lower] * 2, [bound.upper] * 2,
+            [bound.max_velocity] * 2, [bound.max_acceleration] * 2,
+        )
+        return plan.payload()
+
+    def test_continuous_entry_remains_closed_by_default(self) -> None:
+        """只允许旧成对接口不能隐式打开连续接口，也不会因收到文件而运动."""
+        node = self.make_node(allow_paired_trajectory=True)
+        self.enable_both(node)
+        node.stage_paired_target(self.continuous_payload())
+        self.wait_until(lambda: node._preparation is None)
+        self.assertIsNone(node._paired_target)
+        self.assertIn('尚未显式允许', node._paired_phase)
+        self.assertFalse(self.service('paired_move').success)
+
+    def test_continuous_topic_preflight_then_explicit_shared_execution(self) -> None:
+        """真实ROS只暂存后台结果，显式开始后两线程执行连续对象并共用启动时刻."""
+        node = self.make_node(allow_paired_trajectory=True, allow_continuous_trajectory=True)
+        self.enable_both(node)
+        publisher = self.observer.create_publisher(String, '/hardware/position/paired_target', 1)
+        self.wait_until(lambda: publisher.get_subscription_count() > 0)
+        message = String()
+        message.data = json.dumps(self.continuous_payload())
+        publisher.publish(message)
+        self.wait_until(lambda: node._paired_phase == 'STAGED')
+        assert node._paired_target is not None
+        self.assertIsNotNone(node._paired_target.continuous)
+        for side in node.sides:
+            self.assertFalse(any(kind == 'continuous_armed'
+                                 for kind, _ in self.backend(node, side).calls))
+        self.assertTrue(self.service('paired_move').success)
+        self.wait_until(lambda: node._paired_phase == 'FINISHED')
+        left, right = (self.backend(node, side) for side in node.sides)
+        self.assertIsNotNone(left.trajectory_start_at)
+        self.assertEqual(left.trajectory_start_at, right.trajectory_start_at)
+        self.assertEqual(left.positions, (.1,) * 6)
+        self.assertEqual(right.positions, (.1,) * 6)
+        self.assertTrue(all(any(kind == 'continuous_armed' for kind, _ in backend.calls)
+                            for backend in (left, right)))
+        self.assertEqual(node._interlock_reason, '')
+
+    def slow_preflight(self, entered: Event, release: Event):
+        """模拟不响应取消的慢库，证明即使迟到返回成功也无法复活旧结果."""
+        from archer_hardware.position_node import prepare_pair_message
+
+        def prepare(text, limits, excursion, allowed, cancelled):
+            entered.set()
+            if not release.wait(3.):
+                raise RuntimeError('test did not release preparation')
+            return prepare_pair_message(text, limits, excursion, allowed, Event())
+        return prepare
+
+    def test_halt_works_during_preflight_and_late_result_is_discarded(self) -> None:
+        """预检未返回时ROS仍响应halt；迟到的成功结果不能暂存或执行."""
+        node = self.make_node(allow_paired_trajectory=True, allow_continuous_trajectory=True)
+        self.enable_both(node)
+        entered, release = Event(), Event()
+        with patch('archer_hardware.position_node.prepare_pair_message',
+                   side_effect=self.slow_preflight(entered, release)):
+            try:
+                node.stage_paired_target(self.continuous_payload())
+                self.assertTrue(entered.wait(1.))
+                started = time.monotonic()
+                self.assertTrue(self.service('halt').success)
+                self.assertLess(time.monotonic() - started, 1.)
+                self.assertFalse(release.is_set())
+            finally:
+                release.set()
+            self.wait_until(lambda: node._preparation is None)
+        self.assertIsNone(node._paired_target)
+        self.assertFalse(self.service('paired_move').success)
+        self.assertTrue(node._interlock_reason)
+
+    def test_busy_new_message_cancels_old_without_queueing_another(self) -> None:
+        """正在预检时收到新消息会作废旧结果，不积压新的任务或误用旧暂存."""
+        node = self.make_node(allow_paired_trajectory=True, allow_continuous_trajectory=True)
+        self.enable_both(node)
+        entered, release = Event(), Event()
+        with patch('archer_hardware.position_node.prepare_pair_message',
+                   side_effect=self.slow_preflight(entered, release)) as prepare:
+            try:
+                node.stage_paired_target(self.continuous_payload())
+                self.assertTrue(entered.wait(1.))
+                first = node._preparation
+                message = String()
+                message.data = '{bad new json'
+                node._paired_target_callback(message)
+                self.assertIs(node._preparation, first)
+                self.assertEqual(prepare.call_count, 1)
+                self.assertFalse(self.service('paired_move').success)
+            finally:
+                release.set()
+            self.wait_until(lambda: node._preparation is None)
+        self.assertIsNone(node._paired_target)
+        self.assertTrue(node._paired_phase.startswith('REJECTED'))
+
+    def test_actual_start_is_rechecked_after_background_finishes(self) -> None:
+        """预检期间实际角度变化超过容差，不能沿用提交时的反馈通过暂存."""
+        node = self.make_node(allow_paired_trajectory=True, allow_continuous_trajectory=True)
+        self.enable_both(node)
+        entered, release = Event(), Event()
+        with patch('archer_hardware.position_node.prepare_pair_message',
+                   side_effect=self.slow_preflight(entered, release)):
+            try:
+                node.stage_paired_target(self.continuous_payload())
+                self.assertTrue(entered.wait(1.))
+                backend = self.backend(node, 'left')
+                backend.positions = (.106,) * 6
+
+                def moved_feedback():
+                    frame = node.workers['left'].snapshot().feedback
+                    return frame is not None and frame.positions == (.106,) * 6
+
+                self.wait_until(moved_feedback)
+            finally:
+                release.set()
+            self.wait_until(lambda: node._preparation is None)
+        self.assertIsNone(node._paired_target)
+        self.assertIn('实际初始角度', node._paired_phase)
+        self.assertFalse(self.service('paired_move').success)
+
+    def test_expired_feedback_rejects_completed_preflight(self) -> None:
+        """后台结果正确但最新反馈失效时，仍必须拒绝暂存."""
+        node = self.make_node(allow_paired_trajectory=True, allow_continuous_trajectory=True)
+        self.enable_both(node)
+        entered, release = Event(), Event()
+        with patch('archer_hardware.position_node.prepare_pair_message',
+                   side_effect=self.slow_preflight(entered, release)):
+            try:
+                node.stage_paired_target(self.continuous_payload())
+                self.assertTrue(entered.wait(1.))
+                snapshot = node.workers['left'].snapshot()
+                assert snapshot.feedback is not None
+                stale = replace(snapshot, feedback=replace(
+                    snapshot.feedback, source_ns=time.perf_counter_ns() - 200000000,
+                ))
+                with patch.object(node.workers['left'], 'snapshot', return_value=stale):
+                    release.set()
+                    self.wait_until(lambda: node._preparation is None)
+            finally:
+                release.set()
+        self.assertIsNone(node._paired_target)
+        self.assertIn('新鲜静止反馈', node._paired_phase)
+
+    def test_continuous_one_arm_failure_prevents_both_starts(self) -> None:
+        """一侧执行前复核失败时取消共同门控，不能另一侧单独开始."""
+        node = self.make_node(allow_paired_trajectory=True, allow_continuous_trajectory=True)
+        self.enable_both(node)
+        node.stage_paired_target(self.continuous_payload())
+        self.wait_until(lambda: node._paired_phase == 'STAGED')
+        self.backend(node, 'right').reject_trajectory = True
+        self.assertTrue(self.service('paired_move').success)
+        self.wait_until(lambda: bool(node._interlock_reason))
+        self.wait_until(lambda: all(w.snapshot().state in ('STOPPED', 'FAULT')
+                                    for w in node.workers.values()))
+        for side in node.sides:
+            self.assertFalse(any(kind == 'trajectory_start'
+                                 for kind, _ in self.backend(node, side).calls))
+
+    def test_preflight_timeout_discards_late_success(self) -> None:
+        """用测试时钟模拟超时，无需等待30秒，迟到结果仍不能进入暂存."""
+        node = self.make_node(allow_paired_trajectory=True, allow_continuous_trajectory=True)
+        self.enable_both(node)
+        entered, release = Event(), Event()
+        with patch('archer_hardware.position_node.prepare_pair_message',
+                   side_effect=self.slow_preflight(entered, release)):
+            try:
+                node.stage_paired_target(self.continuous_payload())
+                self.assertTrue(entered.wait(1.))
+                node._preparation_started = time.monotonic() - 31.
+                node.check_preparation_progress()
+                self.assertIn('超过30秒', node._paired_phase)
+                self.assertFalse(self.service('paired_move').success)
+            finally:
+                release.set()
+            self.wait_until(lambda: node._preparation is None)
+        self.assertIsNone(node._paired_target)
+        self.assertEqual(node._interlock_reason, '')
+
+    def test_start_tolerance_is_not_accumulated_between_staging_and_execution(self) -> None:
+        """暂存时允许的微小差异不能再次叠加，使执行起点偏离文件超过容差."""
+        node = self.make_node(allow_paired_trajectory=True, allow_continuous_trajectory=True)
+        self.enable_both(node)
+        entered, release = Event(), Event()
+        with patch('archer_hardware.position_node.prepare_pair_message',
+                   side_effect=self.slow_preflight(entered, release)):
+            try:
+                payload = self.continuous_payload()
+                # 给首段足够时间容纳4毫弧度的对齐，单独测试容差不能累计。
+                for side in ('left', 'right'):
+                    for point in payload[side]['points']:
+                        stamp = point['time_from_start']
+                        ns = (stamp['sec'] * 10 ** 9 + stamp['nanosec']) * 5
+                        point['time_from_start'] = {'sec': ns // 10 ** 9, 'nanosec': ns % 10 ** 9}
+                        point['velocities'] = [v / 5. for v in point['velocities']]
+                        point['accelerations'] = [a / 25. for a in point['accelerations']]
+                node.stage_paired_target(payload)
+                self.assertTrue(entered.wait(1.))
+                self.backend(node, 'left').positions = (.104,) * 6
+
+                def staged_feedback():
+                    frame = node.workers['left'].snapshot().feedback
+                    return frame is not None and frame.positions == (.104,) * 6
+
+                self.wait_until(staged_feedback)
+            finally:
+                release.set()
+            self.wait_until(lambda: node._paired_phase == 'STAGED')
+        assert node._paired_target is not None and node._paired_target.continuous is not None
+        self.assertEqual(node._paired_target.continuous['left'].initial, (.1,) * 6)
+        self.backend(node, 'left').positions = (.108,) * 6
+        self.assertTrue(self.service('paired_move').success)
+        self.wait_until(lambda: bool(node._interlock_reason))
+        for side in node.sides:
+            self.assertFalse(any(kind == 'trajectory_start'
+                                 for kind, _ in self.backend(node, side).calls))
 
 
 if __name__ == '__main__':
