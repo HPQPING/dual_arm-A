@@ -95,6 +95,7 @@ def assemble_task_cycle(
     task: Mapping[str, ContinuousPositionTrajectory], *,
     approach: Mapping[str, ContinuousPositionTrajectory],
     return_home: Mapping[str, ContinuousPositionTrajectory], max_excursion: float,
+    cancelled: Callable[[], bool] | None = None,
 ) -> dict[str, ContinuousPositionTrajectory]:
     """只平移段时间并复制原多项式；离线结果不是运动许可，起点仍须实时核对."""
     from archer_control.continuous_trajectory import evaluate
@@ -136,6 +137,8 @@ def assemble_task_cycle(
         for phase in phases:
             plan = phase[side]
             for i, original in enumerate(plan.polynomials):
+                if cancelled is not None and cancelled():
+                    raise ValueError('完整路径拼接已取消')
                 c = np.array(original, dtype=np.float64, copy=True)
                 if c.shape != (6, 6):
                     raise ValueError(side + '完整任务多项式必须为六关节五次系数')
@@ -164,6 +167,7 @@ def assemble_task_cycle(
         result[side] = ContinuousPositionTrajectory(
             tuple(times), tuple(polynomials), first.initial, home.goal,
             tuple((float(a), float(b)) for a, b in zip(lower, upper)), body.limits,
+            preserve_path=True,
         )
     return result
 
@@ -171,6 +175,7 @@ def assemble_task_cycle(
 def geometry_schedule(
     plans: Mapping[str, ContinuousPositionTrajectory], *, max_samples: int = 100000,
     max_time_step: float = .1, max_joint_step: float = .005,
+    cancelled: Callable[[], bool] | None = None,
 ) -> tuple[int, Iterator[int]]:
     """按解析速度峰值加密，限制相邻点时间和关节行程；不是连续碰撞证明."""
     from archer_control.continuous_trajectory import _extrema
@@ -189,6 +194,8 @@ def geometry_schedule(
     divisions: list[int] = []
     count = 1
     for i, (a, b) in enumerate(zip(left.times_ns, left.times_ns[1:])):
+        if cancelled is not None and cancelled():
+            raise ValueError('几何采样准备已取消')
         seconds = (b - a) / 1e9
         peak = max(float(np.max(np.abs(_extrema(p.polynomials[i], seconds, 1))))
                    for p in (left, right))
@@ -212,10 +219,13 @@ def check_samples(
     plans: Mapping[str, ContinuousPositionTrajectory],
     failure: Callable[[tuple[float, ...], tuple[float, ...]], str | None], *,
     max_samples: int = 100000,
+    cancelled: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """检查全部加密采样，异常含时间定位；失败时不返回通过标记."""
-    count, stamps = geometry_schedule(plans, max_samples=max_samples)
+    count, stamps = geometry_schedule(plans, max_samples=max_samples, cancelled=cancelled)
     for stamp in stamps:
+        if cancelled is not None and cancelled():
+            raise ValueError('几何检查已取消')
         elapsed = stamp / 1e9
         problem = failure(plans['left'].sample(elapsed), plans['right'].sample(elapsed))
         if problem:
@@ -248,6 +258,7 @@ def check_task_geometry(
     approach: Mapping[str, ContinuousPositionTrajectory] | None = None,
     return_home: Mapping[str, ContinuousPositionTrajectory] | None = None,
     max_samples: int = 100000,
+    cancelled: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """用当前工程安装模型检查跨臂和台面；不含工件、自碰撞或线缆."""
     from importlib import import_module
@@ -261,7 +272,8 @@ def check_task_geometry(
     if return_home is not None:
         phases.append(('RETURN_ACTUAL', return_home))
     # 先估算整个会话的预算，再加载模型；不能只检查预算内的前半段。
-    total = sum(geometry_schedule(p, max_samples=max_samples)[0] for _, p in phases)
+    total = sum(geometry_schedule(p, max_samples=max_samples, cancelled=cancelled)[0]
+                for _, p in phases)
     if total > max_samples:
         raise ValueError('接近段与任务合计超过几何采样预算')
     if approach is not None:
@@ -322,7 +334,9 @@ def check_task_geometry(
     measured = {}
     for phase, plans in phases:
         try:
-            measured[phase] = check_samples(plans, failure, max_samples=max_samples)
+            measured[phase] = check_samples(
+                plans, failure, max_samples=max_samples, cancelled=cancelled,
+            )
         except ValueError as error:
             raise ValueError(phase + '：' + str(error)) from error
     fingerprint = hashlib.sha256()

@@ -10,9 +10,11 @@ from importlib import import_module
 import json
 from multiprocessing import get_context
 from multiprocessing.managers import SyncManager
+from pathlib import Path
+import re
 from threading import Event, Lock
 import time
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol
 
 import rclpy
 from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
@@ -64,6 +66,7 @@ class StagedPair:
     positions: dict[str, tuple[tuple[float, ...], ...]]
     received: float
     continuous: dict[str, ContinuousPositionTrajectory] | None = None
+    details: dict[str, Any] | None = None
 
 
 def vector_parameter(value: object, name: str) -> tuple[float, ...]:
@@ -108,6 +111,79 @@ def create_preparation_resources() -> tuple[Executor, SyncManager | None]:
         raise
 
 
+def file_request_id(text: str) -> str:
+    """只解析至多16Ki字符的定位请求编号，不读取轨迹文件或SDK."""
+    from .task_file import json_mapping
+
+    if not isinstance(text, str) or len(text) > 16384:
+        raise ValueError('文件定位请求无效或超过16Ki字符上限')
+    data = json_mapping(text.encode('utf-8'))
+    identifier = data.get('request_id')
+    if not isinstance(identifier, str) or re.fullmatch('[0-9a-f]{32}', identifier) is None:
+        raise ValueError('文件请求需要唯一的32位小写十六进制编号')
+    return identifier
+
+
+def prepare_file_task_message(
+    text: str, limits: dict[str, PositionLimits], max_excursion: float,
+    start: dict[str, tuple[float, ...]], cancelled: PreparationCancellation,
+) -> StagedPair:
+    """在计算进程核对文件快照并生成已检完整路径，不读取SDK、不自行发送运动."""
+    from .task_file import json_mapping, load_reviewed_task
+    from .task_geometry import assemble_task_cycle, check_task_geometry, prepare_approach
+    from .task_geometry import prepare_return
+
+    data = json_mapping(text.encode('utf-8'))
+    required = {'request_id', 'run_dir', 'limits_file', 'prepared_file', 'report_file',
+                'transition_max_excursion'}
+    if set(data) != required:
+        raise ValueError('文件预检请求字段不完整或含未知字段')
+    identifier = file_request_id(text)
+    paths = {}
+    for name in ('run_dir', 'limits_file', 'prepared_file', 'report_file'):
+        value = data[name]
+        if not isinstance(value, str) or not value.strip() or '\x00' in value:
+            raise ValueError(name + '需要有效路径')
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            raise ValueError(name + '必须是驱动所在电脑的绝对路径')
+        paths[name] = path
+    transition = positive(data['transition_max_excursion'], 'transition_max_excursion')
+    if transition > max_excursion:
+        raise ValueError('过渡范围不能大于驱动允许的完整任务范围')
+    reviewed = load_reviewed_task(
+        paths['run_dir'], paths['limits_file'], paths['prepared_file'], paths['report_file'],
+        max_excursion=max_excursion, cancelled=cancelled.is_set,
+    )
+    if reviewed.report['task_type'] != 'split_circle':
+        raise ValueError('抓取文件含虚拟附着事件，真实夹爪未接入；当前仅允许画圆文件进入位置执行')
+    if set(limits) != {'left', 'right'} or any(
+        reviewed.plans[side].limits != limits[side] for side in ('left', 'right')
+    ):
+        raise ValueError('准备文件使用的限位与当前驱动限制不一致')
+    approach = prepare_approach(reviewed.plans, start, max_excursion=transition)
+    home = prepare_return(reviewed.plans, start, max_excursion=transition)
+    cycle = assemble_task_cycle(reviewed.plans, approach=approach, return_home=home,
+                                max_excursion=max_excursion, cancelled=cancelled.is_set)
+    geometry = check_task_geometry(reviewed.plans, approach=approach, return_home=home,
+                                   cancelled=cancelled.is_set)
+    if cancelled.is_set():
+        raise ValueError('文件预检已取消，禁止返回可执行对象')
+    if geometry.get('sampled_cross_arm_table_passed') is not True:
+        raise ValueError('完整文件的离散几何检查没有返回通过结果')
+    details = {
+        'request_id': identifier, 'task_type': 'split_circle',
+        'duration_s': cycle['left'].duration, 'sha256': dict(reviewed.report['sha256']),
+        'initial_positions': {s: list(p.initial) for s, p in cycle.items()},
+        'phase_start_ns': {'APPROACH_FILE': 0, 'TASK': approach['left'].times_ns[-1],
+                           'RETURN_ACTUAL': (approach['left'].times_ns[-1]
+                                             + reviewed.plans['left'].times_ns[-1])},
+        'sampled_geometry': geometry, 'preserve_path': True,
+        'gripper_commands_included': False,
+    }
+    return StagedPair(cycle['left'].times_ns, {}, 0., cycle, details)
+
+
 class PositionControlNode(Node):
     """双臂各有独立执行线程，ROS 服务只受理请求并发布状态."""
 
@@ -123,6 +199,7 @@ class PositionControlNode(Node):
             'allow_api_calibration': False, 'readiness_timeout': 10.0,
             'allow_paired_trajectory': False,
             'allow_continuous_trajectory': False,
+            'allow_task_file_trajectory': False,
             'left_url': 'ws://192.168.1.100:8439',
             'right_url': 'ws://192.168.1.100:9439',
             'left_limits_confirmed': False, 'right_limits_confirmed': False,
@@ -170,9 +247,22 @@ class PositionControlNode(Node):
         if not isinstance(allow_continuous, bool):
             raise ValueError('allow_continuous_trajectory 必须为布尔值')
         self.allow_continuous_trajectory: bool = allow_continuous
+        allow_files = self.get_parameter('allow_task_file_trajectory').value
+        if not isinstance(allow_files, bool):
+            raise ValueError('allow_task_file_trajectory必须是布尔值')
+        if allow_files and (not allow_continuous or not self.allow_paired_trajectory):
+            raise ValueError('完整文件需同时明确允许成对轨迹和连续轨迹')
+        self.allow_task_file_trajectory: bool = allow_files
+        self._paired_details: dict[str, Any] = {}
+        self._file_request_id = ''
+        self._file_rejection: dict[str, str] = {}
         if allow_continuous:
             # 在启动工作线程及连接设备之前加载数值库，避免持有控制时首次导入争用GIL。
             import_module('archer_control.continuous_trajectory')
+        if allow_files:
+            # 设备线程启动前载入定位请求所需模块，避免首次文件回调导入争用GIL。
+            import_module('archer_hardware.task_file')
+            import_module('archer_hardware.task_geometry')
         readiness_timeout = positive(
             self.get_parameter('readiness_timeout').value, 'readiness_timeout',
         )
@@ -250,6 +340,12 @@ class PositionControlNode(Node):
         self._subscription_handles.append(self.create_subscription(
             String, '/hardware/position/paired_target', self._paired_target_callback, 1,
         ))
+        self._subscription_handles.append(self.create_subscription(
+            String, '/hardware/position/task_file', self._file_target_callback, 1,
+        ))
+        self._subscription_handles.append(self.create_subscription(
+            String, '/hardware/position/task_execute', self._file_execute_callback, 1,
+        ))
         for kind in ('halt', 'paired_move'):
             self._service_handles.append(self.create_service(
                 Trigger, f'/hardware/position/{kind}', self._service_callback(None, kind),
@@ -265,6 +361,7 @@ class PositionControlNode(Node):
         self._preparation_cancel: PreparationCancellation = Event()
         self._preparation_valid = False
         self._preparation_started = 0.
+        self._preparation_timeout = 30.
         self.create_timer(0.02, self.publish_state)
         try:
             for worker in self.workers.values():
@@ -363,6 +460,30 @@ class PositionControlNode(Node):
                 if not self._paired_active:
                     self._paired_phase = f'REJECTED: {error}'
 
+    def _file_target_callback(self, message: String) -> None:
+        """仅提交完整任务的文件定位请求，拒绝使用离线起点文件冒充实际反馈."""
+        identifier = ''
+        try:
+            identifier = file_request_id(message.data)
+            self.queue_pair_preparation(message.data, task_file=True)
+        except (ValueError, RuntimeError, TypeError) as error:
+            with self._lock:
+                self._file_rejection = {'request_id': identifier, 'reason': str(error)}
+                if not self._paired_active:
+                    self._paired_target = None
+                    self._paired_phase = f'REJECTED: {error}'
+
+    def _file_execute_callback(self, message: String) -> None:
+        """按预检编号显式消费一次文件计划，不会把另一次暂存当成本轮任务."""
+        identifier = message.data if re.fullmatch('[0-9a-f]{32}', message.data) else ''
+        try:
+            if not identifier:
+                raise ValueError('执行请求必须为32位预检编号')
+            self.request_paired_trajectory(expected_request_id=identifier)
+        except (ValueError, RuntimeError) as error:
+            with self._lock:
+                self._file_rejection = {'request_id': identifier, 'reason': str(error)}
+
     def _cancel_preparation_locked(self, signal: bool = True) -> None:
         """只作废后台结果，不排队新的预检；调用者已持有节点锁."""
         self._preparation_valid = False
@@ -378,7 +499,7 @@ class PositionControlNode(Node):
         except Exception as error:
             self.get_logger().error('后台取消信号未确认，结果仍已作废：' + str(error))
 
-    def _pair_feedback(self) -> dict[str, JointFeedback]:
+    def _pair_feedback(self, *, coherent: bool = False) -> dict[str, JointFeedback]:
         """同时核对两侧新鲜静止反馈；不会主动连接或申请控制."""
         result = {}
         for side in self.sides:
@@ -389,11 +510,14 @@ class PositionControlNode(Node):
                     or max(abs(v) for v in frame.velocities) > .02):
                 raise RuntimeError(f'{side} 需要新鲜静止反馈及HOLDING状态')
             result[side] = frame
+        if (coherent and len(result) == 2
+                and abs(result['left'].source_ns - result['right'].source_ns) > 20000000):
+            raise RuntimeError('双臂反馈时间差超过20ms，不能作为同一次起点快照')
         return result
 
     def _check_pair_starts(self, plan: StagedPair) -> None:
         """后台完成后用最新反馈复核起点，不沿用提交时的旧反馈."""
-        for side, frame in self._pair_feedback().items():
+        for side, frame in self._pair_feedback(coherent=plan.details is not None).items():
             if plan.continuous is None:
                 JointPositionTrajectory.prepare(
                     plan.times_ns, plan.positions[side], self.limits[side], self.max_excursion,
@@ -405,8 +529,9 @@ class PositionControlNode(Node):
                     frame.positions, self.limits[side], self.max_excursion,
                 )
 
-    def queue_pair_preparation(self, text: str) -> None:
+    def queue_pair_preparation(self, text: str, *, task_file: bool = False) -> None:
         """至多保留一个后台任务；新消息到来先作废旧暂存，忙时拒绝而不堆积."""
+        identifier = file_request_id(text) if task_file else ''
         with self._lock:
             self._paired_target = None
             if self._preparation is not None:
@@ -417,21 +542,36 @@ class PositionControlNode(Node):
                 raise RuntimeError('需允许成对轨迹并配置两臂已确认限位')
             if self._interlock_reason or self._paired_active:
                 raise RuntimeError('停止或成对执行期间禁止预检新计划')
+            if task_file and not self.allow_task_file_trajectory:
+                raise RuntimeError('完整任务文件入口默认关闭，需显式允许')
             if not isinstance(text, str) or len(text) > 50 * 1024 * 1024:
                 raise ValueError('计划字符串无效或超过50Mi字符上限')
-            self._pair_feedback()
+            if task_file and len(text) > 16384:
+                raise ValueError('文件定位请求超过16Ki字符上限')
+            frames = self._pair_feedback(coherent=task_file)
             self._targets.clear()
             self._paired_ids = {}
+            self._paired_details = {}
+            self._file_request_id = identifier
+            self._file_rejection = {}
             self._preparation_cancel = (self._preparation_manager.Event()
                                         if self._preparation_manager is not None else Event())
             self._preparation_valid = True
             self._preparation_started = time.monotonic()
+            self._preparation_timeout = 120. if task_file else 30.
             self._paired_phase = 'VALIDATING'
             assert self._preparer is not None
-            self._preparation = self._preparer.submit(
-                prepare_pair_message, text, dict(self.limits), self.max_excursion,
-                self.allow_continuous_trajectory, self._preparation_cancel,
-            )
+            if task_file:
+                self._preparation = self._preparer.submit(
+                    prepare_file_task_message, text, dict(self.limits), self.max_excursion,
+                    {side: frame.positions for side, frame in frames.items()},
+                    self._preparation_cancel,
+                )
+            else:
+                self._preparation = self._preparer.submit(
+                    prepare_pair_message, text, dict(self.limits), self.max_excursion,
+                    self.allow_continuous_trajectory, self._preparation_cancel,
+                )
 
     def check_preparation_progress(self) -> None:
         """只消费已完成结果；取消、超时或起点变动都不能产生可执行暂存."""
@@ -439,9 +579,10 @@ class PositionControlNode(Node):
             future = self._preparation
             if future is None:
                 return
-            if self._preparation_valid and time.monotonic() - self._preparation_started > 30.:
+            if (self._preparation_valid
+                    and time.monotonic() - self._preparation_started > self._preparation_timeout):
                 self._cancel_preparation_locked()
-                self._paired_phase = 'REJECTED: 后台预检超过30秒'
+                self._paired_phase = f'REJECTED: 后台预检超过{self._preparation_timeout:g}秒'
             if not future.done():
                 return
             self._preparation = None
@@ -450,6 +591,12 @@ class PositionControlNode(Node):
             self._preparation_valid = False
             try:
                 plan = future.result()
+                if self._file_request_id and (
+                    plan.details is None or plan.details.get('request_id') != self._file_request_id
+                    or plan.continuous is None or set(plan.continuous) != {'left', 'right'}
+                    or any(not curve.preserve_path for curve in plan.continuous.values())
+                ):
+                    raise ValueError('后台文件结果编号或路径保护标记不符，禁止暂存')
                 if plan.continuous is not None:
                     # NumPy数组跨进程序列化后可能恢复可写；进入暂存前重新冻结。
                     for curve in plan.continuous.values():
@@ -457,6 +604,7 @@ class PositionControlNode(Node):
                             polynomial.setflags(write=False)
                 self._check_pair_starts(plan)
                 self._paired_target = replace(plan, received=time.monotonic())
+                self._paired_details = dict(plan.details or {})
                 self._paired_phase = 'STAGED'
             except Exception as error:
                 self._paired_target = None
@@ -500,10 +648,13 @@ class PositionControlNode(Node):
                 )
             self._targets.clear()
             self._paired_target = StagedPair(times, positions, time.monotonic())
+            self._paired_details = {}
+            self._file_request_id = ''
+            self._file_rejection = {}
             self._paired_ids = {}
             self._paired_phase = 'STAGED'
 
-    def request_paired_trajectory(self) -> str:
+    def request_paired_trajectory(self, *, expected_request_id: str | None = None) -> str:
         """消费暂存计划，两线程都确认准备后才确定共同单调启动时刻."""
         failure: Exception | None = None
         identifiers: dict[str, str] = {}
@@ -516,10 +667,17 @@ class PositionControlNode(Node):
             if self._preparation is not None:
                 raise RuntimeError('后台预检尚未结束，不能开始执行')
             plan = self._paired_target
-            self._paired_target = None
             if plan is None or time.monotonic() - plan.received > self.target_timeout:
+                self._paired_target = None
                 self._paired_phase = 'REJECTED: 暂存缺失或过期'
                 raise RuntimeError('没有有效成对暂存计划，或计划已过期')
+            if plan.details is not None:
+                if expected_request_id != plan.details.get('request_id'):
+                    raise RuntimeError('完整文件必须通过匹配预检编号的task_execute入口执行')
+                self._check_pair_starts(plan)
+            elif expected_request_id is not None:
+                raise RuntimeError('当前暂存不是该编号的完整任务文件')
+            self._paired_target = None
             gate = PairedTrajectoryStart()
             self._paired_gate = gate
             self._paired_active = True
@@ -642,6 +800,9 @@ class PositionControlNode(Node):
             self._targets[side] = StagedTarget(ordered, duration, time.monotonic())
             self._paired_target = None
             self._paired_phase = 'IDLE'
+            self._paired_details = {}
+            self._file_request_id = ''
+            self._file_rejection = {}
             self._target_messages[side] = 'STAGED：已预检，尚未执行'
 
     def publish_state(self) -> None:
@@ -658,6 +819,10 @@ class PositionControlNode(Node):
                       'commands': dict(self._paired_ids),
                       'allowed': self.allow_paired_trajectory,
                       'continuous_allowed': self.allow_continuous_trajectory,
+                      'task_files_allowed': self.allow_task_file_trajectory,
+                      'task_file': dict(self._paired_details),
+                      'request_id': self._file_request_id,
+                      'last_file_rejection': dict(self._file_rejection),
                       'preflight_busy': self._preparation is not None}
         for side, worker in self.workers.items():
             snapshot = worker.snapshot()

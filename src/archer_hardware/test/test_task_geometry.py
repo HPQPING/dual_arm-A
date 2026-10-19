@@ -269,6 +269,27 @@ class TaskCycleTests(unittest.TestCase):
             assemble_task_cycle(self.plans, approach=self.approach,
                                 return_home=home, max_excursion=.05)
 
+    def test_geometry_checked_cycle_refuses_start_rebuild(self) -> None:
+        """几何已检路径即使仅有微小起点变化也拒绝，不沿用普通轨迹的首段重建."""
+        plan = self.cycle()['left']
+        self.assertTrue(plan.preserve_path)
+        self.assertIs(plan.aligned_start(plan.initial, self.limits, .05), plan)
+        original = plan.polynomials[0].tobytes()
+        with self.assertRaisesRegex(ValueError, '禁止重建首段'):
+            plan.aligned_start(tuple(x + 1e-7 for x in plan.initial), self.limits, .05)
+        self.assertEqual(original, plan.polynomials[0].tobytes())
+
+    def test_cycle_and_geometry_respond_to_cancellation(self) -> None:
+        """取消后不继续生成完整对象，也不执行部分几何检查后返回通过."""
+        with self.assertRaisesRegex(ValueError, '取消'):
+            assemble_task_cycle(self.plans, approach=self.approach,
+                                return_home=self.home, max_excursion=.05, cancelled=lambda: True)
+        calls = []
+        with self.assertRaisesRegex(ValueError, '取消'):
+            check_samples(self.plans, lambda a, b: calls.append(1) or None,
+                          cancelled=lambda: True)
+        self.assertEqual(calls, [])
+
     def test_cycle_cli_report_keeps_execution_closed(self) -> None:
         """报告给出完整时间轴而不授权运动，拼接失败时不继续调用几何检查."""
         from archer_hardware.task_file import ReviewedTask, main

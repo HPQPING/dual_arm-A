@@ -1,6 +1,7 @@
 """离线验证位置控制，所有发送均被替身接收，不连接实际设备."""
 
 import asyncio
+from dataclasses import replace
 from copy import deepcopy
 from importlib import import_module
 from threading import Event, Thread
@@ -375,6 +376,29 @@ class PositionAdapterTests(unittest.TestCase):
             [limits.max_velocity] * 2, [limits.max_acceleration] * 2,
         )
         return prepare_continuous_pair(plan.payload(), {'left': limits, 'right': limits}, .05)
+
+    def test_checked_path_rejects_drift_before_arm(self) -> None:
+        """已检文件不能在SDK执行入口悄悄重建首段."""
+        plan = replace(self.continuous_plan()['left'], preserve_path=True)
+        self.acquire()
+        self.positions = (.000001,) * 6
+        self.send.reset_mock()
+        with self.assertRaisesRegex(ValueError, '禁止重建首段'):
+            self.adapter.arm_continuous(plan, 'left', PairedTrajectoryStart())
+        self.send.assert_not_called()
+        self.assertEqual(self.adapter.state, 'HOLDING')
+
+    def test_checked_path_waiting_drift_cancels_gate(self) -> None:
+        """双方准备期间实际起点再次变化，不能继续沿旧几何路径启动."""
+        plan = replace(self.continuous_plan()['left'], preserve_path=True)
+        self.acquire()
+        gate = PairedTrajectoryStart()
+        self.adapter.arm_continuous(plan, 'left', gate)
+        self.positions = (.000001,) * 6
+        with self.assertRaisesRegex(RuntimeError, '等待启动时起点变化'):
+            self.adapter.tick()
+        self.assertEqual(self.adapter.state, 'FAULT')
+        self.assertTrue(gate.cancelled)
 
     def test_continuous_cycle_shared_start_and_home_hold(self) -> None:
         """连续轨迹按共同时刻启动，返回记录起点并保持，仅发送位置模式字段."""

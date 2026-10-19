@@ -54,6 +54,34 @@ class OperatorResultTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 request_path(command, side)
 
+    def test_task_run_arguments_fail_before_ros(self) -> None:
+        """缺文件、混入单臂参数或把文件参数给其他操作时，不创建控制客户端."""
+        for args in (['task-run'], ['task-run', '--side', 'left'],
+                     ['status', '--run-dir', '/tmp/unused']):
+            with self.subTest(args=args), patch('rclpy.init') as initialize:
+                with self.assertRaises(SystemExit) as error:
+                    main(args)
+                self.assertEqual(error.exception.code, 2)
+                initialize.assert_not_called()
+
+    def test_task_run_dispatch_is_explicit_and_does_not_enable(self) -> None:
+        """文件执行只调用专用流程，不偷偷调用连接或使能命令."""
+        with patch('rclpy.init'), patch('rclpy.ok', return_value=False), patch(
+            'archer_hardware.operator_client.OperatorClient',
+        ) as constructor:
+            client = constructor.return_value
+            client.run_task_file.return_value = {'result': 'SUCCEEDED'}
+            self.assertEqual(main([
+                'task-run', '--run-dir', '/tmp/run', '--limits-file', '/tmp/limits.yaml',
+                '--prepared-file', '/tmp/plan.json', '--report-file', '/tmp/report.json',
+                '--transition-max-excursion', '.05',
+            ]), 0)
+            client.run_command.assert_not_called()
+            request, timeout = client.run_task_file.call_args.args
+            self.assertEqual(timeout, 120.)
+            self.assertEqual(len(request['request_id']), 32)
+            self.assertEqual(request['transition_max_excursion'], .05)
+
     def test_old_success_and_accepted_are_not_completion(self) -> None:
         """旧编号成功及本次运行中都不能认为已经完成."""
         self.assertIsNone(operation_result(status('old', 'SUCCEEDED'), 'left', 'new', 'move'))

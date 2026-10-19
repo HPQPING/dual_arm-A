@@ -224,6 +224,7 @@ class ContinuousPositionTrajectory:
     goal: tuple[float, ...]
     position_bounds: tuple[tuple[float, float], ...]
     limits: PositionLimits
+    preserve_path: bool = False
 
     @property
     def duration(self) -> float:
@@ -310,6 +311,8 @@ class ContinuousPositionTrajectory:
         if any(abs(q - first) > excursion + 1e-12
                for pair, first in zip(self.position_bounds, actual) for q in pair):
             raise ValueError('实际起点对齐后超出允许位移')
+        if self.preserve_path and actual != self.initial:
+            raise ValueError('已做几何预检的完整路径起点发生变化，需要重新规划和预检，禁止重建首段')
         if actual == self.initial:
             return self
         duration = (self.times_ns[1] - self.times_ns[0]) / 1e9

@@ -3,7 +3,7 @@
 from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 import json
-from threading import Event
+from threading import Event, Thread
 import time
 from typing import Callable, cast
 import unittest
@@ -19,7 +19,7 @@ from std_srvs.srv import Trigger
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from archer_hardware.hex_adapter import JointFeedback
-from archer_hardware.position_node import PositionControlNode
+from archer_hardware.position_node import PositionControlNode, StagedPair
 from archer_hardware.position_plan import (
     ContinuousPositionTrajectory, JointPositionTrajectory, PairedTrajectoryStart, PositionLimits,
 )
@@ -283,12 +283,14 @@ class PositionNodeTests(unittest.TestCase):
         self, configured: bool = True, *, allow_api_calibration: bool = False,
         allow_paired_trajectory: bool = False,
         allow_continuous_trajectory: bool = False,
+        allow_task_file_trajectory: bool = False,
     ) -> PositionControlNode:
         """虚构测试限位只通过参数传入，不写入正式配置."""
         args = ['--ros-args', '-p',
                 f'allow_api_calibration:={str(allow_api_calibration).lower()}', '-p',
                 f'allow_paired_trajectory:={str(allow_paired_trajectory).lower()}', '-p',
-                f'allow_continuous_trajectory:={str(allow_continuous_trajectory).lower()}']
+                f'allow_continuous_trajectory:={str(allow_continuous_trajectory).lower()}', '-p',
+                f'allow_task_file_trajectory:={str(allow_task_file_trajectory).lower()}']
         if configured:
             for side in ('left', 'right'):
                 args.extend(['-p', f'{side}_limits_confirmed:=true'])
@@ -317,7 +319,10 @@ class PositionNodeTests(unittest.TestCase):
         deadline = time.monotonic() + timeout
         while not predicate() and time.monotonic() < deadline:
             self.executor.spin_once(timeout_sec=0.005)
-        self.assertTrue(predicate())
+        self.assertTrue(predicate(), str([
+            (node._paired_phase, node._interlock_reason)
+            for node in self.nodes if isinstance(node, PositionControlNode)
+        ]))
 
     def service(self, name: str) -> Trigger.Response:
         """经真实 ROS 服务传输请求，返回受理结果."""
@@ -962,6 +967,177 @@ class PositionNodeTests(unittest.TestCase):
         for side in node.sides:
             self.assertFalse(any(kind == 'trajectory_start'
                                  for kind, _ in self.backend(node, side).calls))
+
+    def file_preflight(self, text, limits, excursion, starts, cancelled):
+        """合成三段数学路径，替代磁盘和几何耗时步骤，始终不访问设备."""
+        from archer_hardware.task_geometry import assemble_task_cycle, prepare_approach
+        from archer_hardware.task_geometry import prepare_return
+
+        task = {side: ContinuousPositionTrajectory.prepare(
+            (0, 500000000), ((.1,) * 6, (.105,) * 6),
+            ((0.,) * 6,) * 2, ((0.,) * 6,) * 2, limits[side], excursion,
+        ) for side in ('left', 'right')}
+        approach = prepare_approach(task, starts, max_excursion=excursion)
+        home = prepare_return(task, starts, max_excursion=excursion)
+        cycle = assemble_task_cycle(task, approach=approach, return_home=home,
+                                    max_excursion=excursion)
+        identifier = json.loads(text)['request_id']
+        return StagedPair(cycle['left'].times_ns, {}, 0., cycle, {
+            'request_id': identifier, 'preserve_path': True, 'task_type': 'split_circle',
+            'duration_s': cycle['left'].duration,
+        })
+
+    def file_node(self) -> PositionControlNode:
+        """仅向替身节点显式开放全部开关，不修改正式默认值."""
+        node = self.make_node(allow_paired_trajectory=True, allow_continuous_trajectory=True,
+                              allow_task_file_trajectory=True)
+        self.enable_both(node)
+        return node
+
+    def file_message(self, identifier='a' * 32) -> String:
+        """请求仅用于替身后台；真实文件字段由专门的文件测试覆盖."""
+        message = String()
+        message.data = json.dumps({'request_id': identifier})
+        return message
+
+    def test_file_entry_default_closed(self) -> None:
+        """普通连续许可不能自动开放文件入口，也不会因文件消息自动使能."""
+        node = self.make_node(allow_paired_trajectory=True, allow_continuous_trajectory=True)
+        with patch('archer_hardware.position_node.prepare_file_task_message') as prepare:
+            node._file_target_callback(self.file_message())
+        prepare.assert_not_called()
+        self.assertIn('默认关闭', node._file_rejection['reason'])
+        self.assertTrue(all(w._backend is None for w in node.workers.values()))
+
+    def test_file_cycle_correlated_start_home_and_single_use(self) -> None:
+        """文件经ROS提交后不运动，匹配编号才执行，完成含归位且不能重复消费."""
+        node = self.file_node()
+        publisher = self.observer.create_publisher(String, '/hardware/position/task_file', 1)
+        self.wait_until(lambda: publisher.get_subscription_count() > 0)
+        with patch('archer_hardware.position_node.prepare_file_task_message',
+                   side_effect=self.file_preflight):
+            publisher.publish(self.file_message())
+            self.wait_until(lambda: node._paired_phase == 'STAGED')
+        self.assertFalse(self.service('paired_move').success)
+        node._file_execute_callback(String(data='b' * 32))
+        self.assertIsNotNone(node._paired_target)
+        for side in node.sides:
+            self.assertFalse(any(kind == 'continuous_armed'
+                                 for kind, _ in self.backend(node, side).calls))
+        node._file_execute_callback(String(data='a' * 32))
+        self.wait_until(lambda: node._paired_phase == 'FINISHED', timeout=5.)
+        for side in node.sides:
+            backend = self.backend(node, side)
+            self.assertEqual(backend.positions, (.1,) * 6)
+            self.assertIsNotNone(backend._paired_plan)
+            assert backend._paired_plan is not None
+            self.assertEqual(backend._paired_plan.goal, (.1,) * 6)
+            self.assertEqual(sum(kind == 'continuous_armed' for kind, _ in backend.calls), 1)
+        self.assertEqual(self.backend(node, 'left').trajectory_start_at,
+                         self.backend(node, 'right').trajectory_start_at)
+        node._file_execute_callback(String(data='a' * 32))
+        self.assertIn('没有有效成对暂存计划', node._file_rejection['reason'])
+
+    def test_file_start_drift_after_staging_prevents_both_submissions(self) -> None:
+        """即使漂移远小于旧容差，已检文件也必须重新预检而非重建首段."""
+        node = self.file_node()
+        with patch('archer_hardware.position_node.prepare_file_task_message',
+                   side_effect=self.file_preflight):
+            node._file_target_callback(self.file_message())
+            self.wait_until(lambda: node._paired_phase == 'STAGED')
+        self.backend(node, 'right').positions = (.100001,) * 6
+
+        def changed():
+            frame = node.workers['right'].snapshot().feedback
+            return frame is not None and frame.positions == (.100001,) * 6
+
+        self.wait_until(changed)
+        node._file_execute_callback(String(data='a' * 32))
+        self.assertIn('禁止重建首段', node._file_rejection['reason'])
+        self.assertFalse(node._paired_active)
+        for side in node.sides:
+            self.assertFalse(any(kind == 'continuous_armed'
+                                 for kind, _ in self.backend(node, side).calls))
+
+    def test_file_snapshot_rejects_skew_without_changing_legacy_policy(self) -> None:
+        """文件起点快照要求双臂时间差受控，旧通路仍按原新鲜度规则处理."""
+        node = self.file_node()
+        now = time.perf_counter_ns()
+        snapshots = {side: node.workers[side].snapshot() for side in node.sides}
+        left, right = snapshots['left'], snapshots['right']
+        assert left.feedback is not None and right.feedback is not None
+        left = replace(left, feedback=replace(left.feedback, source_ns=now - 25000000))
+        right = replace(right, feedback=replace(right.feedback, source_ns=now))
+        with patch.object(node.workers['left'], 'snapshot', return_value=left), \
+                patch.object(node.workers['right'], 'snapshot', return_value=right):
+            self.assertEqual(set(node._pair_feedback()), {'left', 'right'})
+            with self.assertRaisesRegex(RuntimeError, '时间差超过20ms'):
+                node._pair_feedback(coherent=True)
+
+    def test_file_halt_during_preflight_discards_late_result(self) -> None:
+        """文件后台仍在计算时halt立即结束本轮，迟到成功不能重新暂存."""
+        node = self.file_node()
+        entered, release = Event(), Event()
+
+        def slow(*args):
+            entered.set()
+            if not release.wait(2.):
+                raise RuntimeError('测试后台等待超时')
+            return self.file_preflight(*args)
+
+        with patch('archer_hardware.position_node.prepare_file_task_message', side_effect=slow):
+            try:
+                node._file_target_callback(self.file_message())
+                self.assertTrue(entered.wait(1.))
+                self.assertTrue(self.service('halt').success)
+                self.assertFalse(node._preparation_valid)
+            finally:
+                release.set()
+            self.wait_until(lambda: node._preparation is None)
+        self.assertIsNone(node._paired_target)
+        self.assertTrue(node._interlock_reason)
+
+    def test_file_one_arm_rejection_cancels_both(self) -> None:
+        """一侧执行线程拒绝完整文件时，另一侧不得越过共同启动门控."""
+        node = self.file_node()
+        with patch('archer_hardware.position_node.prepare_file_task_message',
+                   side_effect=self.file_preflight):
+            node._file_target_callback(self.file_message())
+            self.wait_until(lambda: node._paired_phase == 'STAGED')
+        self.backend(node, 'right').reject_trajectory = True
+        node._file_execute_callback(String(data='a' * 32))
+        self.wait_until(lambda: bool(node._interlock_reason))
+        for side in node.sides:
+            self.assertFalse(any(kind == 'trajectory_start'
+                                 for kind, _ in self.backend(node, side).calls))
+
+    def test_task_operator_file_cycle_over_ros(self) -> None:
+        """真实ROS通道贯通操作客户端和位置节点，左右后端仅为内存替身."""
+        from archer_hardware.operator_client import OperatorClient
+
+        node = self.file_node()
+        client = OperatorClient()
+        self.nodes.append(client)
+        assert self.executor is not None
+        executor = self.executor
+        thread = Thread(target=executor.spin, daemon=True)
+        thread.start()
+        try:
+            with patch('archer_hardware.position_node.prepare_file_task_message',
+                       side_effect=self.file_preflight):
+                result = client.run_task_file({'request_id': 'c' * 32}, 3.)
+            self.assertEqual(result['result'], 'SUCCEEDED')
+            self.assertEqual(result['request_id'], 'c' * 32)
+            for side in node.sides:
+                calls = self.backend(node, side).calls
+                self.assertEqual(sum(kind == 'connect' for kind, _ in calls), 1)
+                self.assertEqual(sum(kind == 'enable' for kind, _ in calls), 1)
+                self.assertEqual(sum(kind == 'continuous_armed' for kind, _ in calls), 1)
+                self.assertFalse(any(kind == 'return' for kind, _ in calls))
+        finally:
+            executor.shutdown(timeout_sec=2.)
+            thread.join(timeout=2.)
+            self.executor = None
 
 
 if __name__ == '__main__':

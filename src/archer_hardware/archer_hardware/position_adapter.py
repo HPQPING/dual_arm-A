@@ -368,6 +368,9 @@ class HexPositionAdapter(HexFeedbackAdapter):
         if self.state == 'ARMED':
             assert self._trajectory_gate is not None
             start = self._trajectory_gate.start_time()
+            if (isinstance(self._move, ContinuousPositionTrajectory)
+                    and self._move.preserve_path and frame.positions != self._move.initial):
+                raise RuntimeError('完整路径等待启动时起点变化，取消本次运行并重新预检')
             if (max(abs(v) for v in frame.velocities) > 0.02
                     or self._target is None or max(abs(a - b) for a, b in zip(
                         frame.positions, self._target,

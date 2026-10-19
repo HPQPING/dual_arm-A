@@ -10,7 +10,7 @@ import json
 import math
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -93,9 +93,12 @@ def check_task_stages(stages: object, task: str) -> None:
 def load_reviewed_task(
     run_dir: Path, limits_file: Path, prepared_file: Path, report_file: Path, *,
     max_excursion: float,
+    cancelled: Callable[[], bool] | None = None,
 ) -> ReviewedTask:
     """核对快照哈希、原始采样、阶段与连续整段约束，始终不授予执行许可."""
     excursion = positive(max_excursion, 'max_excursion')
+    if cancelled is not None and cancelled():
+        raise ValueError('任务文件核对已取消')
     root = run_dir.expanduser().resolve()
     names = [n for n in ('state.csv', 'tracking.csv') if (root / n).is_file()]
     if len(names) != 1:
@@ -124,7 +127,7 @@ def load_reviewed_task(
         raise ValueError('需要成功的连续轨迹准备报告')
     limits = load_limits(paths['limits'], content=snapshots['limits'])
     samples, measured = import_samples(snapshots['csv'], limits)
-    plans = prepare_continuous_pair(payload, limits, excursion)
+    plans = prepare_continuous_pair(payload, limits, excursion, cancelled=cancelled)
     scale = positive(report.get('uniform_time_scale'), 'uniform_time_scale')
     if scale < 1.:
         raise ValueError('准备过程不允许缩短原始采样时间')
@@ -155,6 +158,8 @@ def load_reviewed_task(
         if labels != stage_report[side] or len(points) != len(raw):
             raise ValueError(side + '采样数量或阶段被改动')
         for i, (original, prepared) in enumerate(zip(raw, points)):
+            if cancelled is not None and cancelled():
+                raise ValueError('任务采样核对已取消')
             if prepared['positions'] != original['positions']:
                 raise ValueError(side + '原始实际关节角被改写')
             t = original['time_from_start']

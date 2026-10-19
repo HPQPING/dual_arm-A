@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 import re
 import sys
 import time
 from typing import Any
+from uuid import uuid4
 
 import rclpy
 from rclpy.node import Node
@@ -18,13 +20,13 @@ from std_srvs.srv import Trigger
 from .position_plan import positive
 
 
-COMMANDS = ('status', 'connect', 'enable', 'move', 'halt', 'disconnect')
+COMMANDS = ('status', 'connect', 'enable', 'move', 'halt', 'disconnect', 'task-run')
 TERMINAL_FAILURES = ('FAILED', 'REJECTED', 'CANCELLED')
 
 
 def request_path(command: str, side: str | None) -> str:
     """故障停止使用全局接口，其他操作必须明确指定一只臂."""
-    if command not in COMMANDS or command == 'status':
+    if command not in COMMANDS or command in ('status', 'task-run'):
         raise ValueError('该命令没有控制服务入口')
     if command == 'halt':
         if side is not None:
@@ -153,6 +155,94 @@ class OperatorClient(Node):
             rclpy.spin_once(self, timeout_sec=0.05)
         raise RuntimeError('等待本次操作完成超时；不能按成功处理，也不自动重试')
 
+    def run_task_file(self, request: dict[str, Any], timeout: float) -> dict[str, Any]:
+        """显式预检后按同一编号执行整轮；不连接、不使能、不重试、不追加归位."""
+        initial = self.wait_status(timeout)
+        paired = initial.get('paired_trajectory')
+        if (not isinstance(paired, dict) or any(
+            paired.get(key) is not True
+            for key in ('allowed', 'continuous_allowed', 'task_files_allowed')
+        )):
+            raise RuntimeError('驱动尚未明确开放完整文件入口')
+        if initial['interlock'] or paired.get('active') or paired.get('preflight_busy'):
+            raise RuntimeError('驱动停止、执行或预检期间禁止提交另一轮文件任务')
+        identifier = request['request_id']
+        publishers = []
+
+        def publish_once(topic: str, text: str) -> None:
+            publisher = self.create_publisher(String, topic, 1)
+            publishers.append(publisher)
+            deadline = time.monotonic() + min(timeout, 5.)
+            while publisher.get_subscription_count() == 0 and rclpy.ok():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('没有文件任务订阅者：' + topic)
+                rclpy.spin_once(self, timeout_sec=.02)
+            message = String()
+            message.data = text
+            publisher.publish(message)
+
+        def current_pair() -> dict[str, Any] | None:
+            status = self.status
+            if status is None:
+                return None
+            if status.get('interlock'):
+                raise RuntimeError('文件任务软件联锁：' + str(status['interlock']))
+            pair = status.get('paired_trajectory')
+            if not isinstance(pair, dict):
+                return None
+            rejection = pair.get('last_file_rejection', {})
+            if isinstance(rejection, dict) and rejection.get('request_id') == identifier:
+                raise RuntimeError('文件请求被拒绝：' + str(rejection.get('reason')))
+            if pair.get('request_id') != identifier:
+                return None
+            phase = str(pair.get('phase', ''))
+            if phase.startswith(('REJECTED', 'CANCELLED')):
+                raise RuntimeError('文件任务未通过：' + phase)
+            return pair
+
+        try:
+            publish_once('/hardware/position/task_file', json.dumps(request, allow_nan=False))
+            deadline = time.monotonic() + timeout
+            staged: dict[str, Any] | None = None
+            while time.monotonic() < deadline and rclpy.ok():
+                pair = current_pair()
+                if pair is not None and pair.get('phase') == 'STAGED':
+                    details = pair.get('task_file')
+                    if (isinstance(details, dict) and details.get('request_id') == identifier
+                            and details.get('preserve_path') is True):
+                        staged = details
+                        break
+                rclpy.spin_once(self, timeout_sec=.02)
+            if staged is None:
+                raise RuntimeError('文件预检未确认通过；没有发送执行请求，不自动重试')
+            duration = positive(staged.get('duration_s'), '完整路径时长')
+            if duration > 3600.:
+                raise RuntimeError('驱动报告的完整路径超过一小时')
+            self.halt_on_failure = True
+            self.request_issued = True
+            publish_once('/hardware/position/task_execute', identifier)
+            deadline = time.monotonic() + duration + timeout
+            while time.monotonic() < deadline and rclpy.ok():
+                pair = current_pair()
+                if pair is not None and pair.get('phase') == 'FINISHED' and not pair.get('active'):
+                    ids = pair.get('commands')
+                    arms = self.status['arms'] if self.status is not None else {}
+                    if (isinstance(ids, dict) and set(ids) == {'left', 'right'} and all(
+                        isinstance(arms.get(side), dict)
+                        and arms[side].get('command_id') == ids[side]
+                        and arms[side].get('phase') == 'SUCCEEDED'
+                        and arms[side].get('state') == 'HOLDING'
+                        and arms[side].get('feedback_fresh') is True
+                        for side in ('left', 'right')
+                    )):
+                        return {'result': 'SUCCEEDED', 'request_id': identifier,
+                                'return_target_included': True, 'status': self.status}
+                rclpy.spin_once(self, timeout_sec=.02)
+            raise RuntimeError('完整任务未确认完成，不自动归位或重发任务')
+        finally:
+            for publisher in publishers:
+                self.destroy_publisher(publisher)
+
 
 def main(args: list[str] | None = None) -> int:
     """默认只看状态；异常时对已发出的活动请求尽力补发全局 halt."""
@@ -182,20 +272,46 @@ def main(args: list[str] | None = None) -> int:
         nargs='?', default='status',
     )
     parser.add_argument('--side', choices=['left', 'right'])
-    parser.add_argument('--timeout', type=float, default=30.0)
+    parser.add_argument('--timeout', type=float,
+                        help='通信及预检等待秒数；task-run默认120，其余默认30')
+    for field in ('run-dir', 'limits-file', 'prepared-file', 'report-file'):
+        parser.add_argument('--' + field, type=Path)
+    parser.add_argument('--transition-max-excursion', type=float)
     options = parser.parse_args(arguments)
+    if options.timeout is None:
+        options.timeout = 120. if options.command == 'task-run' else 30.
     if options.command in (
         'audit', 'trial', 'plan-check', 'plan-retime', 'csv-import', 'task-review',
     ):
         parser.error('audit/trial/plan-check/plan-retime/csv-import/task-review 子命令必须放在参数最前面')
     positive(options.timeout, 'timeout')
-    if options.command != 'status':
+    task_request: dict[str, Any] | None = None
+    if options.command == 'task-run':
+        if options.side is not None:
+            parser.error('task-run必须双臂执行，不能指定--side')
+        paths = {name: getattr(options, name) for name in (
+            'run_dir', 'limits_file', 'prepared_file', 'report_file',
+        )}
+        if any(value is None for value in paths.values()):
+            parser.error('task-run需要run-dir、limits-file、prepared-file和report-file')
+        if options.transition_max_excursion is None:
+            parser.error('task-run需要明确的transition-max-excursion')
+        task_request = {'request_id': uuid4().hex,
+                        **{name: str(path.expanduser().resolve()) for name, path in paths.items()},
+                        'transition_max_excursion': positive(
+                            options.transition_max_excursion, 'transition-max-excursion')}
+    elif any(getattr(options, name) is not None for name in (
+        'run_dir', 'limits_file', 'prepared_file', 'report_file', 'transition_max_excursion',
+    )):
+        parser.error('文件定位参数仅用于task-run')
+    elif options.command != 'status':
         request_path(options.command, options.side)
     rclpy.init(args=[])
     node: OperatorClient | None = None
     try:
         node = OperatorClient()
-        result = node.run_command(options.command, options.side, options.timeout)
+        result = (node.run_task_file(task_request, options.timeout) if task_request is not None
+                  else node.run_command(options.command, options.side, options.timeout))
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except (RuntimeError, ValueError, OSError, KeyboardInterrupt) as error:

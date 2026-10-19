@@ -315,6 +315,8 @@ class DualTrace(Node):
         previous = self.feedback.get(side)
         if previous is None or stamp > previous[0]:
             self.feedback[side] = (stamp, q)
+            # 两侧回调到齐即尝试配对，避免定时器恰好总在两侧回调之间触发。
+            self.record()
 
     def on_command(self, side: str, message: JointTrajectory, mode: str = "split_circle") -> None:
         stamp = int(message.header.stamp.sec) * 10**9 + int(message.header.stamp.nanosec)
@@ -397,17 +399,21 @@ class DualTrace(Node):
     def record(self) -> None:
         if self.stream is None or self.start_ns is None:
             return
+        # 一次采样只写完整双臂对；尚未配齐时等下一次采样，不写单侧尾帧。
+        if (set(self.plans) != {"left", "right"}
+                or not {"left", "right"} <= set(self.feedback) or self.profile is None):
+            return
         now = self.get_clock().now().nanoseconds
-        for side, plan in self.plans.items():
-            feedback = self.feedback.get(side)
-            if feedback is None:
-                continue
-            stamp, q = feedback
-            if stamp <= self.last_saved.get(side, 0) or not 0 <= now - stamp <= 500_000_000:
-                continue
+        stamps = {side: self.feedback[side][0] for side in ("left", "right")}
+        if any(stamp <= self.last_saved.get(side, 0) or stamp < self.start_ns
+               or not 0 <= now - stamp <= 500_000_000 for side, stamp in stamps.items()):
+            return
+        if abs(stamps["left"] - stamps["right"]) * 1e-9 > self.max_pair_skew:
+            return
+        for side in ("left", "right"):
+            plan = self.plans[side]
+            stamp, q = self.feedback[side]
             elapsed = (stamp - self.start_ns) * 1e-9
-            if elapsed < 0:
-                continue
             target_q, _ = sample_plan(plan[0], plan[1], elapsed)
             actual = (self.world[side] @ self.models[side].forward(q))[:3, 3]
             desired = (self.world[side] @ self.models[side].forward(target_q))[:3, 3]
@@ -597,6 +603,8 @@ class DualTrace(Node):
             self.directory = None
             raise
         summary = {
+            "recording_policy": "paired_fresh_feedback",
+            "max_record_pair_skew_s": self.max_pair_skew,
             "task_name": task_name,
             "started_at": self.started_at.isoformat() if self.started_at is not None else None,
             "task_state": state,

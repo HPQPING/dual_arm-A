@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+from threading import Event
 from tempfile import TemporaryDirectory
 from typing import Any
 import unittest
@@ -15,6 +16,8 @@ import yaml
 from archer_hardware.csv_import import main as prepare_main
 from archer_hardware.operator_client import main as operator_main
 from archer_hardware.task_file import json_mapping, review_task_files
+from archer_hardware.position_node import prepare_file_task_message
+from archer_hardware.position_plan import PositionLimits
 
 
 class TaskFileTests(unittest.TestCase):
@@ -218,6 +221,107 @@ class TaskFileTests(unittest.TestCase):
         ):
             self.assertEqual(operator_main(args), 0)
             initialize.assert_not_called()
+
+    def file_request(self) -> str:
+        """定位合成记录，不提供伪造反馈起点字段."""
+        return json.dumps({
+            'request_id': 'a' * 32, 'run_dir': str(self.root), 'limits_file': str(self.config),
+            'prepared_file': str(self.root / 'prepared_path.json'),
+            'report_file': str(self.root / 'prepared_path_report.json'),
+            'transition_max_excursion': .05,
+        })
+
+    def file_limits(self) -> dict[str, PositionLimits]:
+        """与合成配置完全相同的约束，用来检查配置串用拒绝."""
+        limit = PositionLimits((-1.,) * 6, (1.,) * 6, (.05,) * 6, (.1,) * 6, 0.)
+        return {'left': limit, 'right': limit}
+
+    def make_circle_record(self) -> None:
+        """替换本测试临时记录为完整画圆阶段，并重新生成绑定哈希的候选."""
+        for name in ('state.csv', 'prepared_path.json', 'prepared_path_report.json'):
+            (self.root / name).unlink()
+        stream = io.StringIO(newline='')
+        writer = csv.writer(stream)
+        writer.writerow(['feedback_stamp_ns', 'side', 'phase',
+                         *[f'actual_J{i}_rad' for i in range(1, 7)]])
+        for index, phase in enumerate(('APPROACH', 'ARC', 'RETURN_HOME')):
+            for side in ('left', 'right'):
+                writer.writerow([1792316000123456789 + index * 50000000,
+                                 side, phase, *([.001 * index] * 6)])
+        (self.root / 'tracking.csv').write_text(stream.getvalue())
+        self.write('summary.json', {
+            'task_state': 'COMPLETED', 'task_name': '画圆', 'task_type': 'split_circle',
+            'reference_object_only': False, 'records': {'left': 3, 'right': 3},
+        })
+        self.assertEqual(prepare_main(['--run-dir', str(self.root), '--limits-file',
+                                      str(self.config), '--prepare']), 0)
+
+    def test_file_prepare_reads_once_and_preserves_checked_geometry(self) -> None:
+        """使用真实文件核对与插值；几何替身只验证调用链，不宣称合成姿态无碰撞."""
+        from archer_hardware.task_file import load_reviewed_task, read_snapshot
+
+        self.make_circle_record()
+        original = load_reviewed_task(self.root, self.config, self.root / 'prepared_path.json',
+                                      self.root / 'prepared_path_report.json', max_excursion=.05)
+        starts = {'left': (-.01,) * 6, 'right': (-.02,) * 6}
+        with patch('archer_hardware.task_file.read_snapshot', wraps=read_snapshot) as read, \
+                patch('archer_hardware.task_geometry.check_task_geometry', return_value={
+                    'sampled_cross_arm_table_passed': True,
+                }) as geometry:
+            result = prepare_file_task_message(self.file_request(), self.file_limits(),
+                                               .05, starts, Event())
+        self.assertEqual(read.call_count, 5)
+        geometry.assert_called_once()
+        assert result.continuous is not None and result.details is not None
+        self.assertEqual(result.details['request_id'], 'a' * 32)
+        self.assertFalse(result.details['gripper_commands_included'])
+        for side, plan in result.continuous.items():
+            self.assertTrue(plan.preserve_path)
+            self.assertEqual(plan.initial, starts[side])
+            self.assertEqual(plan.goal, starts[side])
+            for expected, actual in zip(original.plans[side].polynomials, plan.polynomials[1:-1]):
+                self.assertEqual(expected.tobytes(), actual.tobytes())
+
+    def test_file_prepare_rejects_grasp_without_real_gripper(self) -> None:
+        """禁止把虚拟附着事件忽略后当作真实抓取执行."""
+        with patch('archer_hardware.task_geometry.check_task_geometry') as geometry:
+            with self.assertRaisesRegex(ValueError, '真实夹爪未接入'):
+                prepare_file_task_message(self.file_request(), self.file_limits(), .05,
+                                          {'left': (0.,) * 6, 'right': (0.,) * 6}, Event())
+            geometry.assert_not_called()
+
+    def test_file_prepare_rejects_config_change_or_injected_start(self) -> None:
+        """驱动约束串用、额外静态起点和未限定过渡范围均不能进入执行暂存."""
+        from dataclasses import replace
+
+        self.make_circle_record()
+        limits = self.file_limits()
+        changed = {**limits, 'right': replace(limits['right'], max_velocity=(.06,) * 6)}
+        with self.assertRaisesRegex(ValueError, '驱动限制不一致'):
+            prepare_file_task_message(self.file_request(), changed, .05,
+                                      {'left': (0.,) * 6, 'right': (0.,) * 6}, Event())
+        request = json.loads(self.file_request())
+        request['start'] = {'left': [0.] * 6, 'right': [0.] * 6}
+        with self.assertRaisesRegex(ValueError, '未知字段'):
+            prepare_file_task_message(json.dumps(request), limits, .05, {}, Event())
+        request.pop('start')
+        request['transition_max_excursion'] = .06
+        with self.assertRaisesRegex(ValueError, '不能大于'):
+            prepare_file_task_message(json.dumps(request), limits, .05, {}, Event())
+
+    def test_file_prepare_cancelled_before_or_during_geometry(self) -> None:
+        """取消发生在读取前或几何返回前，都不能返回完整可执行对象."""
+        cancelled = Event()
+        cancelled.set()
+        with self.assertRaisesRegex(ValueError, '取消'):
+            prepare_file_task_message(self.file_request(), self.file_limits(), .05, {}, cancelled)
+        self.make_circle_record()
+        cancelled.clear()
+        with patch('archer_hardware.task_geometry.check_task_geometry',
+                   side_effect=lambda *args, **kwargs: cancelled.set() or {}):
+            with self.assertRaisesRegex(ValueError, '禁止返回'):
+                prepare_file_task_message(self.file_request(), self.file_limits(), .05,
+                                          {'left': (0.,) * 6, 'right': (0.,) * 6}, cancelled)
 
 
 if __name__ == '__main__':

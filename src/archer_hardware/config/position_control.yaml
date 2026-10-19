@@ -21,6 +21,8 @@ archer_position_driver:
     allow_paired_trajectory: false
     # 连续轨迹接入仍默认关闭，不会自动连接或使能；完整任务尚需几何与夹爪事件衔接。
     allow_continuous_trajectory: false
+    # 完整文件还需实时起点、文件一致性和几何预检；抓取夹爪尚未接入，不开放抓取文件。
+    allow_task_file_trajectory: false
     # 工程等待上限，覆盖会话、初始化及校准全部步骤，并非厂商承诺耗时。
     readiness_timeout: 10.0
     control_hz: 250
