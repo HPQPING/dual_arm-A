@@ -263,6 +263,19 @@ class PositionWorkerTests(unittest.TestCase):
         self.assertTrue(faults)
         self.assertIn(('stop', ()), fake.calls)
 
+    def test_sdk_background_fault_is_forwarded_once(self) -> None:
+        """后台已先锁存故障时，工作线程仍须通知双臂联锁，且不重复通知."""
+        fake = FakeBackend()
+        fake.state = 'FAULT'
+        fake.last_error = 'SDK 编码失败'
+        faults = []
+        worker = PositionWorker('left', lambda: fake, faults.append)
+        worker._backend = fake
+        worker._cycle()
+        worker._cycle()
+        self.assertEqual(len(faults), 1)
+        self.assertIn('SDK 编码失败', faults[0])
+
 
 class PositionNodeTests(unittest.TestCase):
     """使用真实 ROS 消息及服务，位置后端始终被替换."""
@@ -975,7 +988,7 @@ class PositionNodeTests(unittest.TestCase):
             self.assertFalse(any(kind == 'trajectory_start'
                                  for kind, _ in self.backend(node, side).calls))
 
-    def file_preflight(self, text, limits, excursion, starts, cancelled):
+    def file_preflight(self, text, limits, excursion, starts, cancelled, *, saved_initial=None):
         """合成三段数学路径，替代磁盘和几何耗时步骤，始终不访问设备."""
         from archer_hardware.task_geometry import assemble_task_cycle, prepare_approach
         from archer_hardware.task_geometry import prepare_return
@@ -985,9 +998,11 @@ class PositionNodeTests(unittest.TestCase):
             ((0.,) * 6,) * 2, ((0.,) * 6,) * 2, limits[side], excursion,
         ) for side in ('left', 'right')}
         approach = prepare_approach(task, starts, max_excursion=excursion)
-        home = prepare_return(task, starts, max_excursion=excursion)
+        targets = {side: limits[side].return_goal((saved_initial or starts)[side])
+                   for side in ('left', 'right')}
+        home = prepare_return(task, targets, max_excursion=excursion)
         cycle = assemble_task_cycle(task, approach=approach, return_home=home,
-                                    max_excursion=excursion)
+                                    max_excursion=excursion, return_targets=targets)
         identifier = json.loads(text)['request_id']
         return StagedPair(cycle['left'].times_ns, {}, 0., cycle, {
             'request_id': identifier, 'preserve_path': True, 'task_type': 'split_circle',
@@ -1133,11 +1148,11 @@ class PositionNodeTests(unittest.TestCase):
         node = self.file_node()
         entered, release = Event(), Event()
 
-        def slow(*args):
+        def slow(*args, **kwargs):
             entered.set()
             if not release.wait(2.):
                 raise RuntimeError('测试后台等待超时')
-            return self.file_preflight(*args)
+            return self.file_preflight(*args, **kwargs)
 
         with patch('archer_hardware.position_node.prepare_file_task_message', side_effect=slow):
             try:

@@ -14,7 +14,7 @@ from pathlib import Path
 import re
 from threading import Event, Lock
 import time
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, cast
 
 import rclpy
 from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
@@ -128,6 +128,7 @@ def prepare_file_task_message(
     text: str, limits: dict[str, PositionLimits], max_excursion: float,
     start: dict[str, tuple[float, ...]], cancelled: PreparationCancellation, *,
     hold_start: dict[str, tuple[float, ...]] | None = None, joint_error_rad: float = 0.,
+    saved_initial: dict[str, tuple[float, ...]] | None = None,
 ) -> StagedPair:
     """在计算进程核对文件快照并生成已检完整路径，不读取SDK、不自行发送运动."""
     from .task_file import json_mapping, load_reviewed_task
@@ -179,9 +180,15 @@ def prepare_file_task_message(
         if max(abs(a - b) for a, b in zip(actual, held)) > error:
             raise ValueError(side + '实际反馈超出保持指令的几何误差界限')
     approach = prepare_approach(reviewed.plans, anchor, max_excursion=transition)
-    home = prepare_return(reviewed.plans, anchor, max_excursion=transition)
+    original = start if saved_initial is None else saved_initial
+    if set(original) != {'left', 'right'}:
+        raise ValueError('归位参考缺少本轮最初实测位置')
+    return_targets = {side: limits[side].return_goal(original[side])
+                      for side in ('left', 'right')}
+    home = prepare_return(reviewed.plans, return_targets, max_excursion=transition)
     cycle = assemble_task_cycle(reviewed.plans, approach=approach, return_home=home,
-                                max_excursion=max_excursion, cancelled=cancelled.is_set)
+                                max_excursion=max_excursion, cancelled=cancelled.is_set,
+                                return_targets=return_targets)
     geometry = check_task_geometry(reviewed.plans, approach=approach, return_home=home,
                                    cancelled=cancelled.is_set, joint_error_rad=error)
     if cancelled.is_set():
@@ -196,7 +203,10 @@ def prepare_file_task_message(
         'duration_s': cycle['left'].duration, 'sha256': dict(reviewed.report['sha256']),
         'initial_positions': {s: list(p.initial) for s, p in cycle.items()},
         'actual_initial_positions': {s: list(p) for s, p in start.items()},
-        'return_reference': 'held_command' if error else 'actual_feedback',
+        'return_reference': ('saved_actual_initial_clipped_to_nominal' if saved_initial is not None
+                             else 'actual_feedback'),
+        'saved_initial_positions': {s: list(p) for s, p in original.items()},
+        'return_targets': {s: list(p) for s, p in return_targets.items()},
         'joint_error_rad': error,
         'phase_start_ns': {'APPROACH_FILE': 0, 'TASK': approach['left'].times_ns[-1],
                            'RETURN_ACTUAL': (approach['left'].times_ns[-1]
@@ -594,6 +604,9 @@ class PositionControlNode(Node):
                 raise ValueError('文件定位请求超过16Ki字符上限')
             snapshots = {side: self.workers[side].snapshot() for side in self.sides}
             frames = self._pair_feedback(coherent=task_file, snapshots=snapshots)
+            saved_initial = {side: snapshots[side].initial_positions for side in self.sides}
+            if task_file and any(value is None for value in saved_initial.values()):
+                raise ValueError('缺少本轮控制准备时保存的实际初始位置，禁止任务执行')
             hold: dict[str, tuple[float, ...]] = {}
             if task_file and self.task_joint_error_rad:
                 for side, frame in frames.items():
@@ -623,6 +636,7 @@ class PositionControlNode(Node):
                     prepare_file_task_message, text, dict(self.limits), self.max_excursion,
                     {side: frame.positions for side, frame in frames.items()},
                     self._preparation_cancel,
+                    saved_initial=cast(dict[str, tuple[float, ...]], saved_initial),
                     **({'hold_start': hold, 'joint_error_rad': self.task_joint_error_rad}
                        if self.task_joint_error_rad else {}),
                 )

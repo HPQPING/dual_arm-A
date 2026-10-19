@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from importlib import import_module
 import time
 from typing import Any, Iterable, cast
@@ -15,6 +14,8 @@ from typing import Any, Iterable, cast
 from .hex_adapter import (
     HexFeedbackAdapter, JointFeedback, managed_sdk_class, report_only, verified_sdk,
 )
+from .sdk_cycle import SdkCycleSender
+from .sdk_position import isolated_arm_class
 from .position_plan import (
     ContinuousPositionTrajectory, JointPositionMove, JointPositionTrajectory,
     PairedTrajectoryStart, PositionLimits,
@@ -59,6 +60,8 @@ class HexPositionAdapter(HexFeedbackAdapter):
         self._trajectory_gate: PairedTrajectoryStart | None = None
         self.trajectory_start_at: float | None = None
         self.trajectory_observed_start_at: float | None = None
+        self._native: SdkCycleSender | None = None
+        self._native_error = ''
         self._base: Any = None
         self._command_types: Any = None
         self._epoch = 0
@@ -70,36 +73,61 @@ class HexPositionAdapter(HexFeedbackAdapter):
         self._recovering_limits = False
 
     def connect(self) -> None:
-        """核对 SDK 后建立反馈连接，不启动厂商设备控制周期任务."""
+        """建立反馈连接并启用有准入过滤的官方周期，未申请前不发控制命令."""
         if self.state != 'DISCONNECTED':
             raise RuntimeError('需要先关闭原连接')
         module = verified_sdk()
         base = cast(Any, module.HexDeviceApi)
-
         managed_base = managed_sdk_class(base)
+        arm_type = isolated_arm_class()
+        owner = self
+        self._command_types = import_module('hex_device.motor_base').CommandType
+        self._native = SdkCycleSender(
+            self._check_dispatch, self._native_failure, lambda: self._epoch, self._command_types,
+        )
 
         class PositionAPI(managed_base):
-            """官方周期发送关闭；设备回调只能下发反馈频率设置."""
+            """替换机械臂类并保留附属设备反馈，控制下行经项目核对."""
+
+            def _register_device_class(self, device_class: Any) -> None:
+                super()._register_device_class(
+                    arm_type if device_class is owner._arm_type else device_class,
+                )
 
             def _start_device_periodic_task(self, device_id: int) -> None:
-                """禁止默认自动清错、校准和抢占控制逻辑."""
-                return None
+                arm = self._device_id_map.get(device_id)
+                if isinstance(arm, arm_type):
+                    arm._project_position_error = owner._native_failure
+                    super()._start_device_periodic_task(device_id)
 
             async def _send_down_message(self, message: Any) -> None:
-                """厂商内部回调仅允许反馈配置，不发送控制消息."""
+                if self._HexDeviceApi__is_closing.is_set():
+                    return
                 if report_only(message):
                     await super()._send_down_message(message)
+                elif owner._native is not None:
+                    arms = [d for d in self.device_list if isinstance(d, arm_type)]
+                    if len(arms) == 1:
+                        await owner._native.dispatch(self, base, arms[0], message)
 
         self._base = base
         self._arm_type = import_module('hex_device.arm').Arm
-        self._command_types = import_module('hex_device.motor_base').CommandType
+        self._native_error = ''
+        self._epoch += 1
         self._api = PositionAPI(
             ws_url=self.url, control_hz=self.control_hz, enable_kcp=False,
         )
         self.last_error = ''
-        self._epoch += 1
         self.state = 'CONNECTED'
         self.readiness_stage = 'CONNECTED'
+
+    def _native_failure(self, reason: str) -> None:
+        """SDK 线程锁存故障并缓存 BRAKE，不等待自身线程或自动恢复运动."""
+        if self._native_error or self.state in ('DISCONNECTED', 'CONNECTED'):
+            return
+        self._native_error = reason
+        self.last_error = reason
+        self.stop(fault=True, wait=False)
 
     def _arm(self) -> Any:
         arms = [d for d in self._api.device_list if isinstance(d, self._arm_type)]
@@ -159,79 +187,65 @@ class HexPositionAdapter(HexFeedbackAdapter):
             raise RuntimeError('控制权属于其他会话，不抢占')
         return holder == mine, initialized is True, calibrated is True
 
-    def _send(self, message: Any, kind: str) -> None:
-        """有界等待官方发送协程，过期排队消息在发送前作废."""
-        api = self._api
-        if api is None:
-            raise RuntimeError('设备未连接')
-        epoch = self._epoch
-        deadline = time.perf_counter() + 0.04
-
-        async def deliver() -> None:
-            if epoch != self._epoch or time.perf_counter() > deadline:
-                raise RuntimeError('控制消息已作废或发送超时')
-            if (kind == 'position' and self._trajectory_gate is not None
-                    and self._trajectory_gate.cancelled):
-                raise RuntimeError('双臂轨迹已取消，禁止发送排队的位置消息')
-            permitted = (
-                kind == 'initialize' and self.state == 'REQUESTING'
-                or kind == 'calibrate' and self.state == 'REQUESTING'
-                and self.allow_api_calibration and self._calibration_sent
-                or kind == 'heartbeat' and self.state == 'REQUESTING'
-                or kind == 'position' and self.state in (
-                    'HOLDING', 'ARMED', 'RUNNING',
-                )
-                or kind == 'brake' and self.state in ('STOPPED', 'FAULT')
+    def _check_dispatch(self, message: Any, kind: str) -> None:
+        """发布缓存及官方真实发送前都复核会话、故障、反馈与双臂取消."""
+        if (kind == 'position' and self._trajectory_gate is not None
+                and self._trajectory_gate.cancelled):
+            raise RuntimeError('双臂轨迹已取消，禁止发送排队的位置消息')
+        permitted = (
+            kind == 'initialize' and self.state == 'REQUESTING'
+            or kind == 'calibrate' and self.state == 'REQUESTING'
+            and self.allow_api_calibration and self._calibration_sent
+            or kind == 'heartbeat' and self.state == 'REQUESTING'
+            or kind == 'position' and self.state in (
+                'HOLDING', 'ARMED', 'RUNNING',
             )
-            if not permitted:
-                raise RuntimeError('当前状态不允许下发此类消息')
-            # 通信队列等待期间设备状态可能变化；下发前重新核对，不复用先前结论。
-            if kind == 'brake':
-                arm = self._arm()
-                with arm._status_lock:
-                    holder, mine = arm._session_holder, arm._my_session_id
-                if mine <= 0 or holder != mine:
-                    raise RuntimeError('下发制动前控制权已改变，不向其他会话发送')
-                # 制动用于故障处理，不因电机故障或calibrated失效而阻止尝试。
-            else:
-                owned, initialized, calibrated = self._health(
-                    require_calibrated=kind == 'position',
-                )
-                frame = self._feedback
-                if frame is None or not 0 <= (
-                    time.perf_counter_ns() - frame.source_ns
-                ) / 1e9 <= self.stale_timeout:
-                    raise RuntimeError('下发前缺少新鲜关节反馈，消息作废')
-                self.limits.check_feedback(frame.positions)
-                if kind == 'position':
-                    if not owned or not initialized:
-                        raise RuntimeError('下发位置前控制权或初始化状态已改变')
-                    if self._nominal_required:
-                        self.limits.check_positions(frame.positions)
-                elif kind == 'calibrate' and (not owned or calibrated):
-                    raise RuntimeError('下发校准前控制权或校准状态已改变')
-                elif kind == 'heartbeat':
-                    if not owned:
-                        raise RuntimeError('会话心跳不能在失去控制权后继续发送')
-                    command = message.arm_command.arm_exclusive_command
-                    control = command.arm_api_control_command
-                    if (command.WhichOneof('exclusive_command') != 'arm_api_control_command'
-                            or {f.name for f, _ in control.ListFields()} != {'motor_targets'}
-                            or len(control.motor_targets.targets) != 0):
-                        raise RuntimeError('会话心跳必须只有空电机目标，禁止任何运动模式')
-            # 只由固定的官方构造器产生消息，不提供任意消息发送入口。
-            await self._base._send_down_message(api, message)
+            or kind == 'brake' and self.state in ('STOPPED', 'FAULT')
+        )
+        if not permitted:
+            raise RuntimeError('当前状态不允许下发此类消息')
+        # 通信队列等待期间设备状态可能变化；下发前重新核对，不复用先前结论。
+        if kind == 'brake':
+            arm = self._arm()
+            with arm._status_lock:
+                holder, mine = arm._session_holder, arm._my_session_id
+            if mine <= 0 or holder != mine:
+                raise RuntimeError('下发制动前控制权已改变，不向其他会话发送')
+            # 制动用于故障处理，不因电机故障或calibrated失效而阻止尝试。
+        else:
+            owned, initialized, calibrated = self._health(
+                require_calibrated=kind == 'position',
+            )
+            frame = self._feedback
+            if frame is None or not 0 <= (
+                time.perf_counter_ns() - frame.source_ns
+            ) / 1e9 <= self.stale_timeout:
+                raise RuntimeError('下发前缺少新鲜关节反馈，消息作废')
+            self.limits.check_feedback(frame.positions)
+            if kind == 'position':
+                if not owned or not initialized:
+                    raise RuntimeError('下发位置前控制权或初始化状态已改变')
+                if self._nominal_required:
+                    self.limits.check_positions(frame.positions)
+            elif kind == 'calibrate' and (not owned or calibrated):
+                raise RuntimeError('下发校准前控制权或校准状态已改变')
+            elif kind == 'heartbeat':
+                if not owned:
+                    raise RuntimeError('会话心跳不能在失去控制权后继续发送')
+                command = message.arm_command.arm_exclusive_command
+                control = command.arm_api_control_command
+                if (command.WhichOneof('exclusive_command') != 'arm_api_control_command'
+                        or {f.name for f, _ in control.ListFields()} != {'motor_targets'}
+                        or len(control.motor_targets.targets) != 0):
+                    raise RuntimeError('会话心跳必须只有空电机目标，禁止任何运动模式')
 
-        loop = api._HexDeviceApi__loop
-        if loop is None or not loop.is_running():
-            raise RuntimeError('SDK 通信线程未运行')
-        future = asyncio.run_coroutine_threadsafe(deliver(), loop)
-        try:
-            future.result(timeout=0.05)
-        except Exception:
-            future.cancel()
-            self._epoch += 1
-            raise
+    def _send(self, message: Any, kind: str) -> None:
+        """只发布到官方 SDK 缓存，不运行项目传输协程或周期发送线程."""
+        if self._native is None:
+            raise RuntimeError('官方 SDK 发送器未连接')
+        event = self._native.publish(self._arm(), message, kind, self._target)
+        if kind == 'brake' and not event.wait(.05):
+            raise RuntimeError('BRAKE 未在50ms内确认底层发送，仍将继续关闭连接')
 
     def request_control(self) -> None:
         """在新鲜、静止反馈和无故障状态下显式申请控制权."""
@@ -308,7 +322,11 @@ class HexPositionAdapter(HexFeedbackAdapter):
     @property
     def commanded_positions(self) -> tuple[float, ...] | None:
         """只在保持状态公开已发送目标，不能用最新反馈冒充指令锚点."""
-        return self._target if self.state == 'HOLDING' else None
+        if self.state != 'HOLDING':
+            return None
+        if self._native is not None and self._native.last_position != self._target:
+            return None
+        return self._target
 
     def arm_continuous(
         self, plan: ContinuousPositionTrajectory, side: str, gate: PairedTrajectoryStart,
@@ -348,6 +366,8 @@ class HexPositionAdapter(HexFeedbackAdapter):
         if self.state not in ('REQUESTING', 'HOLDING', 'ARMED', 'RUNNING'):
             return self.state
         try:
+            if self._native_error:
+                raise RuntimeError(self._native_error)
             self._tick()
         except Exception as error:
             self.last_error = str(error)
@@ -405,6 +425,19 @@ class HexPositionAdapter(HexFeedbackAdapter):
                 self.readiness_stage = 'WAITING_INITIALIZATION'
                 self._send(self._arm()._construct_empty_message(), 'heartbeat')
                 return
+            arm = self._arm()
+            if self._native is not None:
+                lower = [min(lo, q) for lo, q in zip(self.limits.lower, frame.positions)]
+                upper = [max(hi, q) for hi, q in zip(self.limits.upper, frame.positions)]
+                config = {'name': 'project_position_limits', 'dof_num': 'six_axis',
+                          'motor_model': [128] * 6,
+                          'joints': [{'joint_name': f'joint_{i + 1}',
+                                      'joint_limit': [lo, hi, -v, v, 0., 0.]}
+                                     for i, (lo, hi, v) in enumerate(zip(
+                                         lower, upper, self.limits.max_velocity))]}
+                if not arm.reload_arm_config_from_dict(config):
+                    raise RuntimeError('本臂 SDK 位置配置加载失败')
+                arm.set_initial_positions(list(frame.positions))
             self.initial_positions = frame.positions
             self._target = frame.positions
             self._last_tick = now
@@ -479,16 +512,24 @@ class HexPositionAdapter(HexFeedbackAdapter):
         )
         self._send(arm._construct_custom_joint_command_msg(targets), 'position')
 
-    def stop(self, *, fault: bool = False) -> None:
+    def stop(self, *, fault: bool = False, wait: bool = True) -> None:
         """
         取消位置发送并尝试制动，保留连接；失败不转零力矩或失能.
 
         STOPPED 仅表示软件轨迹已取消，不证明实际已制动或锁定。
         """
         active = self.state in ('REQUESTING', 'HOLDING', 'ARMED', 'RUNNING')
+        if not active:
+            # 重复停止不能清掉正在由 SDK 周期交付的 BRAKE，也不能降级故障。
+            if fault and self.state == 'STOPPED':
+                self.state = 'FAULT'
+                self.readiness_stage = 'FAULT'
+            return
         if self._trajectory_gate is not None:
             self._trajectory_gate.cancel()
         self._epoch += 1
+        if self._native is not None:
+            self._native.cancel()
         self._move = None
         self.state = 'FAULT' if fault else 'STOPPED'
         self.readiness_stage = self.state
@@ -501,7 +542,11 @@ class HexPositionAdapter(HexFeedbackAdapter):
                 targets = arm._construct_custom_motor_msg(
                     self._command_types.BRAKE, [True] * 6,
                 )
-                self._send(arm._construct_custom_joint_command_msg(targets), 'brake')
+                message = arm._construct_custom_joint_command_msg(targets)
+                if not wait and self._native is not None:
+                    self._native.publish(arm, message, 'brake', None)
+                else:
+                    self._send(message, 'brake')
             except Exception as error:
                 self.last_error += f'；软件制动发送未确认：{error}'
 
@@ -509,6 +554,8 @@ class HexPositionAdapter(HexFeedbackAdapter):
         """关闭连接前取消位置发送，不自动返回初始位置."""
         if self._api is not None:
             self.stop()
+        if self._native is not None:
+            self._native.close()
         try:
             super().close()
         finally:

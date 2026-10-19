@@ -4,7 +4,6 @@ import asyncio
 from dataclasses import replace
 from copy import deepcopy
 from importlib import import_module
-from threading import Event, Thread
 import time
 from types import SimpleNamespace
 from typing import Any, cast
@@ -1153,158 +1152,59 @@ class PositionAdapterTests(unittest.TestCase):
         self.assertTrue(all(call.args[1] in ('initialize', 'position')
                             for call in self.send.call_args_list))
 
-    def test_actual_send_boundary_checks_state(self) -> None:
-        """执行真实发送协程入口，但只向内存替身发送，不建立 socket."""
-        self.sender.stop()
-        loop = asyncio.new_event_loop()
-        ready = Event()
-        loop.call_soon(ready.set)
-        thread = Thread(target=loop.run_forever, daemon=True)
-        thread.start()
-        self.assertTrue(ready.wait(timeout=2.0))
-        sent = []
-
-        async def capture(api, message):
-            sent.append(message)
-
-        self.adapter._base = SimpleNamespace(_send_down_message=capture)
-        self.adapter._api._HexDeviceApi__loop = loop
-        try:
-            with self.assertRaisesRegex(RuntimeError, '不允许'):
-                self.adapter._send(object(), 'position')
-            self.assertEqual(sent, [])
-            self.adapter.state = 'REQUESTING'
-            for allowed, latched in ((False, False), (False, True), (True, False)):
-                self.adapter.allow_api_calibration = allowed
-                self.adapter._calibration_sent = latched
-                with self.assertRaisesRegex(RuntimeError, '不允许'):
-                    self.adapter._send(object(), 'calibrate')
-            self.adapter.allow_api_calibration = True
-            self.adapter._calibration_sent = True
-            self.arm._session_holder = 7
-            self.arm._calibrated = False
-            self.adapter._feedback = self.frame()
-            self.adapter._send(object(), 'calibrate')
-            self.assertEqual(len(sent), 1)
-            sent.clear()
-            self.adapter.state = 'STOPPED'
-            with self.assertRaisesRegex(RuntimeError, '不允许'):
-                self.adapter._send(object(), 'calibrate')
-            self.adapter.state = 'HOLDING'
-            self.arm._api_control_initialized = True
-            self.arm._calibrated = True
-            self.adapter._feedback = self.frame()
-            packet = object()
-            self.adapter._send(packet, 'position')
-            self.assertEqual(sent, [packet])
-            gate = PairedTrajectoryStart()
-            self.adapter._trajectory_gate = gate
-            gate.cancel()
-            with self.assertRaisesRegex(RuntimeError, '双臂轨迹已取消'):
-                self.adapter._send(packet, 'position')
-            self.assertEqual(sent, [packet])
-        finally:
-            loop.call_soon_threadsafe(loop.stop)
-            thread.join(timeout=2.0)
-            loop.close()
-
-    def test_dispatch_rechecks_device_after_queueing(self) -> None:
-        """实际执行发送协程，在入队时改变状态，验证不向传输替身交付旧请求."""
+    def test_native_boundary_rechecks_state_and_feedback(self) -> None:
+        """原生周期发送前重新核对，而非信任此前发布缓存时的状态."""
         self.acquire()
-        self.sender.stop()
-        loop = asyncio.new_event_loop()
-        ready = Event()
-        loop.call_soon(ready.set)
-        thread = Thread(target=loop.run_forever, daemon=True)
-        thread.start()
-        self.assertTrue(ready.wait(timeout=2.))
-        sent = []
+        self.adapter._feedback = self.frame()
+        self.adapter._check_dispatch(object(), 'position')
+        for field, value in (
+            ('_session_holder', 8), ('_api_control_initialized', False),
+            ('_calibrated', False), ('_error_codes', [3] * 6),
+        ):
+            original = getattr(self.arm, field)
+            setattr(self.arm, field, value)
+            with self.subTest(field=field), self.assertRaises(RuntimeError):
+                self.adapter._check_dispatch(object(), 'position')
+            setattr(self.arm, field, original)
+        self.adapter._feedback = None
+        with self.assertRaisesRegex(RuntimeError, '新鲜'):
+            self.adapter._check_dispatch(object(), 'position')
+        self.adapter.state = 'FAULT'
+        self.arm._calibrated = False
+        self.arm._api_control_initialized = False
+        self.arm._error_codes = [3] * 6
+        self.adapter._check_dispatch(object(), 'brake')
+        self.arm._session_holder = 8
+        with self.assertRaises(RuntimeError):
+            self.adapter._check_dispatch(object(), 'brake')
 
-        async def capture(api, message):
-            sent.append(message)
-
-        self.adapter._base = SimpleNamespace(_send_down_message=capture)
-        self.adapter._api._HexDeviceApi__loop = loop
-        submit = asyncio.run_coroutine_threadsafe
-
-        def reset():
-            self.arm._session_holder = 7
-            self.arm._api_control_initialized = True
-            self.arm._calibrated = True
-            self.arm._error_codes = [None] * 6
-            self.adapter.state = 'HOLDING'
-            self.adapter._feedback = self.frame()
-
-        def check_change(field, value, kind='position'):
-            reset()
-            if kind == 'calibrate':
-                self.adapter.state = 'REQUESTING'
-                self.adapter.allow_api_calibration = True
-                self.adapter._calibration_sent = True
-                self.arm._calibrated = False
-            elif kind == 'brake':
-                self.adapter.state = 'STOPPED'
-            elif kind in ('initialize', 'heartbeat'):
-                self.adapter.state = 'REQUESTING'
-
-            def enqueue(coroutine, target_loop):
-                if field == 'feedback':
-                    self.adapter._feedback = value
-                else:
-                    setattr(self.arm, field, value)
-                return submit(coroutine, target_loop)
-
-            with patch('asyncio.run_coroutine_threadsafe', side_effect=enqueue):
-                with self.assertRaises(RuntimeError):
-                    self.adapter._send(object(), kind)
-            self.assertEqual(sent, [])
-
-        try:
-            for field, value in (
-                ('_session_holder', 8), ('_api_control_initialized', False),
-                ('_calibrated', False), ('_error_codes', [None, 3, None, None, None, None]),
-                ('feedback', None),
-                ('feedback', JointFeedback((0.,) * 6, (0.,) * 6, (0.,) * 6,
-                                           time.perf_counter_ns() - 1000000000)),
-            ):
-                with self.subTest(field=field):
-                    check_change(field, value)
-            check_change('_session_holder', 0, 'calibrate')
-            check_change('_calibrated', True, 'calibrate')
-            check_change('_session_holder', 8, 'brake')
-            check_change('_session_holder', 8, 'initialize')
-            check_change('_session_holder', 0, 'heartbeat')
-            check_change('feedback', None, 'initialize')
-            # 故障时本会话仍持有控制权，制动不要求校准、初始化或新鲜位置。
-            reset()
-            self.adapter.state = 'FAULT'
-            self.arm._error_codes = [3] * 6
-            self.arm._calibrated = False
-            self.arm._api_control_initialized = False
-            self.adapter._feedback = None
-            packet = object()
-            self.adapter._send(packet, 'brake')
-            self.assertEqual(sent, [packet])
-            # 尚未持有且未初始化/校准时，正常申请初始化仍然允许。
-            sent.clear()
-            reset()
-            self.adapter.state = 'REQUESTING'
-            self.arm._session_holder = 0
-            self.arm._calibrated = False
-            self.arm._api_control_initialized = False
-            self.adapter._send(packet, 'initialize')
-            self.assertEqual(sent, [packet])
-            sent.clear()
-            self.arm._session_holder = 7
-            heartbeat = self.arm._construct_empty_message()
-            self.adapter._send(heartbeat, 'heartbeat')
-            self.assertEqual(sent, [heartbeat])
-            with self.assertRaisesRegex(RuntimeError, '空电机目标'):
-                self.adapter._send(self.arm._construct_init_message(), 'heartbeat')
-        finally:
-            loop.call_soon_threadsafe(loop.stop)
-            thread.join(timeout=2.)
-            loop.close()
+    def test_native_boundary_calibration_and_empty_only(self) -> None:
+        """准备许可、控制权、空心跳及双臂取消仍在原生发送边界生效."""
+        self.adapter.state = 'REQUESTING'
+        self.arm._session_holder = 7
+        self.arm._calibrated = False
+        self.adapter._feedback = self.frame()
+        for allowed, latched in ((False, False), (False, True), (True, False)):
+            self.adapter.allow_api_calibration = allowed
+            self.adapter._calibration_sent = latched
+            with self.assertRaisesRegex(RuntimeError, '不允许'):
+                self.adapter._check_dispatch(object(), 'calibrate')
+        self.adapter.allow_api_calibration = True
+        self.adapter._calibration_sent = True
+        self.adapter._check_dispatch(object(), 'calibrate')
+        self.arm._session_holder = 0
+        with self.assertRaises(RuntimeError):
+            self.adapter._check_dispatch(object(), 'calibrate')
+        self.adapter._check_dispatch(object(), 'initialize')
+        self.arm._session_holder = 7
+        self.adapter._check_dispatch(self.arm._construct_empty_message(), 'heartbeat')
+        with self.assertRaisesRegex(RuntimeError, '空电机目标'):
+            self.adapter._check_dispatch(self.arm._construct_init_message(), 'heartbeat')
+        gate = PairedTrajectoryStart()
+        self.adapter._trajectory_gate = gate
+        gate.cancel()
+        with self.assertRaisesRegex(RuntimeError, '双臂轨迹已取消'):
+            self.adapter._check_dispatch(object(), 'position')
 
     def test_invalid_frequency_and_limit_isolation(self) -> None:
         """频率不接受布尔值，左右实例不共享初始角度或轨迹."""
@@ -1315,7 +1215,7 @@ class PositionAdapterTests(unittest.TestCase):
         self.assertIsNone(other.initial_positions)
         self.assertIsNone(other._move)
 
-    def test_connect_never_starts_vendor_control_loop(self) -> None:
+    def test_connect_filters_unrequested_vendor_control(self) -> None:
         """替换网络构造后，验证连接不会放行厂商自动控制消息."""
         sdk = import_module('hex_device.hex_device_api').HexDeviceApi
         message_type = import_module('hex_device.generated.public_api_down_pb2').APIDown
@@ -1327,6 +1227,10 @@ class PositionAdapterTests(unittest.TestCase):
 
         with patch.object(sdk, '__init__', return_value=None):
             adapter.connect()
+        from threading import Event
+        adapter._api._HexDeviceApi__is_closing = Event()
+        adapter._api._internal_device_list = []
+        adapter._api._device_id_map = {}
         with patch.object(sdk, '_send_down_message', capture):
             command = message_type()
             command.arm_command.arm_exclusive_command.api_control_initialize = True

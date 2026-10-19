@@ -99,11 +99,14 @@ def assemble_task_cycle(
     approach: Mapping[str, ContinuousPositionTrajectory],
     return_home: Mapping[str, ContinuousPositionTrajectory], max_excursion: float,
     cancelled: Callable[[], bool] | None = None,
+    return_targets: Mapping[str, tuple[float, ...]] | None = None,
 ) -> dict[str, ContinuousPositionTrajectory]:
     """只平移段时间并复制原多项式；离线结果不是运动许可，起点仍须实时核对."""
     from archer_control.continuous_trajectory import evaluate
 
     excursion = positive(max_excursion, 'cycle_max_excursion')
+    if return_targets is not None and set(return_targets) != {'left', 'right'}:
+        raise ValueError('完整任务必须明确双臂归位目标')
     phases = (approach, task, return_home)
     for phase in phases:
         if set(phase) != {'left', 'right'}:
@@ -131,7 +134,9 @@ def assemble_task_cycle(
             raise ValueError(side + '完整任务各阶段限位配置不一致')
         if first.goal != body.initial or body.goal != home.initial:
             raise ValueError(side + '完整任务阶段位置没有精确衔接')
-        if first.initial != home.goal:
+        expected_home = first.initial if return_targets is None else return_targets[side]
+        body.limits.check_positions(expected_home)
+        if expected_home != home.goal:
             raise ValueError(side + '归位目标不是本轮保存起点')
         lower = np.full(6, np.inf)
         upper = np.full(6, -np.inf)

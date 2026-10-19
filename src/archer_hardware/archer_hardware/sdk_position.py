@@ -30,7 +30,17 @@ def isolated_arm_class() -> Any:
             self._project_config_lock = RLock()
             self._project_position_ready = False
             self._project_config_loaded = False
+            self._project_position_error: Any = None
             super().__init__(*args, **kwargs)
+
+        def _construct_joint_command_msg(self, command: Any) -> Any:
+            """编码异常传给项目故障锁存，防止厂商循环仅写日志后继续重试."""
+            try:
+                return super()._construct_joint_command_msg(command)
+            except Exception as error:
+                if self._project_position_error is not None:
+                    self._project_position_error(str(error))
+                raise
 
         def reload_arm_config_from_dict(self, config_data: dict[str, Any]) -> bool:
             """配置仅进入当前实例；配置变化后必须重新提供实测起点."""

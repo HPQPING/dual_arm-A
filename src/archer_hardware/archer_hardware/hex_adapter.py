@@ -89,6 +89,13 @@ def managed_sdk_class(base: Any) -> Any:
             self._project_close_waiter = waiter
             self._HexDeviceApi__is_closing.set()
             try:
+                # 厂商 _stop_all_device_tasks 固定等0.1秒，仍会留下看门狗空窗。
+                # 先取消任务并立即关闭传输；最终循环清理负责等待取消完成。
+                tasks = getattr(self, '_device_tasks', {})
+                for future in list(tasks.values()):
+                    future.cancel()
+                tasks.clear()
+                await asyncio.sleep(0)
                 client = self._HexDeviceApi__kcp_client
                 if client is not None:
                     client.stop()
@@ -139,7 +146,7 @@ def managed_sdk_class(base: Any) -> Any:
                     loop.close()
 
         def close(self) -> None:
-            """回调线程内不阻塞自身；外部调用确认后台线程已退出."""
+            """直接关闭传输，不调用 SDK 的设备 stop 或隐式退出控制请求."""
             loop = getattr(self, '_HexDeviceApi__loop', None)
             worker = getattr(self, '_HexDeviceApi__loop_thread', None)
             if worker is threading.current_thread():
@@ -151,7 +158,14 @@ def managed_sdk_class(base: Any) -> Any:
                         lambda done: None if done.cancelled() else done.exception()
                     )
                 return
-            super().close()
+            if loop is not None and loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(
+                    self._HexDeviceApi__async_close(), loop,
+                )
+                try:
+                    future.result(timeout=3.0)
+                except Exception as error:
+                    self._project_close_error = f'{type(error).__name__}: {error}'
             if worker is not None:
                 worker.join(timeout=1.5)
                 if worker.is_alive():

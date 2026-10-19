@@ -152,7 +152,7 @@ class FeedbackTests(unittest.TestCase):
             start.assert_not_called()
         with patch.object(HexDeviceApi, 'close') as close:
             adapter.close()
-            close.assert_called_once()
+            close.assert_not_called()
         self.assertIsNone(adapter._api)
 
 
@@ -226,6 +226,19 @@ class ShutdownTests(unittest.TestCase):
         self.assertTrue(api._HexDeviceApi__loop.is_closed())
         self.assertFalse(asyncio.all_tasks(api._HexDeviceApi__loop))
         api.close()
+
+    def test_close_does_not_send_device_disable_or_wait_point_three(self):
+        """退出不调用厂商设备 stop，不保留导致看门狗空窗的固定等待."""
+        from unittest.mock import Mock
+
+        api, worker, finished, aborted = self.start_api()
+        device = SimpleNamespace(stop=Mock())
+        api._internal_device_list = [device]
+        api.close()
+        device.stop.assert_not_called()
+        self.assertTrue(finished.is_set())
+        self.assertFalse(aborted.is_set())
+        self.assertFalse(worker.is_alive())
 
     def test_callback_close_does_not_wait_on_own_thread(self):
         """模拟解析失败回调，关闭不在事件线程阻塞等待自己."""

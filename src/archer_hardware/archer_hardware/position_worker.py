@@ -331,6 +331,9 @@ class PositionWorker:
         backend = self._backend
         if backend is None or backend.state == 'DISCONNECTED':
             return
+        if backend.state == 'FAULT' and self._phase != 'FAILED':
+            self._fail(RuntimeError(backend.last_error or 'SDK 后台发送器报告故障'))
+            return
         terminal = backend.state in ('STOPPED', 'FAULT')
         try:
             frame = backend.read_feedback()

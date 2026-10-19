@@ -256,6 +256,39 @@ class TaskFileTests(unittest.TestCase):
         self.assertEqual(prepare_main(['--run-dir', str(self.root), '--limits-file',
                                       str(self.config), '--prepare']), 0)
 
+    def test_file_return_uses_saved_initial_after_recovery(self) -> None:
+        """当前保持位不同于初值时，归位仍返回初值；轻微超限只裁归位目标."""
+        from dataclasses import replace
+        from archer_hardware.task_file import load_reviewed_task
+
+        self.make_circle_record()
+        original = load_reviewed_task(self.root, self.config, self.root / 'prepared_path.json',
+                                      self.root / 'prepared_path_report.json', max_excursion=.05)
+        limits = {s: replace(p.limits, lower=(-.02,) * 6, feedback_tolerance=.005)
+                  for s, p in original.plans.items()}
+        reviewed = replace(original, plans={s: replace(p, limits=limits[s])
+                                            for s, p in original.plans.items()})
+        starts = {'left': (-.015,) * 6, 'right': (-.014,) * 6}
+        for saved in ({s: (-.018,) * 6 for s in starts},
+                      {s: (-.023,) * 6 for s in starts}):
+            with patch('archer_hardware.task_file.load_reviewed_task', return_value=reviewed), \
+                    patch('archer_hardware.task_geometry.check_task_geometry', return_value={
+                        'sampled_cross_arm_table_passed': True,
+                    }) as geometry:
+                result = prepare_file_task_message(self.file_request(), limits, .05,
+                                                   starts, Event(), saved_initial=saved)
+            assert result.continuous is not None and result.details is not None
+            self.assertEqual(result.details['saved_initial_positions'],
+                             {s: list(q) for s, q in saved.items()})
+            for side, plan in result.continuous.items():
+                self.assertEqual(plan.initial, starts[side])
+                self.assertEqual(plan.goal, limits[side].return_goal(saved[side]))
+                self.assertEqual(geometry.call_args.kwargs['return_home'][side].goal, plan.goal)
+                for expected, polynomial in zip(
+                    original.plans[side].polynomials, plan.polynomials[1:-1],
+                ):
+                    self.assertEqual(expected.tobytes(), polynomial.tobytes())
+
     def test_file_prepare_reads_once_and_preserves_checked_geometry(self) -> None:
         """使用真实文件核对与插值；几何替身只验证调用链，不宣称合成姿态无碰撞."""
         from archer_hardware.task_file import load_reviewed_task, read_snapshot
@@ -306,10 +339,10 @@ class TaskFileTests(unittest.TestCase):
         assert result.details is not None and result.continuous is not None
         self.assertEqual(result.details['actual_initial_positions'],
                          {s: list(q) for s, q in actual.items()})
-        self.assertEqual(result.details['return_reference'], 'held_command')
+        self.assertEqual(result.details['return_reference'], 'actual_feedback')
         for side, plan in result.continuous.items():
             self.assertEqual(plan.initial, hold[side])
-            self.assertEqual(plan.goal, hold[side])
+            self.assertEqual(plan.goal, actual[side])
             self.assertEqual(plan.joint_error_rad, .0001)
             for expected, poly in zip(original.plans[side].polynomials, plan.polynomials[1:-1]):
                 self.assertEqual(expected.tobytes(), poly.tobytes())
