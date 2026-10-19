@@ -86,6 +86,7 @@ class WorkerSnapshot:
     readiness_stage: str = ''
     trajectory_start_at: float | None = None
     trajectory_observed_start_at: float | None = None
+    commanded_positions: tuple[float, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -222,6 +223,7 @@ class PositionWorker:
             getattr(backend, 'readiness_stage', '') if backend else '',
             getattr(backend, 'trajectory_start_at', None) if backend else None,
             getattr(backend, 'trajectory_observed_start_at', None) if backend else None,
+            getattr(backend, 'commanded_positions', None) if state == 'HOLDING' else None,
         )
         with self._snapshot_lock:
             self._snapshot = snapshot

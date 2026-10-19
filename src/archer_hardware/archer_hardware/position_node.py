@@ -32,9 +32,9 @@ from .commissioning import review_joint_plan
 from .position_adapter import HexPositionAdapter
 from .position_plan import (
     JointPositionMove, JointPositionTrajectory, PairedTrajectoryStart, PositionLimits, positive,
-    ContinuousPositionTrajectory, prepare_continuous_pair,
+    ContinuousPositionTrajectory, prepare_continuous_pair, checked_joint_error,
 )
-from .position_worker import PositionBackend, PositionWorker
+from .position_worker import PositionBackend, PositionWorker, WorkerSnapshot
 
 
 class PreparationCancellation(Protocol):
@@ -126,7 +126,8 @@ def file_request_id(text: str) -> str:
 
 def prepare_file_task_message(
     text: str, limits: dict[str, PositionLimits], max_excursion: float,
-    start: dict[str, tuple[float, ...]], cancelled: PreparationCancellation,
+    start: dict[str, tuple[float, ...]], cancelled: PreparationCancellation, *,
+    hold_start: dict[str, tuple[float, ...]] | None = None, joint_error_rad: float = 0.,
 ) -> StagedPair:
     """在计算进程核对文件快照并生成已检完整路径，不读取SDK、不自行发送运动."""
     from .task_file import json_mapping, load_reviewed_task
@@ -161,20 +162,42 @@ def prepare_file_task_message(
         reviewed.plans[side].limits != limits[side] for side in ('left', 'right')
     ):
         raise ValueError('准备文件使用的限位与当前驱动限制不一致')
-    approach = prepare_approach(reviewed.plans, start, max_excursion=transition)
-    home = prepare_return(reviewed.plans, start, max_excursion=transition)
+    error = checked_joint_error(joint_error_rad, limits['left'].feedback_tolerance)
+    checked_joint_error(error, limits['right'].feedback_tolerance)
+    if set(start) != {'left', 'right'}:
+        raise ValueError('缺少双臂原始实际反馈')
+    anchor = start
+    if error:
+        if hold_start is None or set(hold_start) != {'left', 'right'}:
+            raise ValueError('非零误差保护需要当前保持指令目标')
+        anchor = hold_start
+    elif hold_start is not None:
+        raise ValueError('零误差模式禁止另行替换实际起点')
+    for side in ('left', 'right'):
+        actual = limits[side].check_positions(start[side])
+        held = limits[side].check_positions(anchor[side])
+        if max(abs(a - b) for a, b in zip(actual, held)) > error:
+            raise ValueError(side + '实际反馈超出保持指令的几何误差界限')
+    approach = prepare_approach(reviewed.plans, anchor, max_excursion=transition)
+    home = prepare_return(reviewed.plans, anchor, max_excursion=transition)
     cycle = assemble_task_cycle(reviewed.plans, approach=approach, return_home=home,
                                 max_excursion=max_excursion, cancelled=cancelled.is_set)
     geometry = check_task_geometry(reviewed.plans, approach=approach, return_home=home,
-                                   cancelled=cancelled.is_set)
+                                   cancelled=cancelled.is_set, joint_error_rad=error)
     if cancelled.is_set():
         raise ValueError('文件预检已取消，禁止返回可执行对象')
     if geometry.get('sampled_cross_arm_table_passed') is not True:
         raise ValueError('完整文件的离散几何检查没有返回通过结果')
+    if error and geometry.get('joint_error_rad') != error:
+        raise ValueError('几何报告没有核对相同的关节误差界限')
+    cycle = {side: replace(curve, joint_error_rad=error) for side, curve in cycle.items()}
     details = {
         'request_id': identifier, 'task_type': 'split_circle',
         'duration_s': cycle['left'].duration, 'sha256': dict(reviewed.report['sha256']),
         'initial_positions': {s: list(p.initial) for s, p in cycle.items()},
+        'actual_initial_positions': {s: list(p) for s, p in start.items()},
+        'return_reference': 'held_command' if error else 'actual_feedback',
+        'joint_error_rad': error,
         'phase_start_ns': {'APPROACH_FILE': 0, 'TASK': approach['left'].times_ns[-1],
                            'RETURN_ACTUAL': (approach['left'].times_ns[-1]
                                              + reviewed.plans['left'].times_ns[-1])},
@@ -200,6 +223,7 @@ class PositionControlNode(Node):
             'allow_paired_trajectory': False,
             'allow_continuous_trajectory': False,
             'allow_task_file_trajectory': False,
+            'task_joint_error_rad': 0.,
             'left_url': 'ws://192.168.1.100:8439',
             'right_url': 'ws://192.168.1.100:9439',
             'left_limits_confirmed': False, 'right_limits_confirmed': False,
@@ -253,6 +277,12 @@ class PositionControlNode(Node):
         if allow_files and (not allow_continuous or not self.allow_paired_trajectory):
             raise ValueError('完整文件需同时明确允许成对轨迹和连续轨迹')
         self.allow_task_file_trajectory: bool = allow_files
+        self.task_joint_error_rad = checked_joint_error(
+            self.get_parameter('task_joint_error_rad').value,
+            feedback_tolerance,
+        )
+        if self.task_joint_error_rad and not allow_files:
+            raise ValueError('非零几何误差界限仅用于显式开放的文件任务')
         self._paired_details: dict[str, Any] = {}
         self._file_request_id = ''
         self._file_rejection: dict[str, str] = {}
@@ -499,11 +529,14 @@ class PositionControlNode(Node):
         except Exception as error:
             self.get_logger().error('后台取消信号未确认，结果仍已作废：' + str(error))
 
-    def _pair_feedback(self, *, coherent: bool = False) -> dict[str, JointFeedback]:
+    def _pair_feedback(
+        self, *, coherent: bool = False,
+        snapshots: dict[str, WorkerSnapshot] | None = None,
+    ) -> dict[str, JointFeedback]:
         """同时核对两侧新鲜静止反馈；不会主动连接或申请控制."""
         result = {}
         for side in self.sides:
-            snapshot = self.workers[side].snapshot()
+            snapshot = snapshots[side] if snapshots is not None else self.workers[side].snapshot()
             frame = snapshot.feedback
             if (snapshot.state != 'HOLDING' or frame is None
                     or not 0 <= (time.perf_counter_ns() - frame.source_ns) / 1e9 <= .1
@@ -517,14 +550,25 @@ class PositionControlNode(Node):
 
     def _check_pair_starts(self, plan: StagedPair) -> None:
         """后台完成后用最新反馈复核起点，不沿用提交时的旧反馈."""
-        for side, frame in self._pair_feedback(coherent=plan.details is not None).items():
+        snapshots = {side: self.workers[side].snapshot() for side in self.sides}
+        frames = self._pair_feedback(coherent=plan.details is not None, snapshots=snapshots)
+        for side, frame in frames.items():
             if plan.continuous is None:
                 JointPositionTrajectory.prepare(
                     plan.times_ns, plan.positions[side], self.limits[side], self.max_excursion,
                     actual_start=frame.positions,
                 )
             else:
-                # 此处只检查；执行线程仍须相对文件原起点独立对齐，避免累计放宽容差。
+                curve = plan.continuous[side]
+                if curve.joint_error_rad and (
+                    plan.details is None or curve.joint_error_rad != self.task_joint_error_rad
+                    or plan.details.get('joint_error_rad') != curve.joint_error_rad
+                    or plan.details.get('sampled_geometry', {}).get('joint_error_rad')
+                    != curve.joint_error_rad
+                    or snapshots[side].commanded_positions != curve.initial
+                ):
+                    raise ValueError('保持指令目标或几何误差证明不一致，必须重新预检')
+                # 这里只核对，设备线程还会独立校验且不改写受保护路径。
                 plan.continuous[side].aligned_start(
                     frame.positions, self.limits[side], self.max_excursion,
                 )
@@ -548,7 +592,20 @@ class PositionControlNode(Node):
                 raise ValueError('计划字符串无效或超过50Mi字符上限')
             if task_file and len(text) > 16384:
                 raise ValueError('文件定位请求超过16Ki字符上限')
-            frames = self._pair_feedback(coherent=task_file)
+            snapshots = {side: self.workers[side].snapshot() for side in self.sides}
+            frames = self._pair_feedback(coherent=task_file, snapshots=snapshots)
+            hold: dict[str, tuple[float, ...]] = {}
+            if task_file and self.task_joint_error_rad:
+                for side, frame in frames.items():
+                    target = snapshots[side].commanded_positions
+                    if target is None:
+                        raise ValueError(side + '没有可核对的保持指令目标')
+                    hold[side] = self.limits[side].check_positions(target)
+                    self.limits[side].check_positions(frame.positions)
+                    if max(abs(a - b) for a, b in zip(frame.positions, target)) > (
+                        self.task_joint_error_rad
+                    ):
+                        raise ValueError(side + '实际反馈超出保持目标的几何误差界限')
             self._targets.clear()
             self._paired_ids = {}
             self._paired_details = {}
@@ -566,6 +623,8 @@ class PositionControlNode(Node):
                     prepare_file_task_message, text, dict(self.limits), self.max_excursion,
                     {side: frame.positions for side, frame in frames.items()},
                     self._preparation_cancel,
+                    **({'hold_start': hold, 'joint_error_rad': self.task_joint_error_rad}
+                       if self.task_joint_error_rad else {}),
                 )
             else:
                 self._preparation = self._preparer.submit(
@@ -594,7 +653,9 @@ class PositionControlNode(Node):
                 if self._file_request_id and (
                     plan.details is None or plan.details.get('request_id') != self._file_request_id
                     or plan.continuous is None or set(plan.continuous) != {'left', 'right'}
-                    or any(not curve.preserve_path for curve in plan.continuous.values())
+                    or any(not curve.preserve_path
+                           or curve.joint_error_rad != self.task_joint_error_rad
+                           for curve in plan.continuous.values())
                 ):
                     raise ValueError('后台文件结果编号或路径保护标记不符，禁止暂存')
                 if plan.continuous is not None:
@@ -820,6 +881,7 @@ class PositionControlNode(Node):
                       'allowed': self.allow_paired_trajectory,
                       'continuous_allowed': self.allow_continuous_trajectory,
                       'task_files_allowed': self.allow_task_file_trajectory,
+                      'task_joint_error_rad': self.task_joint_error_rad,
                       'task_file': dict(self._paired_details),
                       'request_id': self._file_request_id,
                       'last_file_rejection': dict(self._file_rejection),

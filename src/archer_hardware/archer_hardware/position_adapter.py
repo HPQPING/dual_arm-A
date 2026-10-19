@@ -46,6 +46,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
             raise ValueError('readiness_timeout 不能超过 30 秒')
         self.readiness_stage = 'IDLE'
         self._calibration_sent = False
+        self._initialization_seen = False
         self._request_positions: tuple[float, ...] | None = None
         self.state = 'DISCONNECTED'
         self.last_error = ''
@@ -176,6 +177,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
                 kind == 'initialize' and self.state == 'REQUESTING'
                 or kind == 'calibrate' and self.state == 'REQUESTING'
                 and self.allow_api_calibration and self._calibration_sent
+                or kind == 'heartbeat' and self.state == 'REQUESTING'
                 or kind == 'position' and self.state in (
                     'HOLDING', 'ARMED', 'RUNNING',
                 )
@@ -183,7 +185,41 @@ class HexPositionAdapter(HexFeedbackAdapter):
             )
             if not permitted:
                 raise RuntimeError('当前状态不允许下发此类消息')
-            # 只由下面固定的官方构造器产生消息，不提供任意消息发送入口。
+            # 通信队列等待期间设备状态可能变化；下发前重新核对，不复用先前结论。
+            if kind == 'brake':
+                arm = self._arm()
+                with arm._status_lock:
+                    holder, mine = arm._session_holder, arm._my_session_id
+                if mine <= 0 or holder != mine:
+                    raise RuntimeError('下发制动前控制权已改变，不向其他会话发送')
+                # 制动用于故障处理，不因电机故障或calibrated失效而阻止尝试。
+            else:
+                owned, initialized, calibrated = self._health(
+                    require_calibrated=kind == 'position',
+                )
+                frame = self._feedback
+                if frame is None or not 0 <= (
+                    time.perf_counter_ns() - frame.source_ns
+                ) / 1e9 <= self.stale_timeout:
+                    raise RuntimeError('下发前缺少新鲜关节反馈，消息作废')
+                self.limits.check_feedback(frame.positions)
+                if kind == 'position':
+                    if not owned or not initialized:
+                        raise RuntimeError('下发位置前控制权或初始化状态已改变')
+                    if self._nominal_required:
+                        self.limits.check_positions(frame.positions)
+                elif kind == 'calibrate' and (not owned or calibrated):
+                    raise RuntimeError('下发校准前控制权或校准状态已改变')
+                elif kind == 'heartbeat':
+                    if not owned:
+                        raise RuntimeError('会话心跳不能在失去控制权后继续发送')
+                    command = message.arm_command.arm_exclusive_command
+                    control = command.arm_api_control_command
+                    if (command.WhichOneof('exclusive_command') != 'arm_api_control_command'
+                            or {f.name for f, _ in control.ListFields()} != {'motor_targets'}
+                            or len(control.motor_targets.targets) != 0):
+                        raise RuntimeError('会话心跳必须只有空电机目标，禁止任何运动模式')
+            # 只由固定的官方构造器产生消息，不提供任意消息发送入口。
             await self._base._send_down_message(api, message)
 
         loop = api._HexDeviceApi__loop
@@ -208,6 +244,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
         self.state = 'REQUESTING'
         self.readiness_stage = 'WAITING_SESSION'
         self._calibration_sent = False
+        self._initialization_seen = False
         self._request_positions = frame.positions
         self._requested_at = time.monotonic()
         try:
@@ -268,6 +305,11 @@ class HexPositionAdapter(HexFeedbackAdapter):
         self._nominal_required = True
         self.state = 'RUNNING'
 
+    @property
+    def commanded_positions(self) -> tuple[float, ...] | None:
+        """只在保持状态公开已发送目标，不能用最新反馈冒充指令锚点."""
+        return self._target if self.state == 'HOLDING' else None
+
     def arm_continuous(
         self, plan: ContinuousPositionTrajectory, side: str, gate: PairedTrajectoryStart,
     ) -> None:
@@ -276,8 +318,10 @@ class HexPositionAdapter(HexFeedbackAdapter):
             raise ValueError('连续轨迹侧别错误或共同启动已取消')
         frame = self._trajectory_feedback()
         move = plan.aligned_start(frame.positions, self.limits, self.max_excursion)
+        if move.joint_error_rad and self._target != move.initial:
+            raise ValueError('保持指令目标与已检路径起点不同，必须重新预检')
         self._move = move
-        self._target = frame.positions
+        self._target = move.initial if move.joint_error_rad else frame.positions
         self._trajectory_gate = gate
         self._settled_since = None
         self._recovering_limits = False
@@ -334,15 +378,16 @@ class HexPositionAdapter(HexFeedbackAdapter):
                 frame.positions, self._request_positions,
             )) > 0.01:
                 raise RuntimeError('等待控制就绪期间关节漂移超过 0.01 rad')
-            if self._calibration_sent and (not owned or not initialized):
+            if self._calibration_sent and (
+                not owned or (self._initialization_seen and not initialized)
+            ):
                 raise RuntimeError('API 校准请求后控制会话或初始化状态丢失')
             if not owned:
                 self.readiness_stage = 'WAITING_SESSION'
                 return
-            if not initialized:
-                self.readiness_stage = 'WAITING_INITIALIZATION'
-                return
+            self._initialization_seen = self._initialization_seen or initialized
             if not calibrated:
+                sent_calibration_now = False
                 if not self.allow_api_calibration:
                     self.readiness_stage = 'CALIBRATION_PERMISSION_REQUIRED'
                 elif not self._calibration_sent:
@@ -350,6 +395,15 @@ class HexPositionAdapter(HexFeedbackAdapter):
                     self._calibration_sent = True
                     self.readiness_stage = 'WAITING_CALIBRATION'
                     self._send(self._arm()._construct_calibrate_message(), 'calibrate')
+                    sent_calibration_now = True
+                else:
+                    self.readiness_stage = 'WAITING_CALIBRATION'
+                if not sent_calibration_now:
+                    self._send(self._arm()._construct_empty_message(), 'heartbeat')
+                return
+            if not initialized:
+                self.readiness_stage = 'WAITING_INITIALIZATION'
+                self._send(self._arm()._construct_empty_message(), 'heartbeat')
                 return
             self.initial_positions = frame.positions
             self._target = frame.positions
@@ -369,7 +423,10 @@ class HexPositionAdapter(HexFeedbackAdapter):
             assert self._trajectory_gate is not None
             start = self._trajectory_gate.start_time()
             if (isinstance(self._move, ContinuousPositionTrajectory)
-                    and self._move.preserve_path and frame.positions != self._move.initial):
+                    and self._move.preserve_path
+                    and (self._target != self._move.initial or max(
+                        abs(a - b) for a, b in zip(frame.positions, self._move.initial)
+                    ) > self._move.joint_error_rad)):
                 raise RuntimeError('完整路径等待启动时起点变化，取消本次运行并重新预检')
             if (max(abs(v) for v in frame.velocities) > 0.02
                     or self._target is None or max(abs(a - b) for a, b in zip(
@@ -406,6 +463,11 @@ class HexPositionAdapter(HexFeedbackAdapter):
                 if self.state == 'RUNNING' and elapsed > self._move.duration + 2.0:
                     raise RuntimeError('目标位置未在允许时间内到位')
         assert self._target is not None
+        if (isinstance(self._move, ContinuousPositionTrajectory)
+                and self._move.joint_error_rad and max(
+                    abs(a - b) for a, b in zip(frame.positions, self._target)
+                ) > self._move.joint_error_rad):
+            raise RuntimeError('实际反馈超出完整路径几何误差界限，取消后续位置发送')
         if max(abs(a - b) for a, b in zip(frame.positions, self._target)) > (
             self.tracking_tolerance
         ):

@@ -52,6 +52,11 @@ class FakeBackend:
         self.block_connect.set()
         self.entered_connect = Event()
 
+    @property
+    def commanded_positions(self) -> tuple[float, ...] | None:
+        """替身保持目标独立于模拟传感器读数."""
+        return self.goal if self.state == 'HOLDING' else None
+
     def connect(self) -> None:
         """记录连接请求，必要时模拟阻塞初始化."""
         self.calls.append(('connect', ()))
@@ -284,6 +289,7 @@ class PositionNodeTests(unittest.TestCase):
         allow_paired_trajectory: bool = False,
         allow_continuous_trajectory: bool = False,
         allow_task_file_trajectory: bool = False,
+        task_joint_error_rad: float = 0.,
     ) -> PositionControlNode:
         """虚构测试限位只通过参数传入，不写入正式配置."""
         args = ['--ros-args', '-p',
@@ -291,6 +297,7 @@ class PositionNodeTests(unittest.TestCase):
                 f'allow_paired_trajectory:={str(allow_paired_trajectory).lower()}', '-p',
                 f'allow_continuous_trajectory:={str(allow_continuous_trajectory).lower()}', '-p',
                 f'allow_task_file_trajectory:={str(allow_task_file_trajectory).lower()}']
+        args.extend(['-p', f'task_joint_error_rad:={task_joint_error_rad}'])
         if configured:
             for side in ('left', 'right'):
                 args.extend(['-p', f'{side}_limits_confirmed:=true'])
@@ -987,10 +994,10 @@ class PositionNodeTests(unittest.TestCase):
             'duration_s': cycle['left'].duration,
         })
 
-    def file_node(self) -> PositionControlNode:
+    def file_node(self, error: float = 0.) -> PositionControlNode:
         """仅向替身节点显式开放全部开关，不修改正式默认值."""
         node = self.make_node(allow_paired_trajectory=True, allow_continuous_trajectory=True,
-                              allow_task_file_trajectory=True)
+                              allow_task_file_trajectory=True, task_joint_error_rad=error)
         self.enable_both(node)
         return node
 
@@ -999,6 +1006,53 @@ class PositionNodeTests(unittest.TestCase):
         message = String()
         message.data = json.dumps({'request_id': identifier})
         return message
+
+    def test_guarded_file_preparation_binds_raw_feedback_and_hold_target(self) -> None:
+        """真实ROS线程快照分别保存反馈和保持目标，预检结束再核对目标."""
+        node = self.file_node(.0001)
+        for side in node.sides:
+            self.backend(node, side).positions = (.10005,) * 6
+        self.wait_until(lambda: all(
+            (frame := node.workers[s].snapshot().feedback) is not None
+            and frame.positions == (.10005,) * 6 for s in node.sides
+        ))
+        captured = {}
+
+        def preflight(text, limits, excursion, starts, cancelled, **options):
+            captured.update(starts=starts, **options)
+            result = self.file_preflight(text, limits, excursion, options['hold_start'], cancelled)
+            assert result.continuous is not None and result.details is not None
+            return replace(result, continuous={
+                side: replace(p, joint_error_rad=options['joint_error_rad'])
+                for side, p in result.continuous.items()
+            }, details={**result.details, 'joint_error_rad': options['joint_error_rad'],
+                        'sampled_geometry': {'joint_error_rad': options['joint_error_rad']}})
+
+        with patch('archer_hardware.position_node.prepare_file_task_message',
+                   side_effect=preflight):
+            node._file_target_callback(self.file_message())
+            self.wait_until(lambda: node._paired_phase == 'STAGED')
+        self.assertEqual(captured['starts']['left'], (.10005,) * 6)
+        self.assertEqual(captured['hold_start']['left'], (.1,) * 6)
+        assert node._paired_target is not None and node._paired_target.continuous is not None
+        self.assertEqual(node._paired_target.continuous['left'].initial, (.1,) * 6)
+        self.backend(node, 'left').goal = (.10001,) * 6
+        self.wait_until(lambda: node.workers['left'].snapshot().commanded_positions
+                        == (.10001,) * 6)
+        node._file_execute_callback(String(data='a' * 32))
+        self.assertIn('保持指令目标', node._file_rejection['reason'])
+        self.assertFalse(node._paired_active)
+
+    def test_guarded_file_rejects_feedback_beyond_envelope_before_preflight(self) -> None:
+        """超差立即拒绝，不启动后台计算，不沿用旧暂存."""
+        node = self.file_node(.0001)
+        self.backend(node, 'left').positions = (.1002,) * 6
+        self.wait_until(lambda: (frame := node.workers['left'].snapshot().feedback) is not None
+                        and frame.positions == (.1002,) * 6)
+        with patch('archer_hardware.position_node.prepare_file_task_message') as prepare:
+            node._file_target_callback(self.file_message())
+            prepare.assert_not_called()
+        self.assertIn('几何误差界限', node._file_rejection['reason'])
 
     def test_file_entry_default_closed(self) -> None:
         """普通连续许可不能自动开放文件入口，也不会因文件消息自动使能."""

@@ -24,6 +24,10 @@ SDK_HASHES = {
         '2d4116fe6891d2f9551595bc4ed1976267dc48bdbeddeb724a934d625be327f8',
     'motor_base.py':
         'a23fe91324555c4d9c777db37391ecb5426c95ad947c1aa50ba4717943e977a3',
+    'arm_config.py':
+        'ce1dd4228c9ded01f80d91898516f77b8cee4929493dc415cdbc89523f60aa3a',
+    'device_factory.py':
+        '75ac688170a91fa7c9c811f46083fdc184470226c13220ed88ba6f1f0c80b36e',
 }
 
 

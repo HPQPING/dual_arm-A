@@ -214,6 +214,14 @@ class JointPositionTrajectory:
         return self.segments[index].sample(elapsed - self.times_ns[index] / 1e9)
 
 
+def checked_joint_error(value: object, feedback_tolerance: float) -> float:
+    """误差界限默认零，非零值不得超过1毫弧度和反馈读取容差."""
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or not 0. <= value <= min(.001, feedback_tolerance)):
+        raise ValueError('joint_error_rad需要有限非负数且不超过0.001及反馈容差')
+    return float(value)
+
+
 @dataclass(frozen=True)
 class ContinuousPositionTrajectory:
     """已完成段内解析检查的连续轨迹，发送循环仅查段并计算位置."""
@@ -225,6 +233,7 @@ class ContinuousPositionTrajectory:
     position_bounds: tuple[tuple[float, float], ...]
     limits: PositionLimits
     preserve_path: bool = False
+    joint_error_rad: float = 0.
 
     @property
     def duration(self) -> float:
@@ -297,7 +306,7 @@ class ContinuousPositionTrajectory:
         self, actual_start: Iterable[object], limits: PositionLimits,
         max_excursion: float, tolerance: float = .005,
     ) -> ContinuousPositionTrajectory:
-        """核对新鲜实际起点；容差内只重建首段，禁止改写其余路径与时间."""
+        """完整路径仅核对有界反馈且保留原多项式；普通路径沿用首段对齐."""
         import numpy as np
         from archer_control.continuous_trajectory import coefficients, evaluate
 
@@ -311,8 +320,13 @@ class ContinuousPositionTrajectory:
         if any(abs(q - first) > excursion + 1e-12
                for pair, first in zip(self.position_bounds, actual) for q in pair):
             raise ValueError('实际起点对齐后超出允许位移')
-        if self.preserve_path and actual != self.initial:
-            raise ValueError('已做几何预检的完整路径起点发生变化，需要重新规划和预检，禁止重建首段')
+        error = checked_joint_error(self.joint_error_rad, limits.feedback_tolerance)
+        if error and not self.preserve_path:
+            raise ValueError('关节误差保护只适用于已检完整路径')
+        if self.preserve_path:
+            if max(abs(a - b) for a, b in zip(actual, self.initial)) > error:
+                raise ValueError('已做几何预检的完整路径起点发生变化，需要重新规划和预检，禁止重建首段')
+            return self
         if actual == self.initial:
             return self
         duration = (self.times_ns[1] - self.times_ns[0]) / 1e9

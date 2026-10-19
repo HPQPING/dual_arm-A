@@ -400,6 +400,76 @@ class PositionAdapterTests(unittest.TestCase):
         self.assertEqual(self.adapter.state, 'FAULT')
         self.assertTrue(gate.cancelled)
 
+    def test_guarded_feedback_keeps_command_anchor_and_original_curve(self) -> None:
+        """原始反馈有微小偏差时，不把目标改成反馈，不重建多项式."""
+        self.adapter.limits = replace(self.adapter.limits, feedback_tolerance=.005)
+        plan = replace(self.continuous_plan()['left'], preserve_path=True, joint_error_rad=.0001)
+        self.acquire()
+        self.positions = (.00005,) * 6
+        self.assertEqual(self.adapter.commanded_positions, (0.,) * 6)
+        gate = PairedTrajectoryStart()
+        self.adapter.arm_continuous(plan, 'left', gate)
+        self.assertIs(self.adapter._move, plan)
+        self.assertEqual(self.adapter._target, (0.,) * 6)
+        self.adapter.tick()
+        self.assertEqual(self.adapter._target, (0.,) * 6)
+        self.assertIsNone(self.adapter.commanded_positions)
+        self.positions = (.000101,) * 6
+        with self.assertRaisesRegex(RuntimeError, '等待启动时起点变化'):
+            self.adapter.tick()
+        self.assertTrue(gate.cancelled)
+
+    def test_guarded_path_rejects_changed_command_even_when_feedback_matches(self) -> None:
+        """反馈看似符合不能掩盖保持目标已被其他动作更改."""
+        self.adapter.limits = replace(self.adapter.limits, feedback_tolerance=.005)
+        plan = replace(self.continuous_plan()['left'], preserve_path=True, joint_error_rad=.0001)
+        self.acquire()
+        self.adapter._target = (.00005,) * 6
+        with self.assertRaisesRegex(ValueError, '保持指令目标'):
+            self.adapter.arm_continuous(plan, 'left', PairedTrajectoryStart())
+
+    def test_guarded_curve_error_validation_and_nominal_limits(self) -> None:
+        """不允许伪造宽容差、非有限数或用读取容差放宽正式限位."""
+        self.adapter.limits = replace(self.adapter.limits, feedback_tolerance=.005)
+        plan = self.continuous_plan()['left']
+        guarded = replace(plan, preserve_path=True, joint_error_rad=.0001)
+        self.assertIs(guarded.aligned_start((.00005,) * 6, plan.limits, .05), guarded)
+        for error in (-.0001, .00101, float('nan'), float('inf'), True):
+            with self.subTest(error=error), self.assertRaises(ValueError):
+                replace(guarded, joint_error_rad=error).aligned_start(
+                    plan.initial, plan.limits, .05,
+                )
+        with self.assertRaisesRegex(ValueError, '已检完整路径'):
+            replace(plan, joint_error_rad=.0001).aligned_start(plan.initial, plan.limits, .05)
+        with self.assertRaises(ValueError):
+            guarded.aligned_start((2.00001,) * 6, plan.limits, .05)
+
+    def test_guarded_running_error_cancels_before_next_position_command(self) -> None:
+        """执行中不能只用旧的宽跟随容差冒充几何误差界限."""
+        self.adapter.limits = replace(self.adapter.limits, feedback_tolerance=.005)
+        plan = replace(self.continuous_plan()['left'], preserve_path=True, joint_error_rad=.0001)
+        self.acquire()
+        with patch('archer_hardware.position_adapter.time.monotonic') as clock:
+            clock.return_value = 100.
+            self.adapter._last_tick = 100.
+            gate = PairedTrajectoryStart()
+            self.adapter.arm_continuous(plan, 'left', gate)
+            gate.ready('right')
+            start = gate.start_time()
+            assert start is not None
+            for step in range(1, 61):
+                clock.return_value = 100. + step * .005
+                self.positions = plan.sample(max(0., clock.return_value - start))
+                self.adapter.tick()
+            self.assertEqual(self.adapter.state, 'RUNNING')
+            clock.return_value += .005
+            self.positions = tuple(q + .0002 for q in plan.sample(clock.return_value - start))
+            self.send.reset_mock()
+            with self.assertRaisesRegex(RuntimeError, '几何误差界限'):
+                self.adapter.tick()
+            self.assertFalse(any(call.args[1] == 'position' for call in self.send.call_args_list))
+            self.assertTrue(gate.cancelled)
+
     def test_continuous_cycle_shared_start_and_home_hold(self) -> None:
         """连续轨迹按共同时刻启动，返回记录起点并保持，仅发送位置模式字段."""
         plan = self.continuous_plan()['left']
@@ -515,13 +585,14 @@ class PositionAdapterTests(unittest.TestCase):
         for _ in range(3):
             self.assertEqual(self.adapter.tick(), 'REQUESTING')
         self.assertIsNone(self.adapter.initial_positions)
-        self.assertEqual([c.args[1] for c in self.send.call_args_list], ['initialize'])
+        self.assertEqual([c.args[1] for c in self.send.call_args_list],
+                         ['initialize'] + ['heartbeat'] * 3)
         self.arm._calibrated = True
         self.positions = (0.002,) * 6
         self.assertEqual(self.adapter.tick(), 'HOLDING')
         self.assertEqual(self.adapter.initial_positions, self.positions)
         self.assertEqual([c.args[1] for c in self.send.call_args_list],
-                         ['initialize', 'position'])
+                         ['initialize'] + ['heartbeat'] * 3 + ['position'])
 
     def test_calibrated_does_not_replace_initialization(self) -> None:
         """校准状态已就绪仍须等会话和API确认，不能提前发送位置."""
@@ -530,7 +601,8 @@ class PositionAdapterTests(unittest.TestCase):
         self.assertEqual(self.adapter.tick(), 'REQUESTING')
         self.assertIsNone(self.adapter.initial_positions)
         self.assertEqual(self.adapter.state, 'REQUESTING')
-        self.assertEqual([c.args[1] for c in self.send.call_args_list], ['initialize'])
+        self.assertEqual([c.args[1] for c in self.send.call_args_list],
+                         ['initialize', 'heartbeat'])
 
     def test_calibration_wait_timeout_reports_reason(self) -> None:
         """等待校准状态超时明确说明原因，不发送位置或自动校准."""
@@ -555,8 +627,8 @@ class PositionAdapterTests(unittest.TestCase):
         self.assertEqual(self.adapter.state, 'FAULT')
         self.assertEqual([c.args[1] for c in self.send.call_args_list], ['brake'])
 
-    def test_one_calibration_only_after_session_and_initialization(self) -> None:
-        """显式允许后，先确认控制会话和初始化，校准只发一次且等待真实确认."""
+    def test_one_calibration_after_session_without_initialization_deadlock(self) -> None:
+        """显式允许且取得控制会话后校准一次，不以初始化未完成阻塞校准."""
         self.adapter.allow_api_calibration = True
         self.arm._calibrated = False
         self.adapter.request_control()
@@ -564,10 +636,9 @@ class PositionAdapterTests(unittest.TestCase):
         self.assertEqual(self.adapter.readiness_stage, 'WAITING_SESSION')
         self.arm._session_holder = 7
         self.adapter.tick()
-        self.assertEqual(self.adapter.readiness_stage, 'WAITING_INITIALIZATION')
-        self.assertEqual(self.send.call_count, 1)
-        self.arm._api_control_initialized = True
-        self.adapter.tick()
+        self.assertEqual(self.adapter.readiness_stage, 'WAITING_CALIBRATION')
+        self.assertFalse(self.arm._api_control_initialized)
+        self.assertEqual(self.send.call_count, 2)
         packet = self.send.call_args.args[0]
         exclusive = packet.arm_command.arm_exclusive_command
         self.assertEqual(exclusive.WhichOneof('exclusive_command'), 'calibrate')
@@ -576,12 +647,82 @@ class PositionAdapterTests(unittest.TestCase):
             self.adapter.tick()
         self.assertEqual(self.adapter.readiness_stage, 'WAITING_CALIBRATION')
         self.assertEqual([c.args[1] for c in self.send.call_args_list],
-                         ['initialize', 'calibrate'])
+                         ['initialize', 'calibrate'] + ['heartbeat'] * 5)
         self.assertIsNone(self.adapter.initial_positions)
         self.arm._calibrated = True
         self.adapter.tick()
+        self.assertEqual(self.adapter.readiness_stage, 'WAITING_INITIALIZATION')
+        self.assertEqual(self.send.call_count, 8)
+        self.assertIsNone(self.adapter.initial_positions)
+        self.positions = (.00005,) * 6
+        self.arm._api_control_initialized = True
+        self.adapter.tick()
         self.assertEqual(self.adapter.readiness_stage, 'READY')
+        self.assertEqual(self.adapter.initial_positions, self.positions)
+        self.assertEqual(self.adapter.commanded_positions, self.positions)
         self.assertEqual(self.send.call_args.args[1], 'position')
+
+    def test_uncalibrated_without_initialization_still_requires_permission(self) -> None:
+        """状态顺序调整不能使默认配置自动发送校准或位置消息."""
+        self.arm._calibrated = False
+        self.adapter.request_control()
+        self.arm._session_holder = 7
+        for _ in range(3):
+            self.adapter.tick()
+        self.assertEqual(self.adapter.readiness_stage, 'CALIBRATION_PERMISSION_REQUIRED')
+        self.assertEqual([c.args[1] for c in self.send.call_args_list],
+                         ['initialize'] + ['heartbeat'] * 3)
+        self.assertIsNone(self.adapter.initial_positions)
+
+    def test_calibration_before_initialization_cannot_recover_lost_session(self) -> None:
+        """校准请求后会话丢失立即作废，不因迟到确认恢复."""
+        self.adapter.allow_api_calibration = True
+        self.arm._calibrated = False
+        self.adapter.request_control()
+        self.arm._session_holder = 7
+        self.adapter.tick()
+        self.arm._session_holder = 0
+        with self.assertRaisesRegex(RuntimeError, '校准请求后'):
+            self.adapter.tick()
+        self.arm._session_holder = 7
+        self.arm._calibrated = True
+        self.arm._api_control_initialized = True
+        count = self.send.call_count
+        self.adapter.tick()
+        self.assertEqual(self.send.call_count, count)
+        self.assertNotIn('position', [c.args[1] for c in self.send.call_args_list])
+
+    def test_calibration_before_initialization_timeout_is_not_retried(self) -> None:
+        """初始化和校准都未确认时，超时退出且校准不重发."""
+        self.adapter.allow_api_calibration = True
+        self.arm._calibrated = False
+        self.adapter.request_control()
+        self.arm._session_holder = 7
+        self.adapter.tick()
+        self.adapter._requested_at -= self.adapter.readiness_timeout + 1.
+        with self.assertRaisesRegex(RuntimeError, '就绪超时.*初始化.*calibrated=true'):
+            self.adapter.tick()
+        self.adapter.tick()
+        kinds = [c.args[1] for c in self.send.call_args_list]
+        self.assertEqual(kinds.count('calibrate'), 1)
+        self.assertNotIn('position', kinds)
+        self.assertEqual(self.adapter.state, 'FAULT')
+
+    def test_halt_before_initialization_blocks_late_ready_confirmation(self) -> None:
+        """尚未初始化时停止，后来的两个确认都不能触发位置保持."""
+        self.adapter.allow_api_calibration = True
+        self.arm._calibrated = False
+        self.adapter.request_control()
+        self.arm._session_holder = 7
+        self.adapter.tick()
+        self.adapter.stop()
+        count = self.send.call_count
+        self.arm._api_control_initialized = True
+        self.arm._calibrated = True
+        self.adapter.tick()
+        self.assertEqual(self.send.call_count, count)
+        self.assertEqual(self.adapter.state, 'STOPPED')
+        self.assertIsNone(self.adapter.initial_positions)
 
     def test_default_permission_never_sends_calibration(self) -> None:
         """默认等待明确标记需要允许校准，绝不默认为授权."""
@@ -591,7 +732,31 @@ class PositionAdapterTests(unittest.TestCase):
         self.arm._api_control_initialized = True
         self.adapter.tick()
         self.assertEqual(self.adapter.readiness_stage, 'CALIBRATION_PERMISSION_REQUIRED')
-        self.assertEqual([c.args[1] for c in self.send.call_args_list], ['initialize'])
+        self.assertEqual([c.args[1] for c in self.send.call_args_list],
+                         ['initialize', 'heartbeat'])
+
+    def test_waiting_heartbeat_contains_no_motor_targets_and_stops_on_halt(self) -> None:
+        """等待阶段持续空目标通信，不绕过校准许可，也不在停止后续发."""
+        self.arm._calibrated = False
+        self.adapter.request_control()
+        self.arm._session_holder = 7
+        self.arm._api_control_initialized = True
+        for _ in range(20):
+            self.adapter.tick()
+            message, kind = self.send.call_args.args
+            self.assertEqual(kind, 'heartbeat')
+            command = message.arm_command.arm_exclusive_command
+            self.assertEqual(command.WhichOneof('exclusive_command'), 'arm_api_control_command')
+            control = command.arm_api_control_command
+            self.assertEqual([f.name for f, _ in control.ListFields()], ['motor_targets'])
+            self.assertEqual(len(control.motor_targets.targets), 0)
+        self.assertEqual(self.adapter.state, 'REQUESTING')
+        self.assertFalse(self.adapter._calibration_sent)
+        self.adapter.stop()
+        count = self.send.call_count
+        self.adapter.tick()
+        self.assertEqual(self.send.call_count, count)
+        self.assertIsNone(self.adapter.initial_positions)
 
     def test_already_ready_skips_calibration_even_when_allowed(self) -> None:
         """设备已有校准确认时不重复校准."""
@@ -1016,6 +1181,9 @@ class PositionAdapterTests(unittest.TestCase):
                     self.adapter._send(object(), 'calibrate')
             self.adapter.allow_api_calibration = True
             self.adapter._calibration_sent = True
+            self.arm._session_holder = 7
+            self.arm._calibrated = False
+            self.adapter._feedback = self.frame()
             self.adapter._send(object(), 'calibrate')
             self.assertEqual(len(sent), 1)
             sent.clear()
@@ -1023,6 +1191,9 @@ class PositionAdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, '不允许'):
                 self.adapter._send(object(), 'calibrate')
             self.adapter.state = 'HOLDING'
+            self.arm._api_control_initialized = True
+            self.arm._calibrated = True
+            self.adapter._feedback = self.frame()
             packet = object()
             self.adapter._send(packet, 'position')
             self.assertEqual(sent, [packet])
@@ -1035,6 +1206,104 @@ class PositionAdapterTests(unittest.TestCase):
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2.0)
+            loop.close()
+
+    def test_dispatch_rechecks_device_after_queueing(self) -> None:
+        """实际执行发送协程，在入队时改变状态，验证不向传输替身交付旧请求."""
+        self.acquire()
+        self.sender.stop()
+        loop = asyncio.new_event_loop()
+        ready = Event()
+        loop.call_soon(ready.set)
+        thread = Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        self.assertTrue(ready.wait(timeout=2.))
+        sent = []
+
+        async def capture(api, message):
+            sent.append(message)
+
+        self.adapter._base = SimpleNamespace(_send_down_message=capture)
+        self.adapter._api._HexDeviceApi__loop = loop
+        submit = asyncio.run_coroutine_threadsafe
+
+        def reset():
+            self.arm._session_holder = 7
+            self.arm._api_control_initialized = True
+            self.arm._calibrated = True
+            self.arm._error_codes = [None] * 6
+            self.adapter.state = 'HOLDING'
+            self.adapter._feedback = self.frame()
+
+        def check_change(field, value, kind='position'):
+            reset()
+            if kind == 'calibrate':
+                self.adapter.state = 'REQUESTING'
+                self.adapter.allow_api_calibration = True
+                self.adapter._calibration_sent = True
+                self.arm._calibrated = False
+            elif kind == 'brake':
+                self.adapter.state = 'STOPPED'
+            elif kind in ('initialize', 'heartbeat'):
+                self.adapter.state = 'REQUESTING'
+
+            def enqueue(coroutine, target_loop):
+                if field == 'feedback':
+                    self.adapter._feedback = value
+                else:
+                    setattr(self.arm, field, value)
+                return submit(coroutine, target_loop)
+
+            with patch('asyncio.run_coroutine_threadsafe', side_effect=enqueue):
+                with self.assertRaises(RuntimeError):
+                    self.adapter._send(object(), kind)
+            self.assertEqual(sent, [])
+
+        try:
+            for field, value in (
+                ('_session_holder', 8), ('_api_control_initialized', False),
+                ('_calibrated', False), ('_error_codes', [None, 3, None, None, None, None]),
+                ('feedback', None),
+                ('feedback', JointFeedback((0.,) * 6, (0.,) * 6, (0.,) * 6,
+                                           time.perf_counter_ns() - 1000000000)),
+            ):
+                with self.subTest(field=field):
+                    check_change(field, value)
+            check_change('_session_holder', 0, 'calibrate')
+            check_change('_calibrated', True, 'calibrate')
+            check_change('_session_holder', 8, 'brake')
+            check_change('_session_holder', 8, 'initialize')
+            check_change('_session_holder', 0, 'heartbeat')
+            check_change('feedback', None, 'initialize')
+            # 故障时本会话仍持有控制权，制动不要求校准、初始化或新鲜位置。
+            reset()
+            self.adapter.state = 'FAULT'
+            self.arm._error_codes = [3] * 6
+            self.arm._calibrated = False
+            self.arm._api_control_initialized = False
+            self.adapter._feedback = None
+            packet = object()
+            self.adapter._send(packet, 'brake')
+            self.assertEqual(sent, [packet])
+            # 尚未持有且未初始化/校准时，正常申请初始化仍然允许。
+            sent.clear()
+            reset()
+            self.adapter.state = 'REQUESTING'
+            self.arm._session_holder = 0
+            self.arm._calibrated = False
+            self.arm._api_control_initialized = False
+            self.adapter._send(packet, 'initialize')
+            self.assertEqual(sent, [packet])
+            sent.clear()
+            self.arm._session_holder = 7
+            heartbeat = self.arm._construct_empty_message()
+            self.adapter._send(heartbeat, 'heartbeat')
+            self.assertEqual(sent, [heartbeat])
+            with self.assertRaisesRegex(RuntimeError, '空电机目标'):
+                self.adapter._send(self.arm._construct_init_message(), 'heartbeat')
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2.)
             loop.close()
 
     def test_invalid_frequency_and_limit_isolation(self) -> None:
