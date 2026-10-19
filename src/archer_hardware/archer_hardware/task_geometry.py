@@ -1,4 +1,4 @@
-"""离线生成到文件起点的双臂接近段，并对连续插值做离散几何预检."""
+"""离线拼接接近、文件任务与归位轨迹，并对连续插值做离散几何预检."""
 
 from __future__ import annotations
 
@@ -89,6 +89,83 @@ def prepare_return(
              for side in ('left', 'right')}
     return _stationary_transition(task, {s: p.goal for s, p in task.items()}, goals,
                                   max_excursion=max_excursion, minimum_duration=minimum_duration)
+
+
+def assemble_task_cycle(
+    task: Mapping[str, ContinuousPositionTrajectory], *,
+    approach: Mapping[str, ContinuousPositionTrajectory],
+    return_home: Mapping[str, ContinuousPositionTrajectory], max_excursion: float,
+) -> dict[str, ContinuousPositionTrajectory]:
+    """只平移段时间并复制原多项式；离线结果不是运动许可，起点仍须实时核对."""
+    from archer_control.continuous_trajectory import evaluate
+
+    excursion = positive(max_excursion, 'cycle_max_excursion')
+    phases = (approach, task, return_home)
+    for phase in phases:
+        if set(phase) != {'left', 'right'}:
+            raise ValueError('完整任务的每一阶段必须包含双臂')
+        if phase['left'].times_ns != phase['right'].times_ns:
+            raise ValueError('完整任务的每一阶段必须共用双臂时间轴')
+        for plan in phase.values():
+            times = plan.times_ns
+            if (len(times) < 2 or any(type(t) is not int for t in times)
+                    or times[0] != 0 or any(b <= a for a, b in zip(times, times[1:]))
+                    or len(plan.polynomials) != len(times) - 1):
+                raise ValueError('完整任务存在无效时间轴或多项式数量')
+        _check_stationary_boundary(phase, last=False)
+        _check_stationary_boundary(phase, last=True)
+    times = [0]
+    for phase in phases:
+        offset = times[-1]
+        times.extend(offset + t for t in phase['left'].times_ns[1:])
+    if len(times) > 20000 or times[-1] > 3600 * 10 ** 9:
+        raise ValueError('完整任务超过20000个时间点或一小时，不允许截断执行')
+    result: dict[str, ContinuousPositionTrajectory] = {}
+    for side in ('left', 'right'):
+        first, body, home = (phase[side] for phase in phases)
+        if first.limits != body.limits or home.limits != body.limits:
+            raise ValueError(side + '完整任务各阶段限位配置不一致')
+        if first.goal != body.initial or body.goal != home.initial:
+            raise ValueError(side + '完整任务阶段位置没有精确衔接')
+        if first.initial != home.goal:
+            raise ValueError(side + '归位目标不是本轮保存起点')
+        lower = np.full(6, np.inf)
+        upper = np.full(6, -np.inf)
+        polynomials: list[NDArray[np.float64]] = []
+        previous: tuple[NDArray[np.float64], ...] | None = None
+        for phase in phases:
+            plan = phase[side]
+            for i, original in enumerate(plan.polynomials):
+                c = np.array(original, dtype=np.float64, copy=True)
+                if c.shape != (6, 6):
+                    raise ValueError(side + '完整任务多项式必须为六关节五次系数')
+                seconds = (plan.times_ns[i + 1] - plan.times_ns[i]) / 1e9
+                bounds = ContinuousPositionTrajectory._check_segment(c, seconds, body.limits)
+                start = tuple(evaluate(c, 0., seconds, order) for order in (0, 1, 2))
+                end = tuple(evaluate(c, 1., seconds, order) for order in (0, 1, 2))
+                if (i == 0 and not np.allclose(start[0], plan.initial, rtol=0., atol=1e-12)
+                        or i == len(plan.polynomials) - 1
+                        and not np.allclose(end[0], plan.goal, rtol=0., atol=1e-12)):
+                    raise ValueError(side + '阶段端点与实际多项式不一致')
+                if previous is not None and any(
+                    not np.allclose(a, b, rtol=0., atol=1e-10)
+                    for a, b in zip(previous, start)
+                ):
+                    raise ValueError(side + '完整任务位置、速度或加速度不连续')
+                previous = end
+                lower = np.minimum(lower, bounds[:, 0])
+                upper = np.maximum(upper, bounds[:, 1])
+                c.setflags(write=False)
+                polynomials.append(c)
+        initial = np.asarray(first.initial, dtype=np.float64)
+        if (np.any(np.abs(lower - initial) > excursion + 1e-12)
+                or np.any(np.abs(upper - initial) > excursion + 1e-12)):
+            raise ValueError(side + '完整任务相对本轮起点超过允许位移')
+        result[side] = ContinuousPositionTrajectory(
+            tuple(times), tuple(polynomials), first.initial, home.goal,
+            tuple((float(a), float(b)) for a, b in zip(lower, upper)), body.limits,
+        )
+    return result
 
 
 def geometry_schedule(

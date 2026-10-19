@@ -226,7 +226,9 @@ def main(args: list[str] | None = None) -> int:
                                       options.report_file, max_excursion=options.max_excursion)
         result = dict(reviewed.report)
         if options.geometry:
-            from .task_geometry import check_task_geometry, prepare_approach, prepare_return
+            from .task_geometry import (
+                assemble_task_cycle, check_task_geometry, prepare_approach, prepare_return,
+            )
 
             approach = None
             return_home = None
@@ -245,6 +247,24 @@ def main(args: list[str] | None = None) -> int:
                                            'approach_max_excursion'),
                     minimum_duration=options.min_approach_duration,
                 )
+                cycle = assemble_task_cycle(
+                    reviewed.plans, approach=approach, return_home=return_home,
+                    max_excursion=options.max_excursion,
+                )
+                result['assembled_cycle'] = {
+                    'duration_s': cycle['left'].duration,
+                    'time_points': len(cycle['left'].times_ns),
+                    'phase_start_ns': {
+                        'APPROACH_FILE': 0,
+                        'TASK': approach['left'].times_ns[-1],
+                        'RETURN_ACTUAL': (approach['left'].times_ns[-1]
+                                          + reviewed.plans['left'].times_ns[-1]),
+                    },
+                    'original_task_polynomials_preserved': True,
+                    'returns_to_provided_start': True,
+                    'live_feedback_verified': False,
+                    'execution_ready': False,
+                }
                 result['return_actual'] = {
                     'duration_s': return_home['left'].duration,
                     'goals': {side: list(p.goal) for side, p in return_home.items()},
