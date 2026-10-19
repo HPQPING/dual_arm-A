@@ -1,4 +1,4 @@
-"""加载 Archer-Y6 单臂模型到 MuJoCo，不访问实机。"""
+"""加载 Archer-Y6 单臂模型到 MuJoCo，不访问实机."""
 
 from __future__ import annotations
 
@@ -62,13 +62,17 @@ class MuJoCoInterface(Protocol):
     mjtObj: ObjectKinds
 
     def mj_saveLastXML(self, filename: str, model: ModelInterface) -> None: ...
+
     def mj_name2id(self, model: ModelInterface, kind: object, name: str) -> int: ...
+
     def mj_forward(self, model: ModelInterface, data: DataInterface) -> None: ...
+
     def mj_step(self, model: ModelInterface, data: DataInterface) -> None: ...
+
     def mj_resetData(self, model: ModelInterface, data: DataInterface) -> None: ...
 
 
-mujoco = cast(MuJoCoInterface, import_module('mujoco'))
+mujoco = cast(MuJoCoInterface, import_module("mujoco"))
 
 
 @dataclass
@@ -85,7 +89,7 @@ class LoadedArm:
 
 
 def _required_element(parent: ET.Element, tag: str) -> ET.Element:
-    """读取必要的 XML 元素，缺少时明确报错。"""
+    """读取必要的 XML 元素，缺少时明确报错."""
     element = parent.find(tag)
 
     if element is None:
@@ -95,14 +99,14 @@ def _required_element(parent: ET.Element, tag: str) -> ET.Element:
 
 
 def _package_share(name: str) -> Path:
-    """获取已安装 ROS 2 包的资源目录。"""
+    """获取已安装 ROS 2 包的资源目录."""
     from ament_index_python.packages import get_package_share_directory
 
     return Path(get_package_share_directory(name))
 
 
 def _resolve_mesh(filename: str, urdf_directory: Path) -> Path:
-    """将网格资源路径转换为实际文件路径。"""
+    """将网格资源路径转换为实际文件路径."""
     if filename.startswith("package://"):
         package, relative = filename[len("package://"):].split("/", 1)
         path = _package_share(package) / relative
@@ -136,7 +140,7 @@ def load_single_arm(
     enable_contacts: bool = True,
 ) -> LoadedArm:
     """
-    加载单臂，返回 MuJoCo 模型、状态和关节映射。
+    加载单臂，返回 MuJoCo 模型、状态和关节映射.
 
     side:
         left 或 right。
@@ -172,9 +176,7 @@ def load_single_arm(
     values = (timestep, position_kp, position_kv)
 
     if not all(isfinite(v) and v > 0 for v in values):
-        raise ValueError(
-            "Timestep and position gains must be finite and positive"
-        )
+        raise ValueError("Timestep and position gains must be finite and positive")
 
     vectors: dict[str, FloatArray] = {}
     for name, values in (
@@ -184,42 +186,30 @@ def load_single_arm(
     ):
         vector = np.asarray(values, dtype=np.float64)
         if vector.shape != (3,) or not np.all(np.isfinite(vector)):
-            raise ValueError(
-                f"{name} must contain three finite values"
-            )
+            raise ValueError(f"{name} must contain three finite values")
         vectors[name] = vector
 
     prefix = side + "_"
 
-    joint_names = tuple(
-        f"{prefix}joint_{i}" for i in range(1, 7)
-    )
+    joint_names = tuple(f"{prefix}joint_{i}" for i in range(1, 7))
 
-    with tempfile.TemporaryDirectory(
-        prefix="archer_mujoco_"
-    ) as directory:
+    with tempfile.TemporaryDirectory(prefix="archer_mujoco_") as directory:
 
         staging = Path(directory)
 
         # ---------- 读取或展开 URDF ----------
 
         if urdf_path is None:
-            source = (
-                _package_share("archer_description")
-                / "urdf"
-                / "single_arm.xacro"
-            )
+            source = _package_share("archer_description") / "urdf" / "single_arm.xacro"
 
             command = [
                 "xacro",
                 str(source),
                 f"side:={side}",
                 "show_tcp:=false",
-                "tcp_xyz:=" + " ".join(str(v) for v in vectors['tcp_xyz']),
-                "gripper_mount_xyz:="
-                + " ".join(str(v) for v in vectors['mount_xyz']),
-                "gripper_mount_rpy:="
-                + " ".join(str(v) for v in vectors['mount_rpy']),
+                "tcp_xyz:=" + " ".join(str(v) for v in vectors["tcp_xyz"]),
+                "gripper_mount_xyz:=" + " ".join(str(v) for v in vectors["mount_xyz"]),
+                "gripper_mount_rpy:=" + " ".join(str(v) for v in vectors["mount_rpy"]),
             ]
 
             try:
@@ -233,14 +223,11 @@ def load_single_arm(
 
             except FileNotFoundError as exc:
                 raise RuntimeError(
-                    "xacro was not found. "
-                    "Source /opt/ros/humble/setup.bash first."
+                    "xacro was not found. " "Source /opt/ros/humble/setup.bash first."
                 ) from exc
 
             except subprocess.CalledProcessError as exc:
-                raise RuntimeError(
-                    f"Xacro failed:\n{exc.stderr}"
-                ) from exc
+                raise RuntimeError(f"Xacro failed:\n{exc.stderr}") from exc
 
             root = ET.fromstring(result.stdout)
             urdf_directory = source.parent
@@ -252,14 +239,10 @@ def load_single_arm(
 
         # 移除显示球，保留 TCP 坐标系。
         # 后面使用 MuJoCo site 显示 TCP。
-        tcp_link = root.find(
-            f"link[@name='{prefix}tcp']"
-        )
+        tcp_link = root.find(f"link[@name='{prefix}tcp']")
 
         if tcp_link is None:
-            raise ValueError(
-                f"Missing TCP link: {prefix}tcp"
-            )
+            raise ValueError(f"Missing TCP link: {prefix}tcp")
 
         for visual in list(tcp_link.findall("visual")):
             tcp_link.remove(visual)
@@ -269,34 +252,23 @@ def load_single_arm(
         joint_limits: list[tuple[float, float]] = []
 
         for name in joint_names:
-            joint = root.find(
-                f"joint[@name='{name}']"
-            )
+            joint = root.find(f"joint[@name='{name}']")
 
             if joint is None or joint.get("type") != "revolute":
-                raise ValueError(
-                    f"Missing revolute joint: {name}"
-                )
+                raise ValueError(f"Missing revolute joint: {name}")
 
             limit = joint.find("limit")
 
             if limit is None:
-                raise ValueError(
-                    f"Missing joint limits: {name}"
-                )
+                raise ValueError(f"Missing joint limits: {name}")
 
             bounds = (
                 float(limit.attrib["lower"]),
                 float(limit.attrib["upper"]),
             )
 
-            if (
-                not all(isfinite(value) for value in bounds)
-                or bounds[0] >= bounds[1]
-            ):
-                raise ValueError(
-                    f"Invalid joint limits: {name}"
-                )
+            if not all(isfinite(value) for value in bounds) or bounds[0] >= bounds[1]:
+                raise ValueError(f"Invalid joint limits: {name}")
 
             joint_limits.append(bounds)
 
@@ -310,14 +282,9 @@ def load_single_arm(
                 urdf_directory,
             )
 
-            digest = hashlib.sha256(
-                str(path).encode("utf-8")
-            ).hexdigest()[:16]
+            digest = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:16]
 
-            target = (
-                staging
-                / f"mesh_{digest}{path.suffix.lower()}"
-            )
+            target = staging / f"mesh_{digest}{path.suffix.lower()}"
 
             if not target.exists():
                 shutil.copyfile(path, target)
@@ -353,9 +320,7 @@ def load_single_arm(
             xml_declaration=True,
         )
 
-        imported = mujoco.MjModel.from_xml_path(
-            str(prepared)
-        )
+        imported = mujoco.MjModel.from_xml_path(str(prepared))
 
         # ---------- 转为 MJCF 并加入仿真配置 ----------
 
@@ -418,14 +383,10 @@ def load_single_arm(
 
         # ---------- 添加 TCP site ----------
 
-        tcp_body = mjcf.find(
-            f".//body[@name='{prefix}tcp']"
-        )
+        tcp_body = mjcf.find(f".//body[@name='{prefix}tcp']")
 
         if tcp_body is None:
-            raise ValueError(
-                "TCP frame was lost during URDF conversion"
-            )
+            raise ValueError("TCP frame was lost during URDF conversion")
 
         ET.SubElement(
             tcp_body,
@@ -461,9 +422,7 @@ def load_single_arm(
                     "kp": str(position_kp),
                     "kv": str(position_kv),
                     "ctrllimited": "true",
-                    "ctrlrange": (
-                        f"{bounds[0]} {bounds[1]}"
-                    ),
+                    "ctrlrange": (f"{bounds[0]} {bounds[1]}"),
                 },
             )
 
@@ -475,9 +434,7 @@ def load_single_arm(
             xml_declaration=True,
         )
 
-        model = mujoco.MjModel.from_xml_path(
-            str(final_xml)
-        )
+        model = mujoco.MjModel.from_xml_path(str(final_xml))
 
     # 模型编译后，网格数据已在内存中，
     # 不再依赖上面的临时文件。
@@ -514,23 +471,11 @@ def load_single_arm(
         prefix + "tcp_site",
     )
 
-    if (
-        np.any(joint_ids < 0)
-        or np.any(actuator_ids < 0)
-        or tcp_id < 0
-    ):
-        raise ValueError(
-            "Incomplete joint, actuator or TCP mappings"
-        )
+    if np.any(joint_ids < 0) or np.any(actuator_ids < 0) or tcp_id < 0:
+        raise ValueError("Incomplete joint, actuator or TCP mappings")
 
-    if (
-        model.nq != 6
-        or model.nv != 6
-        or model.nu != 6
-    ):
-        raise ValueError(
-            "Expected exactly six arm joints and six actuators"
-        )
+    if model.nq != 6 or model.nv != 6 or model.nu != 6:
+        raise ValueError("Expected exactly six arm joints and six actuators")
 
     data = mujoco.MjData(model)
 
@@ -539,19 +484,12 @@ def load_single_arm(
     dof_indices = np.asarray(model.jnt_dofadr[joint_ids], dtype=np.intp).copy()
 
     # 仿真初始姿态，不向实机发送。
-    initial = np.array(
-        [0.0, -0.8, 1.6, -0.8, 0.0, 0.0], dtype=np.float64
-    )
+    initial = np.array([0.0, -0.8, 1.6, -0.8, 0.0, 0.0], dtype=np.float64)
 
     bounds = np.array(joint_limits, dtype=np.float64)
 
-    if (
-        np.any(initial < bounds[:, 0])
-        or np.any(initial > bounds[:, 1])
-    ):
-        raise ValueError(
-            "Simulation initial pose is outside the model limits"
-        )
+    if np.any(initial < bounds[:, 0]) or np.any(initial > bounds[:, 1]):
+        raise ValueError("Simulation initial pose is outside the model limits")
 
     data.qpos[qpos_indices] = initial
     data.ctrl[actuator_ids] = initial

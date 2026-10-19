@@ -11,16 +11,16 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 
 def opening_from_position(position: float) -> float:
-    """Simulation mapping: 0.0 -> 80 mm open; 5.65 -> zero gap."""
+    """将仿真夹爪参数映射为开口：0.0对应80mm，5.65对应零间隙."""
     if not math.isfinite(position) or not 0.0 <= position <= 5.65:
-        raise ValueError('Gripper position must be finite and between 0.0 and 5.65')
+        raise ValueError("Gripper position must be finite and between 0.0 and 5.65")
     return 0.080 * (1.0 - position / 5.65)
 
 
 def fingertip_coordinates(position: float, tcp_xyz: list[float]):
     """Fingertips symmetric about TCP, along the gripper local Y axis."""
     if len(tcp_xyz) != 3 or not all(math.isfinite(v) for v in tcp_xyz):
-        raise ValueError('tcp_xyz must contain three finite values')
+        raise ValueError("tcp_xyz must contain three finite values")
     half_gap = opening_from_position(position) / 2.0
     x, y, z = tcp_xyz
     return (x, y + half_gap, z), (x, y - half_gap, z)
@@ -28,21 +28,21 @@ def fingertip_coordinates(position: float, tcp_xyz: list[float]):
 
 class GripperMarkers(Node):
     def __init__(self):
-        super().__init__('gripper_markers')
-        self.declare_parameter('side', 'left')
-        self.declare_parameter('tcp_xyz', [0.0, 0.0, 0.147])
-        self.declare_parameter('initial_position', 0.0)
-        side = self.get_parameter('side').value
-        if not isinstance(side, str) or side not in ('left', 'right'):
-            raise ValueError('side must be left or right')
+        super().__init__("gripper_markers")
+        self.declare_parameter("side", "left")
+        self.declare_parameter("tcp_xyz", [0.0, 0.0, 0.147])
+        self.declare_parameter("initial_position", 0.0)
+        side = self.get_parameter("side").value
+        if not isinstance(side, str) or side not in ("left", "right"):
+            raise ValueError("side must be left or right")
         self.side = side
         # Generated ParameterValue arrays are iterable even when not Python lists.
-        self.tcp = list(self.get_parameter('tcp_xyz').get_parameter_value().double_array_value)
+        self.tcp = list(self.get_parameter("tcp_xyz").get_parameter_value().double_array_value)
         if len(self.tcp) != 3 or not all(math.isfinite(v) for v in self.tcp):
-            raise ValueError('tcp_xyz must contain three finite numbers')
-        initial = self.get_parameter('initial_position').value
+            raise ValueError("tcp_xyz must contain three finite numbers")
+        initial = self.get_parameter("initial_position").value
         if isinstance(initial, bool) or not isinstance(initial, (float, int)):
-            raise ValueError('initial_position must be a number')
+            raise ValueError("initial_position must be a number")
         self.position = float(initial)
         opening_from_position(self.position)
         qos = QoSProfile(
@@ -50,16 +50,16 @@ class GripperMarkers(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
-        base = '/' + self.side
-        self.marker_pub = self.create_publisher(MarkerArray, base + '/gripper_markers', qos)
-        self.position_pub = self.create_publisher(Float64, base + '/gripper_position', qos)
+        base = "/" + self.side
+        self.marker_pub = self.create_publisher(MarkerArray, base + "/gripper_markers", qos)
+        self.position_pub = self.create_publisher(Float64, base + "/gripper_position", qos)
         self.command_sub = self.create_subscription(
-            Float64, base + '/gripper_position_command', self.on_command, 10
+            Float64, base + "/gripper_position_command", self.on_command, 10
         )
         self.timer = self.create_timer(0.05, self.publish_markers)
         self.get_logger().info(
-            f'{self.side} coordinate gripper: 0.0=open, 5.65=closed. '
-            'Markers only; no hardware or grasp-contact simulation.'
+            f"{self.side} coordinate gripper: 0.0=open, 5.65=closed. "
+            "Markers only; no hardware or grasp-contact simulation."
         )
 
     def on_command(self, message: Float64):
@@ -74,14 +74,14 @@ class GripperMarkers(Node):
 
     def make_sphere(self, marker_id, xyz, color):
         marker = Marker()
-        marker.header.frame_id = self.side + '_gp80_base_link'
+        marker.header.frame_id = self.side + "_gp80_base_link"
         # These points are attached to a moving tool frame. A zero timestamp
         # requests its latest transform instead of a potentially unavailable
         # transform at this publisher's exact wall-clock time.
         marker.header.stamp.sec = 0
         marker.header.stamp.nanosec = 0
         marker.frame_locked = True
-        marker.ns = self.side + '_gripper_coordinates'
+        marker.ns = self.side + "_gripper_coordinates"
         marker.id = marker_id
         marker.type = Marker.SPHERE
         marker.action = Marker.ADD
@@ -127,5 +127,5 @@ def main(args=None):
             rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

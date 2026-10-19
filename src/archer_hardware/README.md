@@ -118,3 +118,28 @@ ros2 run archer_hardware hardware_operator task-review \
 结果仅打印至终端，不新增任务文件、不初始化ROS、不加载SDK或连接机械臂。通过时 `task_files_verified=true`，`execution_ready=false`。这不是文件签名或厂商认证：哈希只证明当前这些快照与准备报告一致，不能防止整套记录与报告被一起伪造。碰撞、工件真实性、实际起点和夹爪执行仍需后续验证。报告中的这些许可字段不作为本入口的信任依据。
 
 该入口没有播放动作，也没有自动接近、使能、归位或夹爪命令。后续执行必须使用已核对的同一份内存快照，不能检查后再次读取并发送一个可能已变化的路径文件。
+
+
+## 离线起点衔接与采样几何检查
+
+在 `task-review` 后增加 `--geometry`，使用同一次校验保留下来的只读轨迹对象进行几何检查，不重新打开候选路径文件。可选 `--start-file` 提供离线起点，并明确指定 `--approach-max-excursion`：
+
+```bash
+ros2 run archer_hardware hardware_operator task-review \
+  --run-dir /path/to/archer_results/日期_时间_任务名称 \
+  --limits-file ~/archer_ws/src/archer_hardware/config/position_control.yaml \
+  --prepared-file /path/to/prepared_path.json \
+  --report-file /path/to/prepared_path_report.json \
+  --max-excursion 6.3 --geometry \
+  --start-file /path/to/start.json --approach-max-excursion 0.05
+```
+
+起点文件仅包含 `left`、`right` 两个六维关节角数组，单位rad。离线文件不能冒充新鲜反馈；未来执行仍须重新读取并核对双臂实际反馈、状态和时间。略超名义限位的读数会拒绝，要求先走既有的独立限位恢复流程，不自动裁剪反馈。
+
+三段方案是：本轮起点→文件起点的接近、完整原文件、文件末点→本轮保存起点的归位。两个边界段都用零速零加速度五次插值，按更严格一侧的限速自动选择共同时间；文件主体不改写。这里只生成内存预检对象，没有播放命令，也没有新增独立归位结果文件。
+
+几何检查沿实际连续多项式采样，按解析速度峰值加密，相邻点最多0.1秒、单关节行程目标上限0.005rad；默认总预算100000点。预算不足直接拒绝，不降低精度或只检查前半段。检查当前安装模型下跨臂10mm和机器人与台面1mm间隙；台面Z=-0.01m，双基座X=±0.21m、yaw=90°，TCP使用当前工程候选值。模型检查GP80和法兰固定链，哈希记录加载后的几何与运动学数据。
+
+通过时 `sampled_geometry.sampled_cross_arm_table_passed=true`；`interval_collision_proven=false`，因为加密采样仍不是连续碰撞证明。自碰撞、工件、线缆、外部障碍与真实抓取接触没有纳入。总执行许可和实时起点验证保持false，不会据此连接、使能或下发动作。
+
+`--max-excursion 6.3` 仅是本例的离线全文件检查范围，正式驱动0.05rad小幅限制及默认关闭许可不变。接近和归位共用单独的0.05rad范围，不能拿全文件范围替代边界段保护。
