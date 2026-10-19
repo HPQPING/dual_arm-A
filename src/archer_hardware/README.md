@@ -75,7 +75,7 @@ ros2 run archer_hardware hardware_operator csv-import \
 
 成功后生成 `prepared_path.json` 和 `prepared_path_report.json`，不覆盖原CSV、摘要或之前的候选。也可以用 `--output`、`--report` 显式指定已存在目录中的新文件名。移除 `--prepare` 时继续沿用仅导入原采样的版本三行为。
 
-准备结果依然标记 `execution_ready=false`：它尚未通过实际起点和完整几何检查；参考夹爪事件不会作为真实夹爪指令执行。现有版本一执行器继续拒绝版本二文件，不会偷偷退回逐点停车方式。后续再接入连续执行器，连接机械臂前仍先由用户选择。
+准备结果依然标记 `execution_ready=false`：它尚未通过实际起点和完整几何检查；参考夹爪事件不会作为真实夹爪指令执行。现有版本一执行器继续拒绝版本二文件，不会偷偷退回逐点停车方式。连续执行通路需要显式许可，后续还需完整任务门禁和专用文件播放入口；连接机械臂前仍先由用户选择。
 
 ## 连续执行核心
 
@@ -96,3 +96,25 @@ ros2 run archer_hardware hardware_operator csv-import \
 后台任务最多一个，不排队积压。跨进程返回的数值数组会在暂存前重新冻结；取消信号独立传递，故障时先请求两臂执行线程停止，再通知计算进程退出。预检未完成时收到新消息会作废旧结果并拒绝新请求，等待后台退出后需重新提交。预检期间禁止单臂运动和提前开始；halt、显式断开、驱动退出均作废预检结果。耗时检查逐段响应取消，超出30秒即取消；迟到成功也不能重新暂存。
 
 状态话题提供VALIDATING、STAGED等阶段与preflight_busy。预检只检查关节约束，不代表任务几何与夹爪事件已通过；Linux线程及JSON解析也不构成硬实时停止保证。本轮只用替身驱动验证上述通路，没有连接机械臂。
+
+
+## 完整任务文件只读核对
+
+先使用已有 `csv-import --prepare` 生成连续候选，再使用 `task-review` 核对同一轮记录：
+
+```bash
+ros2 run archer_hardware hardware_operator task-review \
+  --run-dir /path/to/archer_results/日期_时间_任务名称 \
+  --limits-file ~/archer_ws/src/archer_hardware/config/position_control.yaml \
+  --prepared-file /path/to/prepared_path.json \
+  --report-file /path/to/prepared_path_report.json \
+  --max-excursion 0.05
+```
+
+`--max-excursion` 是本次离线检查的明确关节位移上限，单位 rad，不修改驱动配置。完整任务若超过0.05会被拒绝；只有明确评估后才能为离线检查选择其他值，不能据此推导已允许驱动发送大范围轨迹。
+
+入口只读取五种文件快照：CSV、成功摘要、限位配置、连续候选和准备报告。校验哈希对应、任务种类、原始实际角度逐点保留、统一时间伸长、两侧完整阶段及事件停顿，再复用连续多项式约束检查器验证全段角度、速度和加速度。仅接受画圆 `split_circle` 或完整圆柱抓取记录，不接受旧参考物协同示意。
+
+结果仅打印至终端，不新增任务文件、不初始化ROS、不加载SDK或连接机械臂。通过时 `task_files_verified=true`，`execution_ready=false`。这不是文件签名或厂商认证：哈希只证明当前这些快照与准备报告一致，不能防止整套记录与报告被一起伪造。碰撞、工件真实性、实际起点和夹爪执行仍需后续验证。报告中的这些许可字段不作为本入口的信任依据。
+
+该入口没有播放动作，也没有自动接近、使能、归位或夹爪命令。后续执行必须使用已核对的同一份内存快照，不能检查后再次读取并发送一个可能已变化的路径文件。

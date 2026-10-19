@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 import math
 from typing import cast
@@ -19,6 +20,16 @@ from archer_mujoco.dual_model_loader import LoadedDualArm, load_dual_arm
 from archer_mujoco.grasp_model_loader import GraspData, GraspModel, physics
 from archer_mujoco.grasp_scene import GraspConfig
 from archer_mujoco.model_loader import mujoco
+
+
+class PlanningCancelled(RuntimeError):
+    """仿真规划收到取消请求，不属于路径不可达。"""
+
+
+def check_planning_cancelled(cancelled: Callable[[], bool] | None) -> None:
+    """在有界计算步骤之间响应取消，禁止采纳未完成的规划。"""
+    if cancelled is not None and cancelled():
+        raise PlanningCancelled('抓取仿真规划已取消')
 
 
 @dataclass(frozen=True)
@@ -70,8 +81,10 @@ def check_runtime_paths(contact: LoadedDualArm, paths: tuple[tuple[str, DualArmP
 
 
 def prepare_simple_motion(model: DualArmKinematics, current: dict[str, FloatArray], config: GraspConfig,
-                          left_urdf: str | None = None, right_urdf: str | None = None) -> SimpleGraspMotion:
+                          left_urdf: str | None = None, right_urdf: str | None = None, *,
+                          cancelled: Callable[[], bool] | None = None) -> SimpleGraspMotion:
     """只规划和预检；不设置真实仿真起点，不使用接触力判定夹取。"""
+    check_planning_cancelled(cancelled)
     config.validate()
     starts = {side: validate_joints(current[side], arm.limits)
               for side, arm in (('left', model.left), ('right', model.right))}
@@ -91,6 +104,7 @@ def prepare_simple_motion(model: DualArmKinematics, current: dict[str, FloatArra
         generator = np.random.default_rng(random_seed)
         candidates: list[FloatArray] = []
         for index in range(25):
+            check_planning_cancelled(cancelled)
             guess = starts[side] if index == 0 else generator.uniform(arm.limits[:, 0], arm.limits[:, 1])
             result = arm.solve_ik(np.linalg.inv(base) @ targets[side], guess)
             if result.success:
@@ -104,6 +118,7 @@ def prepare_simple_motion(model: DualArmKinematics, current: dict[str, FloatArra
     pre = {side: targets[side].copy() for side in targets}
     for pose in pre.values():
         pose[1, 3] -= .01
+    check_planning_cancelled(cancelled)
     backward = model.plan_world_poses(seeds['left'], seeds['right'],
         [interpolate_pose(targets['left'], pre['left'], float(u)) for u in np.linspace(0., 1., 9)[1:]],
         [interpolate_pose(targets['right'], pre['right'], float(u)) for u in np.linspace(0., 1., 9)[1:]],
@@ -127,6 +142,7 @@ def prepare_simple_motion(model: DualArmKinematics, current: dict[str, FloatArra
     far = {side: pose.copy() for side, pose in zip(('left', 'right'), start_poses)}
     for side in far:
         far[side][1, 3] -= .05 if side == 'left' else .03
+    check_planning_cancelled(cancelled)
     outward = model.plan_world_poses(before['left'], before['right'],
         [interpolate_pose(start_poses[0], far['left'], float(u)) for u in np.linspace(0., 1., 13)[1:]],
         [interpolate_pose(start_poses[1], far['right'], float(u)) for u in np.linspace(0., 1., 13)[1:]],
@@ -147,12 +163,14 @@ def prepare_simple_motion(model: DualArmKinematics, current: dict[str, FloatArra
     poses = [corners[0]]
     for start, goal in zip(corners[:-1], corners[1:]):
         poses.extend(interpolate_pose(start, goal, float(u)) for u in np.linspace(0., 1., 17)[1:])
+    check_planning_cancelled(cancelled)
     cooperative = plan_cooperative(model, seeds['left'], seeds['right'], poses, grasps['left'], grasps['right'],
                                    minimum_duration=.25)
     cooperative = replace(cooperative, paired=zero_joint6(cooperative.paired))
     retreat_poses = {side: targets[side].copy() for side in targets}
     for side in retreat_poses:
         retreat_poses[side][1, 3] = far[side][1, 3]
+    check_planning_cancelled(cancelled)
     retreat = model.plan_world_poses(cooperative.paired.left.positions[-1], cooperative.paired.right.positions[-1],
         [interpolate_pose(targets['left'], retreat_poses['left'], float(u)) for u in np.linspace(0., 1., 17)[1:]],
         [interpolate_pose(targets['right'], retreat_poses['right'], float(u)) for u in np.linspace(0., 1., 17)[1:]],
@@ -165,6 +183,7 @@ def prepare_simple_motion(model: DualArmKinematics, current: dict[str, FloatArra
         [home_via['left'], starts['left']], [home_via['right'], starts['right']],
         left_limits=model.left.limits, right_limits=model.right.limits, minimum_duration=3.)
 
+    check_planning_cancelled(cancelled)
     contact = load_dual_arm(left_urdf, right_urdf, left_base_xyz=(-.21, 0., 0.), right_base_xyz=(.21, 0., 0.),
         left_base_rpy=(0., 0., np.pi / 2.), right_base_rpy=(0., 0., np.pi / 2.),
         tcp_xyz=(0., 0., .147021696), enable_contacts=True)
@@ -180,6 +199,7 @@ def prepare_simple_motion(model: DualArmKinematics, current: dict[str, FloatArra
         times = set(float(t) for t in paired.left.times)
         times.update(float(t) for t in np.linspace(0., paired.duration, math.ceil(paired.duration / .03) + 1))
         for elapsed in sorted(times):
+            check_planning_cancelled(cancelled)
             for side, plan in (('left', paired.left), ('right', paired.right)):
                 contact.data.qpos[contact.arms[side].qpos_indices] = sample_joint_plan(plan, elapsed)[0]
             mujoco.mj_forward(contact.model, contact.data)
@@ -196,6 +216,7 @@ def prepare_simple_motion(model: DualArmKinematics, current: dict[str, FloatArra
                     raise ValueError('简化协同插值位置误差超过 0.5 mm')
                 if max(errors['world_rotation_rad'], errors['relative_rotation_rad']) > .003:
                     raise ValueError('简化协同插值姿态误差超过 0.003 rad')
+    check_planning_cancelled(cancelled)
     for value in starts.values():
         value.setflags(write=False)
     return SimpleGraspMotion(starts, approach, cooperative, retreat, home, alignment, insertion, contact)

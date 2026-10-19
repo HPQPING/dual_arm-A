@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from dataclasses import replace
 import json
 import math
@@ -16,7 +17,7 @@ from .cooperative_planner import sample_object
 from .dual_grasp_scene import DualGraspDemo, sample_position_velocity
 from .dual_arm_trajectory import plan_paired_joints
 from .kinematics import ArmKinematics
-from .simple_grasp_planner import (SimpleGraspMotion, check_runtime_paths,
+from .simple_grasp_planner import (PlanningCancelled, SimpleGraspMotion, check_runtime_paths,
                                   joint6_zero_target, prepare_simple_motion)
 from .trajectory import FloatArray, joint_vector
 from archer_mujoco.grasp_model_loader import GraspModel, physics
@@ -85,7 +86,7 @@ class SimpleGraspDemo(DualGraspDemo):
         self.plane_alignment_errors: dict[str, dict[str, float]] = {}
         self.arrival_joint6: dict[str, dict[str, float]] = {}
 
-    def start(self) -> bool:
+    def start(self, *, cancelled: Callable[[], bool] | None = None) -> bool:
         if self.state != 'READY':
             return False
         try:
@@ -97,12 +98,16 @@ class SimpleGraspDemo(DualGraspDemo):
                 if float(np.max(np.abs(self.loaded.data.qpos[self.loaded.finger_positions[side]]))) > .001:
                     raise ValueError(side + ' 夹爪尚未完全张开')
             self.enter('PLANNING')
-            motion = prepare_simple_motion(self.kinematics, current, self.config, self.left_urdf, self.right_urdf)
+            motion = prepare_simple_motion(self.kinematics, current, self.config, self.left_urdf,
+                                           self.right_urdf, cancelled=cancelled)
             if any(np.max(np.abs(self.read_joints()[side] - q)) > .002 for side, q in current.items()):
                 raise ValueError('规划期间起点变化')
             self.motion = motion
             self.enter('SETTLE')
             return True
+        except PlanningCancelled:
+            self.fail('抓取仿真规划已取消')
+            return False
         except (ValueError, RuntimeError, OSError) as exc:
             self.fail('简化抓取规划失败：' + str(exc))
             return False

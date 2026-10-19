@@ -157,6 +157,9 @@ class OperatorClient(Node):
 def main(args: list[str] | None = None) -> int:
     """默认只看状态；异常时对已发出的活动请求尽力补发全局 halt."""
     arguments = list(sys.argv[1:] if args is None else args)
+    if arguments and arguments[0] == 'task-review':
+        from .task_file import main as task_review_main
+        return task_review_main(arguments[1:])
     if arguments and arguments[0] == 'csv-import':
         from .csv_import import main as csv_import_main
         return csv_import_main(arguments[1:])
@@ -174,15 +177,17 @@ def main(args: list[str] | None = None) -> int:
     )
     parser.add_argument(
         'command', choices=COMMANDS + (
-            'audit', 'trial', 'plan-check', 'plan-retime', 'csv-import',
+            'audit', 'trial', 'plan-check', 'plan-retime', 'csv-import', 'task-review',
         ),
         nargs='?', default='status',
     )
     parser.add_argument('--side', choices=['left', 'right'])
     parser.add_argument('--timeout', type=float, default=30.0)
     options = parser.parse_args(arguments)
-    if options.command in ('audit', 'trial', 'plan-check', 'plan-retime', 'csv-import'):
-        parser.error('audit/trial/plan-check/plan-retime/csv-import 子命令必须放在参数最前面')
+    if options.command in (
+        'audit', 'trial', 'plan-check', 'plan-retime', 'csv-import', 'task-review',
+    ):
+        parser.error('audit/trial/plan-check/plan-retime/csv-import/task-review 子命令必须放在参数最前面')
     positive(options.timeout, 'timeout')
     if options.command != 'status':
         request_path(options.command, options.side)

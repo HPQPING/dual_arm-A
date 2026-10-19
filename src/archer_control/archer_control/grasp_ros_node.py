@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import sys
+from threading import Event, Thread, enumerate as enumerate_threads
 from typing import cast
 
 import numpy as np
@@ -65,19 +66,26 @@ class GraspSimulationNode(Node):
         self.demo = SimpleGraspDemo()
         self.resources = ExitStack()
         self.viewer: Viewer | None = None
+        self.viewer_threads: tuple[Thread, ...] = ()
         if show_viewer:
             api = cast(ViewerAPI, import_module('mujoco.viewer'))
+            existing_threads = set(enumerate_threads())
             try:
                 self.viewer = self.resources.enter_context(api.launch_passive(
                     self.demo.loaded.model, self.demo.loaded.data, key_callback=lambda key: None))
+                # 此时尚未创建规划线程；保留本次同步启动查看器所创建的线程。
+                self.viewer_threads = tuple(t for t in enumerate_threads()
+                                            if t not in existing_threads)
                 with self.viewer.lock():
                     self.viewer.cam.lookat[:] = [0., .25, .3]
                     self.viewer.cam.distance = 1.7
                     self.viewer.cam.azimuth = 90.
                     self.viewer.cam.elevation = -15.
             except Exception:
-                self.resources.close()
+                self.close_viewer()
                 raise
+        self.closing = False
+        self.planning_cancel = Event()
         self.running = False
         self.stopped = False
         self.planning: Future[bool] | None = None
@@ -230,12 +238,13 @@ class GraspSimulationNode(Node):
     def prepare(self) -> bool:
         # 查看器和规划器共享模型，规划期间持锁且主线程不执行 sync。
         with self.viewer.lock() if self.viewer is not None else nullcontext():
-            return self.demo.start()
+            return self.demo.start(cancelled=self.planning_cancel.is_set)
 
     def on_start(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
         if self.planning is not None or self.stopped or self.demo.state != 'READY':
             response.success, response.message = False, '只允许从 READY 启动；停止或失败后请 reset'
             return response
+        self.planning_cancel.clear()
         self.recording_error = ''
         if self.recorder is not None:
             try:
@@ -271,10 +280,11 @@ class GraspSimulationNode(Node):
             response.success, response.message = False, '任务已结束；需要重新执行时请 reset'
             return response
         self.running, self.stopped = False, True
+        self.planning_cancel.set()
         if self.planning is None:
             self.demo.fail('用户停止：冻结仿真，必须重置后重新启动')
             self.publish_result()
-        response.success, response.message = True, '已禁止推进仿真；后台预检若未结束，将结束后丢弃结果'
+        response.success, response.message = True, '已冻结仿真并取消后台规划，未完成结果不会执行'
         self.publish_stage()
         return response
 
@@ -338,16 +348,28 @@ class GraspSimulationNode(Node):
         if self.viewer is not None:
             self.viewer.sync()
 
+    def close_viewer(self) -> None:
+        """先通知窗口退出，再等待渲染清理完成，避免 GLFW 与解释器退出竞争。"""
+        self.resources.close()
+        for thread in self.viewer_threads:
+            thread.join()
+        self.viewer_threads = ()
+        self.viewer = None
+
     def close(self) -> None:
+        if self.closing:
+            return
+        self.closing = True
         self.running = False
+        self.planning_cancel.set()
         self.timer.cancel()
-        # 等待后台只读规划结束后再销毁模型和 ROS 节点。
+        # 先取消，再等待当前有界计算退出，避免销毁仍被规划线程使用的模型。
         self.worker.shutdown(wait=True, cancel_futures=True)
         if self.recorder is not None and self.recorder.active:
             result = self.demo.summary()
             result.update({'state': 'INTERRUPTED', 'ros_stage': 'NODE_CLOSED'})
             self.finish_recording(result)
-        self.resources.close()
+        self.close_viewer()
 
 
 def main(args: list[str] | None = None) -> None:
