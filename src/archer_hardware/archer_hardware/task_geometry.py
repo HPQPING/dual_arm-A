@@ -5,12 +5,15 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping
 import hashlib
 import math
-from typing import Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import numpy as np
 from numpy.typing import NDArray
 
 from .position_plan import ContinuousPositionTrajectory, positive
+
+if TYPE_CHECKING:
+    from archer_mujoco.dual_model_loader import LoadedDualArm
 
 
 def _stationary_transition(
@@ -253,12 +256,95 @@ class GeometryAPI(Protocol):
     def mj_id2name(self, model: object, kind: object, index: int) -> str | None: ...
 
 
+class EnvelopeModel(GeometryModel, Protocol):
+    """只读取模型的包围球、关节与固定安装链，不修改限位或姿态."""
+
+    geom_rbound: NDArray[np.float64]
+    body_parentid: NDArray[np.int32]
+    body_pos: NDArray[np.float64]
+    jnt_pos: NDArray[np.float64]
+    jnt_type: NDArray[np.int32]
+    jnt_bodyid: NDArray[np.int32]
+    jnt_qposadr: NDArray[np.int32]
+
+
+def _joint_error(value: float) -> float:
+    """几何检查的明确误差上界，不是厂商精度或自动执行许可."""
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or not 0. <= value <= .001):
+        raise ValueError('关节误差上界必须在0到0.001rad之间')
+    return float(value)
+
+
+def joint_error_displacement_bounds(
+    loaded: LoadedDualArm, tolerance: float,
+) -> dict[str, float]:
+    """用转动半径的全局上界保守覆盖各侧任意碰撞外形点的位移，不采样猜测."""
+    from importlib import import_module
+
+    delta = _joint_error(tolerance)
+    geometry = cast(EnvelopeModel, loaded.model)
+    api = cast(GeometryAPI, import_module('mujoco'))
+    if set(loaded.arms) != {'left', 'right'}:
+        raise ValueError('误差包围检查需要两侧六轴机械臂')
+    result = {}
+    for side, arm in loaded.arms.items():
+        identifiers = []
+        for qpos in arm.qpos_indices:
+            matches = np.flatnonzero(geometry.jnt_qposadr == qpos)
+            if len(matches) != 1 or int(geometry.jnt_type[int(matches[0])]) != 3:
+                raise ValueError('误差包围仅支持已核对的单自由度转动关节')
+            identifiers.append(int(matches[0]))
+        if len(identifiers) != 6 or len(set(identifiers)) != 6:
+            raise ValueError('误差包围需要六个唯一关节')
+        radii = [0.] * 6
+        count = 0
+        for geom, body_value in enumerate(geometry.geom_bodyid):
+            body = int(body_value)
+            name = api.mj_id2name(loaded.model, api.mjtObj.mjOBJ_BODY, body) or ''
+            if not name.startswith(side + '_') or not (
+                geometry.geom_contype[geom] or geometry.geom_conaffinity[geom]
+            ):
+                continue
+            radius = float(geometry.geom_rbound[geom])
+            if not math.isfinite(radius) or radius <= 0.:
+                raise ValueError('模型碰撞几何包围球无效')
+            distance = float(np.linalg.norm(geometry.geom_pos[geom])) + radius
+            visited = set()
+            while body != 0:
+                if body in visited or not 0 < body < len(geometry.body_parentid):
+                    raise ValueError('模型父子链无效')
+                visited.add(body)
+                body_joints = np.flatnonzero(geometry.jnt_bodyid == body)
+                if len(body_joints) > 1:
+                    raise ValueError('误差包围不支持同一刚体上的多个活动关节')
+                for joint in body_joints:
+                    index = int(joint)
+                    if index not in identifiers:
+                        raise ValueError('碰撞链含未纳入误差上界的活动关节')
+                    lever = distance + float(np.linalg.norm(geometry.jnt_pos[index]))
+                    if not math.isfinite(lever):
+                        raise ValueError('模型运动学长度包含非有限值')
+                    slot = identifiers.index(index)
+                    radii[slot] = max(radii[slot], lever)
+                distance += float(np.linalg.norm(geometry.body_pos[body]))
+                body = int(geometry.body_parentid[body])
+            count += 1
+        if count == 0:
+            raise ValueError(side + '模型没有启用碰撞几何')
+        # 每个关节绕任意角度转动delta时，点的弦长不超过R*delta。
+        # 三角不等式及固定偏移长度之和给出与当前姿态无关的半径上界。
+        result[side] = sum(radii) * delta
+    return result
+
+
 def check_task_geometry(
     task: Mapping[str, ContinuousPositionTrajectory], *,
     approach: Mapping[str, ContinuousPositionTrajectory] | None = None,
     return_home: Mapping[str, ContinuousPositionTrajectory] | None = None,
     max_samples: int = 100000,
     cancelled: Callable[[], bool] | None = None,
+    joint_error_rad: float = 0.,
 ) -> dict[str, Any]:
     """用当前工程安装模型检查跨臂和台面；不含工件、自碰撞或线缆."""
     from importlib import import_module
@@ -267,6 +353,9 @@ def check_task_geometry(
     from archer_mujoco.dual_model_loader import load_dual_arm
     from archer_mujoco.model_loader import mujoco
 
+    error = _joint_error(joint_error_rad)
+    if any(error > p.limits.feedback_tolerance for p in task.values()):
+        raise ValueError('几何误差上界不能大于已配置的反馈读取容差')
     phases = ([('TASK', task)] if approach is None else
               [('APPROACH_FILE', approach), ('TASK', task)])
     if return_home is not None:
@@ -303,13 +392,23 @@ def check_task_geometry(
         raise ValueError('台面未启用碰撞检查')
     geometry.geom_pos[floor, 2] = -.01
     clearance = .01
-    geometry.geom_margin[:] = clearance + .001
+    displacement = joint_error_displacement_bounds(loaded, error) if error else {
+        'left': 0., 'right': 0.,
+    }
+    guarded_clearance = clearance + sum(displacement.values())
+    guarded_table = .001 + max(displacement.values())
+    geometry.geom_margin[:] = max(guarded_clearance, guarded_table) + .001
     for side, arm in loaded.arms.items():
         for _, plans in phases:
             bounds = np.asarray(plans[side].position_bounds)
-            if (np.any(bounds[:, 0] < arm.joint_limits[:, 0] - 1e-10)
-                    or np.any(bounds[:, 1] > arm.joint_limits[:, 1] + 1e-10)):
+            if (np.any(bounds[:, 0] - error < arm.joint_limits[:, 0] - 1e-10)
+                    or np.any(bounds[:, 1] + error > arm.joint_limits[:, 1] + 1e-10)):
                 raise ValueError(side + '路径超出当前几何模型的URDF限位')
+            if error and (
+                np.any(bounds[:, 0] - error < np.asarray(plans[side].limits.lower))
+                or np.any(bounds[:, 1] + error > np.asarray(plans[side].limits.upper))
+            ):
+                raise ValueError(side + '误差包围超出名义限位')
         active = [i for i, body in enumerate(geometry.geom_bodyid)
                   if (api.mj_id2name(loaded.model, api.mjtObj.mjOBJ_BODY, int(body))
                       or '').startswith(side + '_')
@@ -321,14 +420,14 @@ def check_task_geometry(
         for side, q in (('left', left), ('right', right)):
             loaded.data.qpos[loaded.arms[side].qpos_indices] = q
         mujoco.mj_forward(loaded.model, loaded.data)
-        problem = cross_arm_failure(loaded, clearance)
+        problem = cross_arm_failure(loaded, guarded_clearance)
         if problem:
-            return '跨臂间隙不足10mm：' + problem
+            return f'跨臂间隙不足{guarded_clearance * 1000:.3f}mm：' + problem
         data = cast(CollisionData, loaded.data)
         for i in range(data.ncon):
             contact = data.contact[i]
-            if floor in (contact.geom1, contact.geom2) and contact.dist < .001:
-                return '机器人与台面间隙不足1mm'
+            if floor in (contact.geom1, contact.geom2) and contact.dist < guarded_table:
+                return f'机器人与台面间隙不足{guarded_table * 1000:.3f}mm'
         return None
 
     measured = {}
@@ -353,4 +452,8 @@ def check_task_geometry(
             'cross_arm_clearance_m': clearance, 'table_clearance_m': .001,
             'table_z_m': -.01, 'interval_collision_proven': False,
             'self_collision_checked': False, 'object_collision_checked': False,
+            'joint_error_rad': error, 'displacement_bounds_m': displacement,
+            'checked_cross_arm_clearance_m': guarded_clearance,
+            'checked_table_clearance_m': guarded_table,
+            'execution_ready': False,
             'scope': '当前工程刚性GP80与双臂模型的离散跨臂和台面检查，不是连续碰撞证明'}

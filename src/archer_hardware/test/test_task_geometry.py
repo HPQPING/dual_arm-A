@@ -1,22 +1,118 @@
 """验证离线接近、连续路径加密采样及碰撞拒绝，不连接实机."""
 
+from __future__ import annotations
+
 from dataclasses import replace
 from contextlib import redirect_stdout
 import io
+from importlib import import_module
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
 import unittest
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 
 from archer_hardware.position_plan import ContinuousPositionTrajectory, PositionLimits
 from archer_hardware.task_geometry import (
     assemble_task_cycle, check_samples, check_task_geometry, geometry_schedule,
     prepare_approach, prepare_return,
+    joint_error_displacement_bounds,
 )
+
+if TYPE_CHECKING:
+    from archer_mujoco.dual_model_loader import LoadedDualArm
+
+
+def envelope_model() -> LoadedDualArm:
+    """构造两侧六转动关节与球形碰撞体，避免依赖设备或工程模型文件."""
+    mj = import_module('mujoco')
+    bodies = []
+    for side in ('left', 'right'):
+        chain = ''
+        for index in range(6):
+            chain += (f'<body name="{side}_{index}" pos="0 0 .1">'
+                      '<joint type="hinge" axis="0 0 1"/>'
+                      '<geom type="sphere" size=".03" pos=".05 0 .06" mass=".01"/>')
+        bodies.append(chain + '</body>' * 6)
+    model = mj.MjModel.from_xml_string(
+        '<mujoco><worldbody>' + ''.join(bodies) + '</worldbody></mujoco>')
+    return cast('LoadedDualArm', SimpleNamespace(
+        model=model, data=mj.MjData(model), arms={
+            'left': SimpleNamespace(qpos_indices=np.arange(6)),
+            'right': SimpleNamespace(qpos_indices=np.arange(6, 12)),
+        }))
+
+
+def test_error_displacement_bound_contains_perturbed_geometry():
+    """随机非零姿态与全关节误差下，碰撞球外形点位移不超过解析保守上界."""
+    mj = import_module('mujoco')
+    loaded = envelope_model()
+    bounds = joint_error_displacement_bounds(loaded, .0001)
+    model, data = cast(Any, loaded.model), cast(Any, loaded.data)
+    rng = np.random.default_rng(20261019)
+    offsets = np.concatenate((np.eye(3), -np.eye(3))) * .03
+    for _ in range(20):
+        original = rng.uniform(-2., 2., 12)
+        data.qpos[:] = original
+        mj.mj_forward(model, data)
+        before = np.asarray([data.geom_xpos[i] + offsets @ data.geom_xmat[i].reshape(3, 3).T
+                             for i in range(model.ngeom)])
+        data.qpos[:] = original + rng.uniform(-.0001, .0001, 12)
+        mj.mj_forward(model, data)
+        for i in range(model.ngeom):
+            after = data.geom_xpos[i] + offsets @ data.geom_xmat[i].reshape(3, 3).T
+            side = 'left' if i < 6 else 'right'
+            assert float(np.max(np.linalg.norm(after - before[i], axis=1))) <= bounds[side]
+
+
+def test_error_bound_scales_and_rejects_unsupported_input():
+    """误差增大会扩大包围，非法误差或非转动关节不返回通过结果."""
+    loaded = envelope_model()
+    assert joint_error_displacement_bounds(loaded, 0.) == {'left': 0., 'right': 0.}
+    small = joint_error_displacement_bounds(loaded, .0001)
+    large = joint_error_displacement_bounds(loaded, .0002)
+    assert all(large[s] == 2 * small[s] > 0. for s in small)
+    for value in (True, -.001, .002, float('nan')):
+        with pytest.raises(ValueError):
+            joint_error_displacement_bounds(loaded, value)
+    model = cast(Any, loaded.model)
+    model.jnt_type[0] = 2
+    with pytest.raises(ValueError, match='转动关节'):
+        joint_error_displacement_bounds(loaded, .0001)
+
+
+def test_invalid_collision_envelope_is_not_accepted():
+    """缺少启用的碰撞体或损坏包围球时不能返回位移上界."""
+    loaded = envelope_model()
+    model = cast(Any, loaded.model)
+    model.geom_rbound[0] = float('nan')
+    with pytest.raises(ValueError, match='包围球'):
+        joint_error_displacement_bounds(loaded, .0001)
+    loaded = envelope_model()
+    model = cast(Any, loaded.model)
+    model.geom_contype[:] = 0
+    model.geom_conaffinity[:] = 0
+    with pytest.raises(ValueError, match='碰撞几何'):
+        joint_error_displacement_bounds(loaded, .0001)
+
+
+def test_unbounded_shape_and_multiple_joints_on_body_are_rejected():
+    """无有限包围球或复合刚体关节不能套用单轴链的半径公式."""
+    loaded = envelope_model()
+    model = cast(Any, loaded.model)
+    model.geom_rbound[0] = 0.
+    with pytest.raises(ValueError, match='包围球'):
+        joint_error_displacement_bounds(loaded, .0001)
+    loaded = envelope_model()
+    model = cast(Any, loaded.model)
+    model.jnt_bodyid[1] = model.jnt_bodyid[0]
+    with pytest.raises(ValueError, match='多个活动关节'):
+        joint_error_displacement_bounds(loaded, .0001)
 
 
 class TaskGeometryTests(unittest.TestCase):
