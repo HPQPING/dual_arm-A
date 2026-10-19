@@ -125,13 +125,13 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "show_viewer",
-                default_value="false",
+                default_value="true",
                 choices=["true", "false"],
                 description="是否显示 MuJoCo 窗口；true 需要 Ubuntu 桌面显示环境",
             ),
             DeclareLaunchArgument(
                 "show_rviz",
-                default_value="false",
+                default_value="true",
                 choices=["true", "false"],
                 description="是否同时启动双臂 TF、反馈汇总和抓取 RViz 界面",
             ),

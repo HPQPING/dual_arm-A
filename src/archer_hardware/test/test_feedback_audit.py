@@ -148,3 +148,78 @@ class FeedbackAuditTests(unittest.TestCase):
             if node is not None:
                 node.destroy_node()
             rclpy.shutdown()
+
+    def test_startup_candidates_preserve_raw_and_only_recover_outside_joint(self) -> None:
+        """原始越界初值不变，准备目标只收回越界关节，归位候选取名义边界."""
+        first = message(1.0)
+        first.position = [-1.001, .3] + [0.0] * 4
+        self.add(1.0, first)
+        last = message(1.1)
+        last.position = [-1.0011, .30001] + [0.0] * 4
+        self.add(1.1, last)
+        result = self.window.report(1.11, 2, .25, .02)
+        startup = result['startup_review']
+        self.assertTrue(result['passed'])
+        self.assertFalse(startup['execution_ready'])
+        self.assertTrue(startup['requires_nominal_recovery'])
+        self.assertEqual(result['initial_observed_rad'][0], -1.001)
+        self.assertEqual(result['latest_rad'][0], -1.0011)
+        self.assertEqual(startup['recovery_candidate_rad'], (-.995, .30001) + (0.,) * 4)
+        self.assertEqual(startup['saved_start_return_candidate_rad'], (-1., .3) + (0.,) * 4)
+
+    def test_bad_or_missing_feedback_has_no_startup_candidate(self) -> None:
+        """坏帧或缺反馈不能产生可被误用的准备位置."""
+        empty = self.window.report(1.0, 2, .25, .02)['startup_review']
+        self.assertIsNone(empty['recovery_candidate_rad'])
+        self.assertIsNone(empty['requires_nominal_recovery'])
+        self.add(1.0)
+        bad = message(1.1)
+        bad.position = [1.1] * 6
+        self.add(1.1, bad)
+        startup = self.window.report(1.11, 2, .25, .02)['startup_review']
+        self.assertIsNone(startup['recovery_candidate_rad'])
+        self.assertIsNone(startup['saved_start_return_candidate_rad'])
+        self.assertFalse(startup['execution_ready'])
+
+    def test_position_variation_preserves_small_changes(self) -> None:
+        """往返变化及微小抖动都保留，不以首尾相同冒充全程不变."""
+        for index, q in enumerate((0.0, 1e-7, -2e-7, 0.0)):
+            stamp = 1.0 + index * .1
+            packet = message(stamp)
+            packet.position = [q, .5] + [0.0] * 4
+            self.add(stamp, packet)
+        result = self.window.report(1.31, 4, .25, .02)
+        self.assertTrue(result['passed'])
+        self.assertFalse(result['positions_exactly_constant'])
+        self.assertEqual(result['position_change_counts'], (3, 0, 0, 0, 0, 0))
+        self.assertAlmostEqual(result['position_range_rad'][0], 3e-7)
+        self.assertAlmostEqual(result['max_adjacent_position_change_rad'][0], 3e-7)
+        self.assertEqual(result['minimum_observed_rad'][0], -2e-7)
+        self.assertEqual(result['initial_observed_rad'], result['latest_rad'])
+
+    def test_no_or_single_frame_is_not_constant_evidence(self) -> None:
+        """没有变化区间时输出未知，至少两帧才能报告逐位不变."""
+        for count in (0, 1, 2):
+            if count:
+                self.add(1.0 + count * .1)
+            result = self.window.report(1.21, 2, .25, .02)
+            if count < 2:
+                self.assertIsNone(result['positions_exactly_constant'])
+                self.assertIsNone(result['max_adjacent_position_change_rad'])
+            else:
+                self.assertTrue(result['positions_exactly_constant'])
+                self.assertEqual(result['position_range_rad'], (0.0,) * 6)
+
+    def test_bad_frames_do_not_pollute_position_statistics(self) -> None:
+        """坏帧不混入范围统计；超限但结构合法的真实读数仍留证且判失败."""
+        self.add(1.0)
+        packet = message(1.1)
+        packet.position = [float('nan')] * 6
+        self.add(1.1, packet)
+        packet = message(1.2)
+        packet.position = [1.03] + [0.0] * 5
+        self.add(1.2, packet)
+        result = self.window.report(1.21, 2, .25, .02)
+        self.assertFalse(result['passed'])
+        self.assertEqual(result['position_range_rad'][0], 1.03)
+        self.assertEqual(result['position_change_counts'][0], 1)

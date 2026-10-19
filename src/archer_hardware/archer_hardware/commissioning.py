@@ -40,6 +40,10 @@ class FeedbackWindow:
         self.overrun = [0.0] * 6
         self.initial: tuple[float, ...] | None = None
         self.latest: tuple[float, ...] | None = None
+        self.minimum: tuple[float, ...] | None = None
+        self.maximum: tuple[float, ...] | None = None
+        self.max_step = [0.0] * 6
+        self.changed_frames = [0] * 6
 
     def add(self, message: JointState, received: float, ros_now_ns: int) -> None:
         """无效帧计入失败，不能由后续正常帧清除历史错误."""
@@ -68,6 +72,14 @@ class FeedbackWindow:
             if self.initial is None:
                 self.initial = q
                 self.first_at = received
+            if self.latest is not None:
+                for i, (value, previous) in enumerate(zip(q, self.latest)):
+                    self.max_step[i] = max(self.max_step[i], abs(value - previous))
+                    self.changed_frames[i] += int(value != previous)
+            self.minimum = (q if self.minimum is None else
+                            tuple(min(a, b) for a, b in zip(q, self.minimum)))
+            self.maximum = (q if self.maximum is None else
+                            tuple(max(a, b) for a, b in zip(q, self.maximum)))
             self.latest = q
             self.last_at = received
             self.last_stamp = stamp
@@ -92,6 +104,14 @@ class FeedbackWindow:
         passed = (self.invalid == 0 and self.count >= minimum and tail is not None
                   and 0 <= tail <= gap and self.max_gap <= gap and self.max_speed <= speed
                   and span >= minimum_span)
+        ranges = (None if self.minimum is None or self.maximum is None else
+                  tuple(high - low for low, high in zip(self.minimum, self.maximum)))
+        recovery = None
+        return_target = None
+        if self.invalid == 0 and self.initial is not None and self.latest is not None:
+            # 只给出候选位置，不将读取通过解释成动作许可；不改写原始角度。
+            recovery = self.limits.recovery_goal(self.latest)
+            return_target = self.limits.return_goal(self.initial)
         return {
             'passed': passed, 'samples': self.count, 'invalid_frames': self.invalid,
             'structurally_valid_observations': self.observed,
@@ -100,6 +120,27 @@ class FeedbackWindow:
             'max_arrival_gap_s': self.max_gap, 'last_arrival_age_s': tail,
             'max_abs_velocity_rad_s': self.max_speed,
             'initial_observed_rad': self.initial, 'latest_rad': self.latest,
+            'minimum_observed_rad': self.minimum, 'maximum_observed_rad': self.maximum,
+            'position_range_rad': ranges,
+            'max_adjacent_position_change_rad': (
+                tuple(self.max_step) if self.observed > 1 else None
+            ),
+            'position_change_counts': tuple(self.changed_frames),
+            'positions_exactly_constant': (
+                all(value == 0.0 for value in ranges)
+                if ranges is not None and self.observed > 1 else None
+            ),
+            'position_statistics_scope': '结构与时间合法的原始反馈；不据此放宽起点或限位',
+            'startup_review': {
+                'execution_ready': False,
+                'requires_nominal_recovery': (
+                    not self.limits.within_nominal(self.latest)
+                    if self.latest is not None else None
+                ),
+                'recovery_candidate_rad': recovery,
+                'saved_start_return_candidate_rad': return_target,
+                'scope': '仅位置候选；仍须新鲜反馈、限速、位移、几何及控制状态检查',
+            },
             'max_nominal_limit_overrun_rad': self.overrun,
             'latest_within_nominal_limits': (
                 self.limits.within_nominal(self.latest) if self.latest is not None else None

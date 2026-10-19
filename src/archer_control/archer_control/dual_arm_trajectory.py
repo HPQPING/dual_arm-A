@@ -97,7 +97,7 @@ def export_paired_plan(plan: DualArmPlan, destination: str | Path) -> Path:
             or not np.all(np.isfinite(times))
             or not np.all(np.isfinite(positions))
             or times[0] != 0.0
-            or np.any(np.diff(times) <= 0.0)
+            or any(float(b) <= float(a) for a, b in zip(times, times[1:]))
             or times[-1] > 3600.0
         ):
             raise ValueError(f"{side} 计划必须包含从零开始的递增时间和有限六关节角，最长一小时")

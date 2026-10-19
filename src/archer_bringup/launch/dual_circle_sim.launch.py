@@ -1,4 +1,4 @@
-"""启动画圆仿真和可选只读记录节点；完整抓取使用独立启动文件."""
+"""启动画圆仿真、默认RViz显示和可选只读记录；抓取使用独立入口."""
 
 from __future__ import annotations
 
@@ -13,12 +13,14 @@ from launch.actions import (
     DeclareLaunchArgument,
     EmitEvent,
     ExecuteProcess,
+    IncludeLaunchDescription,
     LogInfo,
     OpaqueFunction,
     RegisterEventHandler,
 )
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 import yaml
 
@@ -97,6 +99,7 @@ def _start(context) -> list[Action]:
     python = Path(LaunchConfiguration("python_executable").perform(context)).expanduser()
     viewer = LaunchConfiguration("show_viewer").perform(context).lower()
     recording = LaunchConfiguration("record").perform(context).lower()
+    show_rviz = LaunchConfiguration("show_rviz").perform(context).lower()
     # 不展示任务选择；旧协同参数明确拒绝，不能被忽略后执行画圆。
     mode = context.launch_configurations.get("task_type", "split_circle")
     if mode != "split_circle":
@@ -109,6 +112,8 @@ def _start(context) -> list[Action]:
         raise ValueError("show_viewer 只能是 true 或 false")
     if recording not in ("true", "false"):
         raise ValueError("record 只能是 true 或 false")
+    if show_rviz not in ("true", "false"):
+        raise ValueError("show_rviz 只能是 true 或 false")
     record = recording == "true"
     validate_parameters(config, record=record)
     for package in ("archer_description", "archer_mujoco", "archer_control"):
@@ -191,6 +196,17 @@ def _start(context) -> list[Action]:
     else:
         actions.append(LogInfo(msg="本次不启动记录节点；可使用 record:=true 启用。"))
         actions.extend([scene, task])
+    if show_rviz == "true":
+        share = Path(get_package_share_directory("archer_bringup"))
+        actions.append(
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(str(share / "launch/dual_arm_view.launch.py")),
+                launch_arguments={
+                    "params_file": str(config),
+                    "rviz_config": str(share / "rviz/dual_arm.rviz"),
+                }.items(),
+            )
+        )
     return actions
 
 
@@ -210,6 +226,12 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="true",
                 choices=["true", "false"],
                 description="是否显示 MuJoCo 窗口",
+            ),
+            DeclareLaunchArgument(
+                "show_rviz",
+                default_value="true",
+                choices=["true", "false"],
+                description="是否同时启动公共双臂RViz显示、TF和反馈汇总",
             ),
             DeclareLaunchArgument(
                 "python_executable",

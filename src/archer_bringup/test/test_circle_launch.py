@@ -6,7 +6,7 @@ from pathlib import Path
 
 from launch import LaunchContext
 from launch.utilities import perform_substitutions
-from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription
 import pytest
 import yaml
 
@@ -34,6 +34,7 @@ def context(path: Path) -> LaunchContext:
             "show_viewer": "false",
             "python_executable": "/usr/bin/python3",
             "record": "true",
+            "show_rviz": "false",
         }
     )
     return value
@@ -95,3 +96,32 @@ def test_grasp_stays_a_separate_entry() -> None:
     names = {a.name for a in description.entities if isinstance(a, DeclareLaunchArgument)}
     assert "task_type" not in names
     assert "show_viewer" in names
+
+
+def test_both_tasks_default_to_shared_rviz() -> None:
+    """两个任务默认开启MuJoCo和公共RViz，画圆默认记录保持开启."""
+    for name in ('dual_circle_sim.launch.py', 'dual_grasp_sim.launch.py'):
+        description = load(name).generate_launch_description()
+        defaults = {}
+        for argument in description.entities:
+            if isinstance(argument, DeclareLaunchArgument):
+                value = argument.default_value
+                if value is not None:
+                    defaults[argument.name] = perform_substitutions(LaunchContext(), value)
+        assert defaults['show_rviz'] == 'true'
+        assert defaults['show_viewer'] == 'true'
+        if 'circle' in name:
+            assert defaults['record'] == 'true'
+    assert (ROOT / 'launch/dual_arm_view.launch.py').is_file()
+
+
+def test_circle_includes_shared_display_once_when_enabled() -> None:
+    """显示开关只增加一份公共显示组件，不增加场景、任务或记录进程."""
+    module = load('dual_circle_sim.launch.py')
+    ctx = context(ROOT / 'config/dual_circle.yaml')
+    disabled = module._start(ctx)
+    assert not any(isinstance(a, IncludeLaunchDescription) for a in disabled)
+    ctx.launch_configurations['show_rviz'] = 'true'
+    enabled = module._start(ctx)
+    assert len([a for a in enabled if isinstance(a, IncludeLaunchDescription)]) == 1
+    assert len([a for a in enabled if isinstance(a, ExecuteProcess)]) == 3
