@@ -53,6 +53,8 @@ class SdkCycleSender:
                 arm.motor_command(self.types.BRAKE, [True] * 6)
             elif kind == 'initialize':
                 arm.start()
+            elif kind == 'clear_api_timeout':
+                arm.clear_parking_stop()
             elif kind not in ('calibrate', 'heartbeat'):
                 raise ValueError('未知 SDK 周期请求')
             self.pending[kind] = PendingCommand(
@@ -84,12 +86,18 @@ class SdkCycleSender:
                 if fields != {'arm_command'}:
                     raise RuntimeError('SDK 周期产生了未授权的顶层命令')
                 outer = message.arm_command
-                if {f.name for f, _ in outer.ListFields()} != {'arm_exclusive_command'}:
-                    # 不允许厂商自动清错或自动恢复控制。
-                    return
+                outer_fields = {f.name for f, _ in outer.ListFields()}
                 command = outer.arm_exclusive_command
                 field = command.WhichOneof('exclusive_command')
-                if field == 'api_control_initialize':
+                if outer_fields == {'arm_shared_command'}:
+                    shared = outer.arm_shared_command
+                    if ({f.name for f, _ in shared.ListFields()} != {'clear_parking_stop'}
+                            or shared.clear_parking_stop is not True):
+                        return
+                    kind = 'clear_api_timeout'
+                elif outer_fields != {'arm_exclusive_command'}:
+                    return
+                elif field == 'api_control_initialize':
                     kind = 'initialize'
                     if command.api_control_initialize is not True:
                         return
@@ -136,7 +144,7 @@ class SdkCycleSender:
                     if kind == 'position':
                         positions = arm.get_last_positions()
                         self.last_position = tuple(positions) if positions is not None else None
-                    elif kind in ('initialize', 'calibrate'):
+                    elif kind in ('initialize', 'calibrate', 'clear_api_timeout'):
                         self.pending.pop(kind)
         except Exception as error:
             self.fail(str(error))

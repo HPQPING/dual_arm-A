@@ -24,8 +24,7 @@ class NativeCycleTests(unittest.TestCase):
     def setUp(self) -> None:
         self.sdk = import_module('hex_device.hex_device_api').HexDeviceApi
         self.limits = PositionLimits((-2.,) * 6, (2.,) * 6, (.1,) * 6, (.2,) * 6)
-        self.adapter = HexPositionAdapter('ws://127.0.0.1:8439', self.limits,
-                                          allow_api_calibration=True)
+        self.adapter = HexPositionAdapter('ws://127.0.0.1:8439', self.limits)
         arm_type = isolated_arm_class()
         with patch('archer_hardware.position_adapter.isolated_arm_class', return_value=arm_type):
             with patch.object(self.sdk, '__init__', return_value=None):
@@ -43,6 +42,7 @@ class NativeCycleTests(unittest.TestCase):
         self.api._optional_device_list = []
         self.api._device_id_map = {1: self.arm}
         self.sent: list[Any] = []
+        self.clear_ack = True
         self.feedback_patch = patch.object(HexFeedbackAdapter, 'read', side_effect=self.frame)
         self.feedback_patch.start()
         self.addCleanup(self.feedback_patch.stop)
@@ -56,6 +56,10 @@ class NativeCycleTests(unittest.TestCase):
         packet = type(message)()
         packet.CopyFrom(message)
         self.sent.append(packet)
+        if message.arm_command.HasField('arm_shared_command'):
+            if self.clear_ack:
+                self.arm._parking_stop_detail.Clear()
+            return
         command = message.arm_command.arm_exclusive_command
         field = command.WhichOneof('exclusive_command')
         if field == 'api_control_initialize':
@@ -89,6 +93,9 @@ class NativeCycleTests(unittest.TestCase):
         """将捕获的实际 protobuf 下行分类供断言使用."""
         result = []
         for packet in self.sent:
+            if packet.arm_command.HasField('arm_shared_command'):
+                result.append('clear_api_timeout')
+                continue
             command = packet.arm_command.arm_exclusive_command
             field = command.WhichOneof('exclusive_command')
             if field != 'arm_api_control_command':
@@ -97,6 +104,107 @@ class NativeCycleTests(unittest.TestCase):
                 targets = command.arm_api_control_command.motor_targets.targets
                 result.append('empty' if not targets else targets[0].ListFields()[0][0].name)
         return result
+
+    def set_api_timeout(self) -> None:
+        """模拟控制器保留的API超时停车，不发送任何真实控制命令."""
+        types = import_module('hex_device.generated.public_api_types_pb2')
+        self.arm._parking_stop_detail.CopyFrom(types.ParkingStopDetail(
+            reason='API communication timeout', is_remotely_clearable=True,
+            category=types.ParkingStopCategory.PscAPICommunicationTimeout,
+        ))
+
+    def test_official_startup_clears_once_then_prepares_and_holds(self) -> None:
+        """真实SDK周期执行单次指定清除、初始化、必要校准及位置保持."""
+        async def run() -> None:
+            self.set_api_timeout()
+            with patch.object(self.sdk, '_send_down_message', self.capture):
+                task = await self.acquire()
+                try:
+                    kinds = self.kinds()
+                    self.assertEqual(kinds.count('clear_api_timeout'), 1)
+                    self.assertEqual(kinds.count('api_control_initialize'), 1)
+                    self.assertEqual(kinds.count('calibrate'), 1)
+                    self.assertLess(kinds.index('clear_api_timeout'),
+                                    kinds.index('api_control_initialize'))
+                    self.assertLess(kinds.index('calibrate'), kinds.index('position'))
+                    self.assertEqual(self.adapter.initial_positions, (0.,) * 6)
+                finally:
+                    await self.finish(task)
+        asyncio.run(run())
+
+    def test_connect_alone_never_clears_existing_timeout(self) -> None:
+        """没有显式enable时，SDK自身的自动清除和重新初始化均不交付."""
+        async def run() -> None:
+            self.set_api_timeout()
+            with patch.object(self.sdk, '_send_down_message', self.capture):
+                task = asyncio.create_task(self.arm._periodic())
+                try:
+                    await asyncio.sleep(.025)
+                    self.assertEqual(self.sent, [])
+                    self.assertEqual(self.adapter.state, 'CONNECTED')
+                finally:
+                    await self.finish(task)
+        asyncio.run(run())
+
+    def test_clear_without_confirmation_times_out_without_retry(self) -> None:
+        """一次清除未获确认时只等待，超时不重发清除或申请控制."""
+        async def run() -> None:
+            self.set_api_timeout()
+            self.clear_ack = False
+            with patch.object(self.sdk, '_send_down_message', self.capture):
+                task = asyncio.create_task(self.arm._periodic())
+                try:
+                    self.adapter.request_control()
+                    for _ in range(8):
+                        await asyncio.sleep(.003)
+                        self.adapter.tick()
+                    self.assertEqual(self.kinds(), ['clear_api_timeout'])
+                    self.adapter._requested_at -= self.adapter.readiness_timeout + 1.
+                    with self.assertRaisesRegex(RuntimeError, '就绪超时'):
+                        self.adapter.tick()
+                    await asyncio.sleep(.012)
+                    self.assertEqual(self.kinds(), ['clear_api_timeout'])
+                    self.assertEqual(self.adapter.state, 'FAULT')
+                finally:
+                    await self.finish(task)
+        asyncio.run(run())
+
+    def test_running_timeout_cancels_pair_without_clear_or_reinitialization(self) -> None:
+        """已保持或运动时的新超时取消双方，SDK不能自行清除并复发旧目标."""
+        async def run() -> None:
+            with patch.object(self.sdk, '_send_down_message', self.capture):
+                task = await self.acquire()
+                try:
+                    gate = PairedTrajectoryStart()
+                    self.adapter._trajectory_gate = gate
+                    before = self.kinds().count('position')
+                    self.set_api_timeout()
+                    await asyncio.sleep(.02)
+                    self.assertEqual(self.adapter.state, 'FAULT')
+                    self.assertTrue(gate.cancelled)
+                    self.assertEqual(self.kinds().count('position'), before)
+                    self.assertEqual(self.kinds().count('api_control_initialize'), 1)
+                    self.assertNotIn('clear_api_timeout', self.kinds())
+                    self.assertIn('brake', self.kinds())
+                finally:
+                    await self.finish(task)
+        asyncio.run(run())
+
+    def test_halt_before_clear_delivery_discards_preparation(self) -> None:
+        """停止优先作废排队清除，随后SDK周期不能恢复初始化或运动."""
+        async def run() -> None:
+            self.set_api_timeout()
+            with patch.object(self.sdk, '_send_down_message', self.capture):
+                self.adapter.request_control()
+                self.adapter.stop(wait=False)
+                task = asyncio.create_task(self.arm._periodic())
+                try:
+                    await asyncio.sleep(.02)
+                    self.assertEqual(self.sent, [])
+                    self.assertEqual(self.adapter.state, 'STOPPED')
+                finally:
+                    await self.finish(task)
+        asyncio.run(run())
 
     def test_native_public_position_and_halt_no_more_positions(self) -> None:
         """准备和位置都由官方周期交付；停止后只允许制动，不再下发位置."""

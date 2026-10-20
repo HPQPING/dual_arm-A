@@ -229,7 +229,7 @@ class PositionControlNode(Node):
             'startup_timeout': 10.0, 'target_timeout': 5.0,
             'max_excursion': 0.05, 'tracking_tolerance': 0.10,
             'feedback_tolerance': 0.005,
-            'allow_api_calibration': False, 'readiness_timeout': 10.0,
+            'allow_api_calibration': True, 'readiness_timeout': 10.0,
             'allow_paired_trajectory': False,
             'allow_continuous_trajectory': False,
             'allow_task_file_trajectory': False,
@@ -910,6 +910,8 @@ class PositionControlNode(Node):
             states[side] = {
                 'state': snapshot.state, 'error': snapshot.error,
                 'feedback_fresh': fresh, 'initial_positions': snapshot.initial_positions,
+                'feedback_time_basis': 'local_monotonic_receive',
+                'sdk_feedback_stamp_ns': frame.sdk_source_ns if frame is not None else None,
                 'command_id': snapshot.command_id, 'command': snapshot.command,
                 'phase': snapshot.phase, 'message': snapshot.message,
                 'readiness_stage': snapshot.readiness_stage,

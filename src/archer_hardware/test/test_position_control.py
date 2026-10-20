@@ -338,7 +338,8 @@ class PositionAdapterTests(unittest.TestCase):
         self.arm._api_control_initialized = False
         self.arm._session_holder = 0
         self.arm._my_session_id = 7
-        self.adapter = HexPositionAdapter('ws://127.0.0.1:8439', fixture_limits())
+        self.adapter = HexPositionAdapter('ws://127.0.0.1:8439', fixture_limits(),
+                                          allow_api_calibration=False)
         self.adapter._api = SimpleNamespace(device_list=[self.arm])
         self.adapter._arm_type = arm_type
         self.adapter._command_types = import_module('hex_device.motor_base').CommandType
@@ -363,6 +364,33 @@ class PositionAdapterTests(unittest.TestCase):
         self.arm._api_control_initialized = True
         self.adapter.tick()
 
+    def test_local_receipt_allows_hold_but_never_refreshes_old_feedback(self) -> None:
+        """走正式读取及保持入口，SDK时间略领先不会误停，真正超时仍拒绝."""
+        self.reader.stop()
+        received = time.perf_counter_ns()
+        sdk_stamp = received + 2000000
+        status = {
+            'pos': self.positions, 'vel': self.velocity, 'eff': (0.,) * 6,
+            'ts': {'s': sdk_stamp // 1000000000, 'ns': sdk_stamp % 1000000000},
+        }
+        self.adapter._api.is_api_exit = lambda: False
+        self.adapter._api.is_websocket_recv_timeout = lambda: False
+        self.adapter._api._project_feedback_frames = {16: (self.arm, received, status)}
+        with patch('archer_hardware.hex_adapter.time.perf_counter_ns',
+                   return_value=received + 1000000):
+            self.acquire()
+            self.assertEqual(self.adapter.state, 'HOLDING')
+            self.assertEqual(self.adapter._target, self.positions)
+            self.assertTrue(any(call.args[1] == 'position'
+                                for call in self.send.call_args_list))
+        self.send.reset_mock()
+        with patch('archer_hardware.hex_adapter.time.perf_counter_ns',
+                   return_value=received + 100000001):
+            with self.assertRaisesRegex(RuntimeError, '过期'):
+                self.adapter.tick()
+        self.assertFalse(any(call.args[1] == 'position'
+                             for call in self.send.call_args_list))
+
     def continuous_plan(self):
         """准备小幅合成连续轨迹，完整预检先于模拟申请控制."""
         from archer_control.continuous_trajectory import retime_recorded_pair
@@ -375,6 +403,88 @@ class PositionAdapterTests(unittest.TestCase):
             [limits.max_velocity] * 2, [limits.max_acceleration] * 2,
         )
         return prepare_continuous_pair(plan.payload(), {'left': limits, 'right': limits}, .05)
+
+    def set_api_timeout(self, **changes) -> None:
+        """设置可远程清除的通信超时或其变种，不连接实际控制器."""
+        types = import_module('hex_device.generated.public_api_types_pb2')
+        fields = {'reason': 'API communication timeout', 'is_remotely_clearable': True,
+                  'category': types.ParkingStopCategory.PscAPICommunicationTimeout}
+        fields.update(changes)
+        self.arm._parking_stop_detail.CopyFrom(types.ParkingStopDetail(**fields))
+
+    def test_startup_clear_waits_for_new_feedback_before_initialization(self) -> None:
+        """单次清除后等更新实测帧确认，不能同周期申请控制或进入保持."""
+        self.set_api_timeout()
+        first = self.frame()
+        with patch.object(HexFeedbackAdapter, 'read', return_value=first):
+            self.adapter.request_control()
+            self.assertEqual(self.adapter.readiness_stage, 'CLEARING_API_TIMEOUT')
+            for _ in range(3):
+                self.adapter.tick()
+            self.arm._parking_stop_detail.Clear()
+            self.adapter.tick()
+        self.assertEqual([c.args[1] for c in self.send.call_args_list], ['clear_api_timeout'])
+        self.adapter.tick()
+        self.assertEqual([c.args[1] for c in self.send.call_args_list],
+                         ['clear_api_timeout', 'initialize'])
+        self.arm._session_holder = 7
+        self.arm._api_control_initialized = True
+        self.adapter.tick()
+        self.assertEqual(self.adapter.state, 'HOLDING')
+        self.assertEqual(self.adapter.initial_positions, self.positions)
+
+    def test_unknown_parking_and_unsafe_clear_conditions_are_rejected(self) -> None:
+        """不可远程清除、原因不符、电机故障、其他会话和运动均不清除."""
+        for changes in ({'is_remotely_clearable': False}, {'reason': 'Other stop'},
+                        {'category': 0}):
+            self.set_api_timeout(**changes)
+            with self.subTest(changes=changes), self.assertRaisesRegex(RuntimeError, '停车'):
+                self.adapter.request_control()
+        self.set_api_timeout()
+        for name, value in (('_session_holder', 9), ('_error_codes', [3] * 6)):
+            original = getattr(self.arm, name)
+            setattr(self.arm, name, value)
+            with self.subTest(field=name), self.assertRaises(RuntimeError):
+                self.adapter.request_control()
+            setattr(self.arm, name, original)
+        self.velocity = (.03,) * 6
+        with self.assertRaisesRegex(RuntimeError, '运动'):
+            self.adapter.request_control()
+        self.send.assert_not_called()
+
+    def test_startup_clear_timeout_and_halt_never_retry(self) -> None:
+        """清除未确认超时后不重复清除，迟到确认不能恢复初始化或位置发送."""
+        self.set_api_timeout()
+        self.adapter.request_control()
+        self.adapter._requested_at -= self.adapter.readiness_timeout + 1.
+        with self.assertRaisesRegex(RuntimeError, '就绪超时.*API通信超时'):
+            self.adapter.tick()
+        self.assertEqual(self.adapter.state, 'FAULT')
+        self.arm._parking_stop_detail.Clear()
+        self.adapter.tick()
+        self.assertEqual([c.args[1] for c in self.send.call_args_list], ['clear_api_timeout'])
+
+    def test_clear_dispatch_rechecks_reason_payload_and_feedback(self) -> None:
+        """真实发送前再次核对清除原因、消息纯度及反馈有效期."""
+        self.set_api_timeout()
+        self.adapter.request_control()
+        message = self.send.call_args.args[0]
+        self.adapter._check_dispatch(message, 'clear_api_timeout')
+        mixed = type(message)()
+        mixed.CopyFrom(message)
+        mixed.arm_command.arm_exclusive_command.api_control_initialize = True
+        with self.assertRaisesRegex(RuntimeError, '单独'):
+            self.adapter._check_dispatch(mixed, 'clear_api_timeout')
+        self.set_api_timeout(reason='Other stop')
+        with self.assertRaisesRegex(RuntimeError, '停车'):
+            self.adapter._check_dispatch(message, 'clear_api_timeout')
+        self.set_api_timeout()
+        self.adapter._feedback = replace(self.frame(), source_ns=time.perf_counter_ns()-10**9)
+        with self.assertRaisesRegex(RuntimeError, '新鲜'):
+            self.adapter._check_dispatch(message, 'clear_api_timeout')
+        self.adapter.stop()
+        with self.assertRaisesRegex(RuntimeError, '不允许'):
+            self.adapter._check_dispatch(message, 'clear_api_timeout')
 
     def test_checked_path_rejects_drift_before_arm(self) -> None:
         """已检文件不能在SDK执行入口悄悄重建首段."""
@@ -723,8 +833,8 @@ class PositionAdapterTests(unittest.TestCase):
         self.assertEqual(self.adapter.state, 'STOPPED')
         self.assertIsNone(self.adapter.initial_positions)
 
-    def test_default_permission_never_sends_calibration(self) -> None:
-        """默认等待明确标记需要允许校准，绝不默认为授权."""
+    def test_explicitly_disabled_calibration_never_sends_calibration(self) -> None:
+        """显式禁用校准时等待许可，不绕过设置进入保持."""
         self.arm._calibrated = False
         self.adapter.request_control()
         self.arm._session_holder = 7

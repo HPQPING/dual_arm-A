@@ -33,12 +33,13 @@ SDK_HASHES = {
 
 @dataclass(frozen=True)
 class JointFeedback:
-    """同一帧的六关节反馈；单位依次为 rad、rad/s 和 N·m."""
+    """同帧六轴反馈；source_ns为本地收包单调时间，SDK换算时间独立保留."""
 
     positions: tuple[float, ...]
     velocities: tuple[float, ...]
     efforts: tuple[float, ...]
     source_ns: int
+    sdk_source_ns: int | None = None
 
 
 def six_values(values: Iterable[object]) -> tuple[float, ...]:
@@ -78,6 +79,24 @@ def managed_sdk_class(base: Any) -> Any:
 
     class ManagedAPI(base):
         """先完成传输清理，再允许 SDK 主循环退出."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            """先创建帧缓存，再启动厂商网络线程，避免首帧初始化竞争."""
+            self._project_feedback_frames: dict[int, tuple[Any, int, Any]] = {}
+            super().__init__(*args, **kwargs)
+
+        def _process_api_up(self, message: Any) -> None:
+            """原子保存同帧数据与本地收包处理时刻，不用SDK偏移时钟计算时效."""
+            received_ns = time.perf_counter_ns()
+            super()._process_api_up(message)
+            if message.HasField('arm_status'):
+                arm = self.find_device_by_robot_type(message.robot_type)
+                if arm is not None:
+                    status = arm.get_simple_motor_status(pop=False)
+                    if status is not None:
+                        self._project_feedback_frames[message.robot_type] = (
+                            arm, received_ns, status,
+                        )
 
         async def _HexDeviceApi__async_close(self) -> None:
             """关闭握手有界等待，失败时记录异常并中止本地传输."""
@@ -195,6 +214,7 @@ class HexFeedbackAdapter:
         self._api: Any = None
         self._arm_type: Any = None
         self._last_source_ns = -1
+        self._last_sdk_source_ns = -1
 
     def connect(self) -> None:
         """核对 SDK 后连接，关闭设备控制循环并过滤所有控制下行."""
@@ -234,7 +254,16 @@ class HexFeedbackAdapter:
             raise RuntimeError('每个地址必须对应一台六关节机械臂')
         if arms[0].robot_type not in (16, 17, 25, 26):
             raise RuntimeError('反馈设备不是已核对的六轴 Archer 系列')
-        status = arms[0].get_simple_motor_status(pop=False)
+        # 正式托管API提供同帧缓存；简单替身仍可直接提供SDK格式的状态。
+        frames = getattr(self._api, '_project_feedback_frames', None)
+        received_ns: int | None = None
+        if frames is not None:
+            saved = frames.get(arms[0].robot_type)
+            if saved is None or saved[0] is not arms[0]:
+                return None
+            _, received_ns, status = saved
+        else:
+            status = arms[0].get_simple_motor_status(pop=False)
         if status is None:
             return None
         stamp = status['ts']
@@ -242,19 +271,25 @@ class HexFeedbackAdapter:
         if (type(seconds) is not int or type(nanos) is not int
                 or seconds < 0 or not 0 <= nanos < 1_000_000_000):
             raise ValueError('SDK 时间戳无效')
-        source_ns = seconds * 1_000_000_000 + nanos
-        age = (time.perf_counter_ns() - source_ns) / 1e9
-        if age < -0.05 or age > self.stale_timeout:
+        sdk_source_ns = seconds * 1_000_000_000 + nanos
+        source_ns = sdk_source_ns if received_ns is None else received_ns
+        now_ns = time.perf_counter_ns()
+        age = (now_ns - source_ns) / 1e9
+        sdk_age = (now_ns - sdk_source_ns) / 1e9
+        # SDK旧时钟仍用于排除积压旧包；新时效基准不能把旧数据刷新成新数据。
+        if (age < (-0.05 if received_ns is None else 0.) or age > self.stale_timeout
+                or sdk_age < -0.05 or sdk_age > self.stale_timeout):
             raise RuntimeError('关节反馈过期或时间基准不匹配')
-        if source_ns < self._last_source_ns:
+        if source_ns < self._last_source_ns or sdk_source_ns < self._last_sdk_source_ns:
             raise RuntimeError('反馈时间倒退，请断开后重新检查设备')
-        if source_ns == self._last_source_ns:
+        if source_ns == self._last_source_ns or sdk_source_ns == self._last_sdk_source_ns:
             return None
         feedback = JointFeedback(
             six_values(status['pos']), six_values(status['vel']),
-            six_values(status['eff']), source_ns,
+            six_values(status['eff']), source_ns, sdk_source_ns,
         )
         self._last_source_ns = source_ns
+        self._last_sdk_source_ns = sdk_source_ns
         return feedback
 
     def close(self) -> None:
@@ -263,3 +298,4 @@ class HexFeedbackAdapter:
             self._api.close()
             self._api = None
         self._last_source_ns = -1
+        self._last_sdk_source_ns = -1

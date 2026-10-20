@@ -2,7 +2,7 @@
 独立的 SDK 关节位置控制接入，默认只连接反馈，不自动申请控制权.
 
 调用方需显式申请控制并持续调用 tick；软件制动请求不等同于实体急停。
-本轮通过离线测试验证，尚未连接实机确认固件响应。
+显式准备时采用官方 SDK 流程；任务中故障取消执行，不自动续发旧目标。
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
     def __init__(
         self, url: str, limits: PositionLimits, *, control_hz: int = 250,
         max_excursion: float = 0.05, tracking_tolerance: float = 0.10,
-        allow_api_calibration: bool = False, readiness_timeout: float = 10.0,
+        allow_api_calibration: bool = True, readiness_timeout: float = 10.0,
     ) -> None:
         """要求显式传入限位，小幅试运行默认每关节最多变化 0.05 rad."""
         super().__init__(url, stale_timeout=0.1)
@@ -48,6 +48,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
         self.readiness_stage = 'IDLE'
         self._calibration_sent = False
         self._initialization_seen = False
+        self._startup_clear_source_ns: int | None = None
         self._request_positions: tuple[float, ...] | None = None
         self.state = 'DISCONNECTED'
         self.last_error = ''
@@ -156,7 +157,17 @@ class HexPositionAdapter(HexFeedbackAdapter):
             self.limits.check_positions(frame.positions)
         return frame
 
-    def _health(self, *, require_calibrated: bool = True) -> tuple[bool, bool, bool]:
+    def _startup_timeout_only(self) -> bool:
+        """只识别厂商可远程清除的API通信超时，不把其他停车当作可恢复状态."""
+        detail = self._arm().get_parking_stop_detail()
+        category = import_module('hex_device.generated.public_api_types_pb2').ParkingStopCategory
+        return (detail.category == category.PscAPICommunicationTimeout
+                and detail.reason == 'API communication timeout'
+                and detail.is_remotely_clearable is True)
+
+    def _health(
+        self, *, require_calibrated: bool = True, allow_startup_timeout: bool = False,
+    ) -> tuple[bool, bool, bool]:
         arm = self._arm()
         # SDK 的 type 26 是只读 HelloArcher；不能因六轴反馈正常而允许控制。
         if arm.robot_type not in (16, 17, 25):
@@ -164,8 +175,11 @@ class HexPositionAdapter(HexFeedbackAdapter):
                 f'设备型号 {arm.robot_type} 不在已核对的位置控制型号中；'
                 '只读 Hello 型号禁止申请控制'
             )
-        if arm.get_parking_stop_detail().ListFields():
-            raise RuntimeError('机械臂报告停车故障；本接口不会自动清除')
+        if arm.get_parking_stop_detail().ListFields() and not (
+            allow_startup_timeout and self.state in ('CONNECTED', 'REQUESTING')
+            and self._startup_timeout_only()
+        ):
+            raise RuntimeError('机械臂报告停车故障；仅启动准备允许清除指定API通信超时')
         errors = arm.get_motor_error_codes()
         if errors is None or len(errors) != 6:
             raise RuntimeError('尚未取得六个电机的故障状态')
@@ -193,7 +207,11 @@ class HexPositionAdapter(HexFeedbackAdapter):
                 and self._trajectory_gate.cancelled):
             raise RuntimeError('双臂轨迹已取消，禁止发送排队的位置消息')
         permitted = (
-            kind == 'initialize' and self.state == 'REQUESTING'
+            kind == 'clear_api_timeout' and self.state == 'REQUESTING'
+            and self.readiness_stage == 'CLEARING_API_TIMEOUT'
+            and self._startup_clear_source_ns is not None
+            or kind == 'initialize' and self.state == 'REQUESTING'
+            and self.readiness_stage != 'CLEARING_API_TIMEOUT'
             or kind == 'calibrate' and self.state == 'REQUESTING'
             and self.allow_api_calibration and self._calibration_sent
             or kind == 'heartbeat' and self.state == 'REQUESTING'
@@ -215,6 +233,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
         else:
             owned, initialized, calibrated = self._health(
                 require_calibrated=kind == 'position',
+                allow_startup_timeout=kind == 'clear_api_timeout',
             )
             frame = self._feedback
             if frame is None or not 0 <= (
@@ -222,7 +241,22 @@ class HexPositionAdapter(HexFeedbackAdapter):
             ) / 1e9 <= self.stale_timeout:
                 raise RuntimeError('下发前缺少新鲜关节反馈，消息作废')
             self.limits.check_feedback(frame.positions)
-            if kind == 'position':
+            if kind == 'clear_api_timeout':
+                if (not self._startup_timeout_only()
+                        or max(abs(v) for v in frame.velocities) > .02
+                        or self._request_positions is None
+                        or max(abs(a - b) for a, b in zip(
+                            frame.positions, self._request_positions,
+                        )) > .01):
+                    raise RuntimeError('清除通信超时前状态或静止条件已改变')
+                outer = message.arm_command
+                shared = outer.arm_shared_command
+                if ({f.name for f, _ in message.ListFields()} != {'arm_command'}
+                        or {f.name for f, _ in outer.ListFields()} != {'arm_shared_command'}
+                        or {f.name for f, _ in shared.ListFields()} != {'clear_parking_stop'}
+                        or shared.clear_parking_stop is not True):
+                    raise RuntimeError('启动清除只能包含单独的clear_parking_stop=true')
+            elif kind == 'position':
                 if not owned or not initialized:
                     raise RuntimeError('下发位置前控制权或初始化状态已改变')
                 if self._nominal_required:
@@ -252,7 +286,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
         if self.state != 'CONNECTED':
             raise RuntimeError('仅允许从 CONNECTED 状态申请控制')
         frame = self._fresh_feedback()
-        self._health(require_calibrated=False)
+        self._health(require_calibrated=False, allow_startup_timeout=True)
         if max(abs(v) for v in frame.velocities) > 0.02:
             raise RuntimeError('机械臂仍在运动，不能申请初始位置保持')
         self.state = 'REQUESTING'
@@ -261,8 +295,15 @@ class HexPositionAdapter(HexFeedbackAdapter):
         self._initialization_seen = False
         self._request_positions = frame.positions
         self._requested_at = time.monotonic()
+        self._startup_clear_source_ns = None
         try:
-            self._send(self._arm()._construct_init_message(True), 'initialize')
+            arm = self._arm()
+            if arm.get_parking_stop_detail().ListFields():
+                self.readiness_stage = 'CLEARING_API_TIMEOUT'
+                self._startup_clear_source_ns = frame.source_ns
+                self._send(arm._construct_clear_parking_stop_message(), 'clear_api_timeout')
+            else:
+                self._send(arm._construct_init_message(True), 'initialize')
         except Exception as error:
             self.last_error = str(error)
             self.stop(fault=True)
@@ -378,10 +419,15 @@ class HexPositionAdapter(HexFeedbackAdapter):
     def _tick(self) -> None:
         now = time.monotonic()
         frame = self._fresh_feedback()
-        owned, initialized, calibrated = self._health(require_calibrated=False)
+        clearing = self.state == 'REQUESTING' and self.readiness_stage == 'CLEARING_API_TIMEOUT'
+        owned, initialized, calibrated = self._health(
+            require_calibrated=False, allow_startup_timeout=clearing,
+        )
         if self.state == 'REQUESTING':
             if now - self._requested_at > self.readiness_timeout:
                 waiting = []
+                if clearing:
+                    waiting.append('API通信超时停车尚未确认清除')
                 if not owned:
                     waiting.append('尚未取得控制会话')
                 if not initialized:
@@ -398,6 +444,17 @@ class HexPositionAdapter(HexFeedbackAdapter):
                 frame.positions, self._request_positions,
             )) > 0.01:
                 raise RuntimeError('等待控制就绪期间关节漂移超过 0.01 rad')
+            if clearing:
+                if (self._arm().get_parking_stop_detail().ListFields()
+                        or self._startup_clear_source_ns is None
+                        or frame.source_ns <= self._startup_clear_source_ns):
+                    return
+                # 只有更新的实测帧确认停车已消失后才申请控制，不保留排队的清除请求。
+                if self._native is not None:
+                    self._native.cancel()
+                self.readiness_stage = 'WAITING_SESSION'
+                self._send(self._arm()._construct_init_message(True), 'initialize')
+                return
             if self._calibration_sent and (
                 not owned or (self._initialization_seen and not initialized)
             ):

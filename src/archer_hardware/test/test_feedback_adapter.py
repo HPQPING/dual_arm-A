@@ -59,6 +59,69 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(feedback.positions, (0.1,) * 6)
         self.assertIsNone(self.adapter.read())
 
+    def test_local_receipt_accepts_small_sdk_clock_lead(self):
+        """SDK偏移换算时间略领先时，本地收包时间仍为非未来，原始时间另存."""
+        received = time.perf_counter_ns()
+        sdk_stamp = received + 2000000
+        self.arm.set_stamp(sdk_stamp)
+        self.api._project_feedback_frames = {16: (self.arm, received, self.arm.status)}
+        frame = self.adapter.read()
+        assert frame is not None
+        self.assertEqual(frame.source_ns, received)
+        self.assertEqual(frame.sdk_source_ns, sdk_stamp)
+        self.assertGreaterEqual(time.perf_counter_ns() - frame.source_ns, 0)
+        self.assertIsNone(self.adapter.read())
+
+    def test_new_receipt_does_not_refresh_repeated_sdk_sample(self):
+        """同一SDK时间戳即使重复收到，也不更新可供控制使用的反馈帧."""
+        received = time.perf_counter_ns()
+        self.arm.set_stamp(received)
+        self.api._project_feedback_frames = {16: (self.arm, received, self.arm.status)}
+        frame = self.adapter.read()
+        assert frame is not None
+        self.api._project_feedback_frames[16] = (self.arm, received + 1, self.arm.status)
+        self.assertIsNone(self.adapter.read())
+        self.assertEqual(self.adapter._last_source_ns, received)
+
+    def test_receipt_and_sdk_time_both_reject_stale_frames(self):
+        """新收包也不能掩盖SDK旧时间，SDK新时间也不能掩盖长时间未收包."""
+        now = time.perf_counter_ns()
+        samples = ((now, now - 1000000000), (now - 1000000000, now),
+                   (now, now + 1000000000))
+        for received, sdk_stamp in samples:
+            self.arm.set_stamp(sdk_stamp)
+            self.api._project_feedback_frames = {16: (self.arm, received, self.arm.status)}
+            with self.subTest(received=received, sdk=sdk_stamp), \
+                    self.assertRaisesRegex(RuntimeError, '过期|时间基准'):
+                self.adapter.read()
+
+    def test_managed_hook_captures_same_frame_without_transport(self):
+        """直接调用真实托管收包钩子，保存同帧时间与角度，不创建网络线程."""
+        from unittest.mock import Mock
+
+        arm = self.arm
+
+        class Base:
+            """只模拟上行更新，不提供任何连接或发送入口."""
+
+            def _process_api_up(self, message):
+                """先更新角度，由托管钩子随后保存本帧."""
+                arm.status['pos'] = [.2] * 6
+
+            def find_device_by_robot_type(self, robot_type):
+                """返回当前离线替身."""
+                return arm
+
+        api = object.__new__(managed_sdk_class(Base))
+        api._project_feedback_frames = {}
+        message = Mock(robot_type=16)
+        message.HasField.side_effect = lambda field: field == 'arm_status'
+        api._process_api_up(message)
+        saved_arm, received, status = api._project_feedback_frames[16]
+        self.assertIs(saved_arm, arm)
+        self.assertLessEqual(received, time.perf_counter_ns())
+        self.assertEqual(status['pos'], [.2] * 6)
+
     def test_invalid_vectors(self):
         """拒绝维度错误、非数值及非有限反馈."""
         for values in ([0.0] * 5, [float('nan')] * 6,
