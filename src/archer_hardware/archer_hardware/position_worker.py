@@ -17,6 +17,7 @@ ALLOWED_STATES = {
     'connect': ('DISCONNECTED',),
     'enable': ('CONNECTED',),
     'move': ('HOLDING',),
+    'recover_limits': ('HOLDING',),
     'trajectory': ('HOLDING',),
     'disconnect': ('CONNECTED', 'STOPPED', 'FAULT', 'DISCONNECTED'),
 }
@@ -43,6 +44,10 @@ class PositionBackend(Protocol):
 
     def move_to(self, goal: tuple[float, ...], duration: float) -> None:
         """从实际反馈规划移动."""
+        ...
+
+    def recover_limits(self, duration: float) -> None:
+        """从执行时的实际反馈生成只收回超限关节的目标."""
         ...
 
     def arm_trajectory(
@@ -289,6 +294,14 @@ class PositionWorker:
             elif command.kind == 'move':
                 backend.move_to(command.goal, command.duration)
                 self._phase = 'RUNNING'
+            elif command.kind == 'recover_limits':
+                backend.recover_limits(command.duration)
+                if backend.state == 'HOLDING':
+                    self._phase = 'SUCCEEDED'
+                    self._message = '实际角度已在名义限位内，未启动收回动作'
+                else:
+                    self._phase = 'RUNNING'
+                    self._message = '仅收回轻微超限关节，等待实际反馈进入名义限位'
             elif command.kind == 'trajectory':
                 if command.gate is None:
                     raise ValueError('成对轨迹缺少共同启动门控')

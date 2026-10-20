@@ -229,7 +229,7 @@ class PositionControlNode(Node):
             'startup_timeout': 10.0, 'target_timeout': 5.0,
             'max_excursion': 0.05, 'tracking_tolerance': 0.10,
             'feedback_tolerance': 0.005,
-            'allow_api_calibration': True, 'readiness_timeout': 10.0,
+            'readiness_timeout': 10.0,
             'allow_paired_trajectory': False,
             'allow_continuous_trajectory': False,
             'allow_task_file_trajectory': False,
@@ -271,9 +271,6 @@ class PositionControlNode(Node):
         autoconnect = self.get_parameter('connect_on_start').value
         if not isinstance(autoconnect, bool):
             raise ValueError('connect_on_start 必须是布尔值')
-        self.allow_api_calibration = self.get_parameter('allow_api_calibration').value
-        if type(self.allow_api_calibration) is not bool:
-            raise ValueError('allow_api_calibration 必须为布尔值')
         self.allow_paired_trajectory = self.get_parameter('allow_paired_trajectory').value
         if type(self.allow_paired_trajectory) is not bool:
             raise ValueError('allow_paired_trajectory 必须为布尔值')
@@ -343,7 +340,6 @@ class PositionControlNode(Node):
                 factory = partial(
                     HexPositionAdapter, url, limits, control_hz=frequency,
                     max_excursion=self.max_excursion, tracking_tolerance=tolerance,
-                    allow_api_calibration=self.allow_api_calibration,
                     readiness_timeout=readiness_timeout,
                 )
             elif autoconnect:
@@ -367,7 +363,7 @@ class PositionControlNode(Node):
         self._subscription_handles = []
         for side in self.sides:
             for kind in (
-                'connect', 'enable', 'move', 'disconnect',
+                'connect', 'enable', 'move', 'recover_limits', 'disconnect',
             ):
                 self._service_handles.append(self.create_service(
                     Trigger, f'/hardware/position/{side}/{kind}',
@@ -459,7 +455,7 @@ class PositionControlNode(Node):
             if side is not None:
                 raise ValueError('成对执行必须使用全局入口')
             return self.request_paired_trajectory()
-        if kind not in ('connect', 'enable', 'move', 'disconnect'):
+        if kind not in ('connect', 'enable', 'move', 'recover_limits', 'disconnect'):
             raise ValueError('该操作已移除；本次运行不提供软件复位或恢复入口')
         if side is None or side not in self.workers:
             raise ValueError('未配置该机械臂')
@@ -484,6 +480,9 @@ class PositionControlNode(Node):
                     'move', goal=target.positions, duration=target.duration,
                 )
                 del self._targets[side]
+            elif kind == 'recover_limits':
+                identifier = self.workers[side].submit(kind, duration=2.0)
+                self._targets.pop(side, None)
             else:
                 identifier = self.workers[side].submit(kind)
                 if kind == 'disconnect':
@@ -915,7 +914,6 @@ class PositionControlNode(Node):
                 'command_id': snapshot.command_id, 'command': snapshot.command,
                 'phase': snapshot.phase, 'message': snapshot.message,
                 'readiness_stage': snapshot.readiness_stage,
-                'allow_api_calibration': self.allow_api_calibration,
                 'trajectory_start_at_monotonic': snapshot.trajectory_start_at,
                 'trajectory_observed_start_at_monotonic': snapshot.trajectory_observed_start_at,
                 'target_staged': targets[side], 'target_message': target_messages.get(side, ''),

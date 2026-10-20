@@ -64,6 +64,19 @@ class OperatorResultTests(unittest.TestCase):
                 self.assertEqual(error.exception.code, 2)
                 initialize.assert_not_called()
 
+    def test_recovery_scope_and_result_match(self) -> None:
+        """限位收回明确指定一臂，受理或旧编号不能作为本次完成."""
+        self.assertEqual(request_path('recover-limits', 'right'),
+                         '/hardware/position/right/recover_limits')
+        with self.assertRaises(ValueError):
+            request_path('recover-limits', None)
+        self.assertIsNone(operation_result(
+            status('old', 'SUCCEEDED'), 'left', 'new', 'recover-limits',
+        ))
+        self.assertTrue(operation_result(
+            status('new', 'SUCCEEDED'), 'left', 'new', 'recover-limits',
+        ))
+
     def test_task_run_dispatch_is_explicit_and_does_not_enable(self) -> None:
         """文件执行只调用专用流程，不偷偷调用连接或使能命令."""
         with patch('rclpy.init'), patch('rclpy.ok', return_value=False), patch(
@@ -196,6 +209,19 @@ class OperatorRosTests(unittest.TestCase):
         self.assertEqual(result['command_id'], 'abcdef123456')
         self.assertEqual(self.calls, ['move'])
         self.assertEqual(list(self.client.clients), [])
+
+    def test_recovery_waits_for_result_and_enables_failure_halt(self) -> None:
+        """新命令只发送一次，并沿用运动请求失败后的停止规则."""
+        service = self.server.create_service(
+            Trigger, '/hardware/position/left/recover_limits', self.move,
+        )
+        try:
+            result = self.client.run_command('recover-limits', 'left', 3.0)
+            self.assertEqual(result['command_id'], 'abcdef123456')
+            self.assertEqual(self.calls, ['move'])
+            self.assertTrue(self.client.halt_on_failure)
+        finally:
+            self.server.destroy_service(service)
 
     def test_rejection_is_not_ambiguous_timeout(self) -> None:
         """明确拒绝不算已受理，客户端不重试."""

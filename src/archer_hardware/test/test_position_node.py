@@ -103,6 +103,12 @@ class FakeBackend:
         self.state = 'ARMED'
         gate.ready(side)
 
+    def recover_limits(self, duration: float) -> None:
+        """替身仅在内存收回超限关节，不构造任何实际设备."""
+        assert self.limits is not None
+        if not self.limits.within_nominal(self.positions):
+            self.move_to(self.limits.recovery_goal(self.positions), duration)
+
     def tick(self) -> str:
         """模拟取得控制和到位，轨迹数学由其他测试单独验证."""
         if self._gate is not None and self._gate.cancelled:
@@ -160,6 +166,20 @@ class FakeBackend:
 
 class PositionWorkerTests(unittest.TestCase):
     """验证有界队列、停止优先和执行前状态检查."""
+
+    def test_recovery_queued_before_stop_cannot_execute(self) -> None:
+        """停止代次同样作废尚未执行的限位收回请求."""
+        fake = FakeBackend()
+        fake.state = 'HOLDING'
+        worker = PositionWorker('left', lambda: fake, lambda reason: None)
+        worker._backend = fake
+        worker._publish()
+        worker.submit('recover_limits', duration=2.0)
+        command = worker._queue.get_nowait()
+        worker.request_stop()
+        worker._execute(command)
+        self.assertEqual(worker._phase, 'REJECTED')
+        self.assertEqual(fake.calls, [])
 
     def test_old_queued_command_cannot_survive_stop(self) -> None:
         """停止使旧代次的使能请求失效."""
@@ -298,7 +318,7 @@ class PositionNodeTests(unittest.TestCase):
             rclpy.shutdown()
 
     def make_node(
-        self, configured: bool = True, *, allow_api_calibration: bool = False,
+        self, configured: bool = True, *,
         allow_paired_trajectory: bool = False,
         allow_continuous_trajectory: bool = False,
         allow_task_file_trajectory: bool = False,
@@ -306,7 +326,6 @@ class PositionNodeTests(unittest.TestCase):
     ) -> PositionControlNode:
         """虚构测试限位只通过参数传入，不写入正式配置."""
         args = ['--ros-args', '-p',
-                f'allow_api_calibration:={str(allow_api_calibration).lower()}', '-p',
                 f'allow_paired_trajectory:={str(allow_paired_trajectory).lower()}', '-p',
                 f'allow_continuous_trajectory:={str(allow_continuous_trajectory).lower()}', '-p',
                 f'allow_task_file_trajectory:={str(allow_task_file_trajectory).lower()}']
@@ -420,6 +439,36 @@ class PositionNodeTests(unittest.TestCase):
         self.assertFalse(self.service('left/move').success)
         self.assertTrue(self.service('halt').success)
         self.assertFalse(any(kind == 'return' for kind, _ in backend.calls))
+
+    def test_recovery_is_explicit_single_arm_and_clears_old_target(self) -> None:
+        """连接使能不自动收回；单臂服务使用最新反馈且清除该臂旧单点目标."""
+        node = self.make_node()
+        self.assertFalse(self.service('left/recover_limits').success)
+        self.enable_both(node)
+        left = self.backend(node, 'left')
+        right = self.backend(node, 'right')
+        self.assertFalse(any(kind == 'move' for kind, _ in left.calls + right.calls))
+        node.stage_target('left', self.target('left'))
+        left.positions = (-2.001, 0.101) + (0.1,) * 4
+        self.assertTrue(self.service('left/recover_limits').success)
+        self.wait_until(lambda: node.workers['left'].snapshot().phase == 'SUCCEEDED')
+        self.assertEqual(left.goal, (-1.995, 0.101) + (0.1,) * 4)
+        self.assertNotIn('left', node._targets)
+        self.assertFalse(any(kind == 'move' for kind, _ in right.calls))
+        self.assertFalse(self.service('left/move').success)
+        self.assertTrue(self.service('halt').success)
+        self.assertFalse(self.service('left/recover_limits').success)
+
+    def test_recovery_nominal_reports_success_without_motion(self) -> None:
+        """已在范围内的请求按本次编号完成，不能一直等待不存在的运动."""
+        node = self.make_node()
+        self.enable_both(node)
+        self.assertTrue(self.service('left/recover_limits').success)
+        self.wait_until(lambda: node.workers['left'].snapshot().command == 'recover_limits')
+        snapshot = node.workers['left'].snapshot()
+        self.assertEqual(snapshot.phase, 'SUCCEEDED')
+        self.assertIn('未启动', snapshot.message)
+        self.assertFalse(any(kind == 'move' for kind, _ in self.backend(node, 'left').calls))
 
     def test_target_validation_and_reordering(self) -> None:
         """按关节名重新排序，拒绝重复名字、多点、其他控制字段和越界目标."""
@@ -603,8 +652,6 @@ class PositionNodeTests(unittest.TestCase):
         self.assertFalse(result[0].successful)
         result = node.set_parameters([Parameter('max_excursion', value=1.0)])
         self.assertFalse(result[0].successful)
-        result = node.set_parameters([Parameter('allow_api_calibration', value=True)])
-        self.assertFalse(result[0].successful)
         result = node.set_parameters([Parameter('allow_paired_trajectory', value=True)])
         self.assertFalse(result[0].successful)
 
@@ -747,20 +794,22 @@ class PositionNodeTests(unittest.TestCase):
         self.wait_until(lambda: all(w.snapshot().state in ('STOPPED', 'FAULT')
                                     for w in node.workers.values()))
 
-    def test_calibration_configuration_and_stage_reach_status(self) -> None:
-        """显式许可只传入后端配置，连接不等于使能，阶段可从状态读取."""
-        node = self.make_node(allow_api_calibration=True)
+    def test_preparation_stage_reaches_status_without_implicit_enable(self) -> None:
+        """连接只读取反馈，显式准备后才进入保持，阶段可从状态读取."""
+        node = self.make_node()
         self.assertTrue(self.service('left/connect').success)
         self.wait_until(lambda: node.workers['left'].snapshot().feedback is not None)
         backend = self.backend(node, 'left')
-        self.assertTrue(backend.options['allow_api_calibration'])
         self.assertEqual(backend.options['readiness_timeout'], 10.0)
         self.assertEqual([kind for kind, _ in backend.calls], ['connect'])
         self.assertEqual(node.workers['left'].snapshot().readiness_stage, 'CONNECTED')
         node.publish_state()
         status = json.loads(node._last_status)
         self.assertEqual(status['arms']['left']['readiness_stage'], 'CONNECTED')
-        self.assertTrue(status['arms']['left']['allow_api_calibration'])
+        self.assertTrue(self.service('left/enable').success)
+        self.wait_until(lambda: node.workers['left'].snapshot().state == 'HOLDING')
+        node.publish_state()
+        self.assertEqual(json.loads(node._last_status)['arms']['left']['readiness_stage'], 'READY')
 
     def continuous_payload(self) -> dict:
         """合成小幅闭合路径，不使用实机或仿真任务初值."""

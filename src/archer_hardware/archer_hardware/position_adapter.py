@@ -29,7 +29,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
     def __init__(
         self, url: str, limits: PositionLimits, *, control_hz: int = 250,
         max_excursion: float = 0.05, tracking_tolerance: float = 0.10,
-        allow_api_calibration: bool = True, readiness_timeout: float = 10.0,
+        readiness_timeout: float = 10.0,
     ) -> None:
         """要求显式传入限位，小幅试运行默认每关节最多变化 0.05 rad."""
         super().__init__(url, stale_timeout=0.1)
@@ -39,9 +39,6 @@ class HexPositionAdapter(HexFeedbackAdapter):
         self.control_hz = control_hz
         self.max_excursion = positive(max_excursion, 'max_excursion')
         self.tracking_tolerance = positive(tracking_tolerance, 'tracking_tolerance')
-        if type(allow_api_calibration) is not bool:
-            raise ValueError('allow_api_calibration 必须为布尔值')
-        self.allow_api_calibration = allow_api_calibration
         self.readiness_timeout = positive(readiness_timeout, 'readiness_timeout')
         if self.readiness_timeout > 30.0:
             raise ValueError('readiness_timeout 不能超过 30 秒')
@@ -63,7 +60,6 @@ class HexPositionAdapter(HexFeedbackAdapter):
         self.trajectory_observed_start_at: float | None = None
         self._native: SdkCycleSender | None = None
         self._native_error = ''
-        self._base: Any = None
         self._command_types: Any = None
         self._epoch = 0
         self._requested_at = 0.0
@@ -111,7 +107,6 @@ class HexPositionAdapter(HexFeedbackAdapter):
                     if len(arms) == 1:
                         await owner._native.dispatch(self, base, arms[0], message)
 
-        self._base = base
         self._arm_type = import_module('hex_device.arm').Arm
         self._native_error = ''
         self._epoch += 1
@@ -193,7 +188,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
         if require_calibrated and calibrated is not True:
             raise RuntimeError(
                 '设备尚未报告 calibrated=true，禁止发送位置目标；'
-                '本接口不会自动校准'
+                '需要重新完成控制准备'
             )
         if mine <= 0:
             raise RuntimeError('尚未取得有效会话编号')
@@ -213,7 +208,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
             or kind == 'initialize' and self.state == 'REQUESTING'
             and self.readiness_stage != 'CLEARING_API_TIMEOUT'
             or kind == 'calibrate' and self.state == 'REQUESTING'
-            and self.allow_api_calibration and self._calibration_sent
+            and self._calibration_sent
             or kind == 'heartbeat' and self.state == 'REQUESTING'
             or kind == 'position' and self.state in (
                 'HOLDING', 'ARMED', 'RUNNING',
@@ -311,6 +306,21 @@ class HexPositionAdapter(HexFeedbackAdapter):
 
     def move_to(self, goal: Iterable[object], duration: float) -> None:
         """从当前实际静止位置规划单段小幅移动，不抢占正在运行的轨迹."""
+        frame = self._single_move_feedback()
+        self._start_move(frame, goal, duration, self.max_excursion)
+
+    def recover_limits(self, duration: float) -> None:
+        """显式从同一帧实测角度生成收回目标，只改变轻微超限关节."""
+        frame = self._single_move_feedback()
+        if self.limits.within_nominal(frame.positions):
+            return
+        self._start_move(
+            frame, self.limits.recovery_goal(frame.positions), duration,
+            min(self.max_excursion, 0.02),
+        )
+
+    def _single_move_feedback(self) -> JointFeedback:
+        """单点移动和限位收回共用新鲜、静止及有效控制会话检查."""
         if self.state != 'HOLDING':
             raise RuntimeError('需要先获得控制权并处于 HOLDING 状态')
         frame = self._fresh_feedback()
@@ -319,8 +329,15 @@ class HexPositionAdapter(HexFeedbackAdapter):
             raise RuntimeError('控制会话无效')
         if max(abs(v) for v in frame.velocities) > 0.02:
             raise RuntimeError('需要等待机械臂静止后再开始新轨迹')
+        return frame
+
+    def _start_move(
+        self, frame: JointFeedback, goal: Iterable[object], duration: float,
+        max_excursion: float,
+    ) -> None:
+        """验证并安装单段计划；不重读反馈或改变原始初始位置记录."""
         move = JointPositionMove.prepare(
-            frame.positions, goal, duration, self.limits, self.max_excursion,
+            frame.positions, goal, duration, self.limits, max_excursion,
         )
         self._recovering_limits = not self.limits.within_nominal(frame.positions)
         self._nominal_required = not self._recovering_limits
@@ -434,8 +451,6 @@ class HexPositionAdapter(HexFeedbackAdapter):
                     waiting.append('API 初始化尚未确认')
                 if not calibrated:
                     waiting.append('设备尚未报告 calibrated=true')
-                    if not self.allow_api_calibration:
-                        waiting.append('API 校准未获显式允许')
                 raise RuntimeError('等待控制就绪超时：' + '；'.join(waiting))
             if max(abs(v) for v in frame.velocities) > 0.02:
                 raise RuntimeError('等待控制就绪期间机械臂出现运动')
@@ -464,18 +479,12 @@ class HexPositionAdapter(HexFeedbackAdapter):
                 return
             self._initialization_seen = self._initialization_seen or initialized
             if not calibrated:
-                sent_calibration_now = False
-                if not self.allow_api_calibration:
-                    self.readiness_stage = 'CALIBRATION_PERMISSION_REQUIRED'
-                elif not self._calibration_sent:
+                self.readiness_stage = 'WAITING_CALIBRATION'
+                if not self._calibration_sent:
                     # 发送前锁存，传输失败也不自动重试未知的校准操作。
                     self._calibration_sent = True
-                    self.readiness_stage = 'WAITING_CALIBRATION'
                     self._send(self._arm()._construct_calibrate_message(), 'calibrate')
-                    sent_calibration_now = True
                 else:
-                    self.readiness_stage = 'WAITING_CALIBRATION'
-                if not sent_calibration_now:
                     self._send(self._arm()._construct_empty_message(), 'heartbeat')
                 return
             if not initialized:
@@ -542,7 +551,8 @@ class HexPositionAdapter(HexFeedbackAdapter):
                 stopped = max(abs(v) for v in frame.velocities) <= 0.02
                 recovered = (not self._recovering_limits
                              or self.limits.within_nominal(frame.positions))
-                if error <= 0.01 and stopped and recovered:
+                # 小幅试运行不能以接近整段位移的误差提前报告到位。
+                if error <= min(0.003, self.tracking_tolerance) and stopped and recovered:
                     if self._settled_since is None:
                         self._settled_since = now
                     if now - self._settled_since >= 0.2:

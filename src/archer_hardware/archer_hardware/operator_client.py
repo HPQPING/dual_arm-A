@@ -20,7 +20,8 @@ from std_srvs.srv import Trigger
 from .position_plan import positive
 
 
-COMMANDS = ('status', 'connect', 'enable', 'move', 'halt', 'disconnect', 'task-run')
+COMMANDS = ('status', 'connect', 'enable', 'move', 'recover-limits',
+            'halt', 'disconnect', 'task-run')
 TERMINAL_FAILURES = ('FAILED', 'REJECTED', 'CANCELLED')
 
 
@@ -34,7 +35,8 @@ def request_path(command: str, side: str | None) -> str:
         return f'/hardware/position/{command}'
     if side not in ('left', 'right'):
         raise ValueError('必须用 --side left/right 指定一只臂')
-    return f'/hardware/position/{side}/{command}'
+    service = 'recover_limits' if command == 'recover-limits' else command
+    return f'/hardware/position/{side}/{service}'
 
 
 def operation_result(
@@ -53,6 +55,7 @@ def operation_result(
     if phase != 'SUCCEEDED':
         return None
     expected = {'connect': 'CONNECTED', 'enable': 'HOLDING', 'move': 'HOLDING',
+                'recover-limits': 'HOLDING',
                 'disconnect': 'DISCONNECTED'}[command]
     if frame.get('state') != expected:
         raise RuntimeError('操作编号已完成，但当前状态已改变，请检查完整状态')
@@ -128,7 +131,7 @@ class OperatorClient(Node):
         if command == 'status':
             return {'result': 'STATUS', 'status': self.wait_status(timeout)}
         path = request_path(command, side)
-        self.halt_on_failure = command in ('connect', 'enable', 'move')
+        self.halt_on_failure = command in ('connect', 'enable', 'move', 'recover-limits')
         baseline = self.version
         response = self.trigger(path, min(timeout, 5.0))
         deadline = time.monotonic() + timeout

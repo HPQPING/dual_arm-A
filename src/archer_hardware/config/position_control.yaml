@@ -14,9 +14,7 @@ archer_position_driver:
   ros__parameters:
     arms: both
     connect_on_start: false
-    # 仅允许显式 enable 请求中的一次API校准，不会在启动或连接时校准。
-    # 显式enable采用官方准备；单纯启动节点或连接反馈不会触发校准。
-    allow_api_calibration: true
+    # 显式enable按官方流程完成必要的单次API校准；启动或连接反馈不触发。
     # 与同一控制器的can0/8439左臂、can1/9439右臂进行软件同步；默认不开放。
     allow_paired_trajectory: false
     # 连续轨迹接入仍默认关闭，不会自动连接或使能；完整任务尚需几何与夹爪事件衔接。
