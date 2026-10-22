@@ -279,7 +279,12 @@ class HexFeedbackAdapter:
         # SDK旧时钟仍用于排除积压旧包；新时效基准不能把旧数据刷新成新数据。
         if (age < (-0.05 if received_ns is None else 0.) or age > self.stale_timeout
                 or sdk_age < -0.05 or sdk_age > self.stale_timeout):
-            raise RuntimeError('关节反馈过期或时间基准不匹配')
+            raise RuntimeError(
+                '关节反馈过期或时间基准不匹配：'
+                f'本地反馈年龄={age * 1000.:.3f}ms，'
+                f'SDK时间差={sdk_age * 1000.:.3f}ms，'
+                f'允许时限={self.stale_timeout * 1000.:.3f}ms，'
+                f'本地收包时间={received_ns is not None}')
         if source_ns < self._last_source_ns or sdk_source_ns < self._last_sdk_source_ns:
             raise RuntimeError('反馈时间倒退，请断开后重新检查设备')
         if source_ns == self._last_source_ns or sdk_source_ns == self._last_sdk_source_ns:

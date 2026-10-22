@@ -21,24 +21,30 @@ from archer_hardware.position_plan import ContinuousPositionTrajectory, Position
 from archer_hardware.task_geometry import (
     assemble_task_cycle, check_samples, check_task_geometry, geometry_schedule,
     prepare_approach, prepare_return,
-    joint_error_displacement_bounds,
+    joint_error_displacement_bounds, geometry_error_displacement_bounds,
+    _pose_geometry_error_bounds,
 )
 
 if TYPE_CHECKING:
     from archer_mujoco.dual_model_loader import LoadedDualArm
 
 
-def envelope_model() -> LoadedDualArm:
+def envelope_model(*, fixed_base: bool = False) -> LoadedDualArm:
     """构造两侧六转动关节与球形碰撞体，避免依赖设备或工程模型文件."""
     mj = import_module('mujoco')
     bodies = []
     for side in ('left', 'right'):
         chain = ''
         for index in range(6):
+            axis = ('1 0 0', '0 1 0', '0 0 1')[index % 3]
             chain += (f'<body name="{side}_{index}" pos="0 0 .1">'
-                      '<joint type="hinge" axis="0 0 1"/>'
+                      f'<joint type="hinge" axis="{axis}"/>'
                       '<geom type="sphere" size=".03" pos=".05 0 .06" mass=".01"/>')
-        bodies.append(chain + '</body>' * 6)
+        chain += '</body>' * 6
+        if fixed_base:
+            chain = (f'<body name="{side}_base">'
+                     '<geom type="sphere" size=".03" mass=".01"/>' + chain + '</body>')
+        bodies.append(chain)
     model = mj.MjModel.from_xml_string(
         '<mujoco><worldbody>' + ''.join(bodies) + '</worldbody></mujoco>')
     return cast('LoadedDualArm', SimpleNamespace(
@@ -70,6 +76,56 @@ def test_error_displacement_bound_contains_perturbed_geometry():
             assert float(np.max(np.linalg.norm(after - before[i], axis=1))) <= bounds[side]
 
 
+def test_per_geometry_bounds_cover_large_errors_without_inflating_fixed_base():
+    """固定底座不因末端误差膨胀；每个活动零件仍覆盖完整0.05rad误差盒。"""
+    loaded = envelope_model(fixed_base=True)
+    mj = import_module('mujoco')
+    bounds = geometry_error_displacement_bounds(loaded, .05)
+    model, data = cast(Any, loaded.model), cast(Any, loaded.data)
+    base_ids = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, side + '_base')
+                for side in ('left', 'right')]
+    for side, base in zip(('left', 'right'), base_ids):
+        geom = int(np.flatnonzero(model.geom_bodyid == base)[0])
+        self_bounds = bounds[side]
+        assert self_bounds[geom] == 0.
+        assert len(set(self_bounds.values())) > 2
+    offsets = np.concatenate((np.eye(3), -np.eye(3))) * .03
+    rng = np.random.default_rng(20261021)
+    radii = {geom: float(model.geom_rbound[geom]) for arm in bounds.values() for geom in arm}
+    chains = {}
+    for geom in radii:
+        body = int(model.geom_bodyid[geom])
+        ancestors = []
+        while body:
+            ancestors.extend(int(j) for j in np.flatnonzero(model.jnt_bodyid == body))
+            body = int(model.body_parentid[body])
+        chains[geom] = tuple(reversed(ancestors))
+    for trial in range(30):
+        original = rng.uniform(-2., 2., 12)
+        data.qpos[:] = original
+        mj.mj_forward(model, data)
+        posed = _pose_geometry_error_bounds(data, radii, chains, .05)
+        normal = rng.normal(size=3)
+        normal /= np.linalg.norm(normal)
+        directions = (np.array([0., 0., 1.]), normal)
+        projected = [_pose_geometry_error_bounds(data, radii, chains, .05, direction=n)
+                     for n in directions]
+        before = [data.geom_xpos[i] + offsets @ data.geom_xmat[i].reshape(3, 3).T
+                  for i in range(model.ngeom)]
+        perturbation = (np.full(12, .05 if trial == 0 else -.05) if trial < 2
+                        else rng.uniform(-.05, .05, 12))
+        data.qpos[:] = original + perturbation
+        mj.mj_forward(model, data)
+        for side_bounds in bounds.values():
+            for geom, bound in side_bounds.items():
+                after = data.geom_xpos[geom] + offsets @ data.geom_xmat[geom].reshape(3, 3).T
+                assert np.max(np.linalg.norm(after - before[geom], axis=1)) <= (
+                    min(bound, posed[geom]) + 1e-12)
+                for normal, projection in zip(directions, projected):
+                    assert np.max(np.abs((after - before[geom]) @ normal)) <= (
+                        min(bound, posed[geom], projection[geom]) + 1e-12)
+
+
 def test_error_bound_scales_and_rejects_unsupported_input():
     """误差增大会扩大包围，非法误差或非转动关节不返回通过结果."""
     loaded = envelope_model()
@@ -77,7 +133,15 @@ def test_error_bound_scales_and_rejects_unsupported_input():
     small = joint_error_displacement_bounds(loaded, .0001)
     large = joint_error_displacement_bounds(loaded, .0002)
     assert all(large[s] == 2 * small[s] > 0. for s in small)
-    for value in (True, -.001, .002, float('nan')):
+    allowed = joint_error_displacement_bounds(loaded, .005)
+    assert all(allowed[s] == pytest.approx(50 * small[s]) for s in small)
+    observation = joint_error_displacement_bounds(loaded, .01)
+    assert all(observation[s] == pytest.approx(100 * small[s]) for s in small)
+    wider = joint_error_displacement_bounds(loaded, .02)
+    assert all(wider[s] == pytest.approx(2 * observation[s]) for s in small)
+    coarse = joint_error_displacement_bounds(loaded, .05)
+    assert all(coarse[s] == pytest.approx(5 * observation[s]) for s in small)
+    for value in (True, -.001, .05001, float('nan')):
         with pytest.raises(ValueError):
             joint_error_displacement_bounds(loaded, value)
     model = cast(Any, loaded.model)
@@ -260,6 +324,113 @@ class TaskGeometryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, '本轮保存起点'):
                 check_task_geometry(self.plans, approach=approach, return_home=home)
             loader.assert_not_called()
+
+    def test_recovered_start_returns_to_clipped_saved_initial_with_real_geometry(self) -> None:
+        """真实工程模型检查三段路径，恢复后出发点不同也须归回裁剪后的原始初值."""
+        from archer_hardware.commissioning import load_limits
+
+        limits = load_limits(Path(__file__).resolve().parents[1] / 'config/position_control.yaml')
+        initial = (0., -1.55, 3.13, -1.55, 0., 1.5)
+        goal = (.001, *initial[1:])
+        task = {side: ContinuousPositionTrajectory.prepare(
+            (0, 2000000000), (initial, goal), ((0.,) * 6,) * 2, ((0.,) * 6,) * 2,
+            limits[side], .05,
+        ) for side in ('left', 'right')}
+        recovered = {side: initial for side in task}
+        saved = {side: (0., -1.576, *initial[2:]) for side in task}
+        targets = {side: limits[side].return_goal(saved[side]) for side in task}
+        approach = prepare_approach(task, recovered, max_excursion=.05)
+        home = prepare_return(task, targets, max_excursion=.05)
+        with self.assertRaisesRegex(ValueError, '本轮保存起点'):
+            check_task_geometry(task, approach=approach, return_home=home)
+        result = check_task_geometry(task, approach=approach, return_home=home,
+                                     return_targets=targets)
+        self.assertTrue(result['sampled_cross_arm_table_passed'])
+        self.assertEqual(set(result['phases']), {'APPROACH_FILE', 'TASK', 'RETURN_ACTUAL'})
+        self.assertGreater(result['phases']['RETURN_ACTUAL']['samples_checked'], 2)
+        self.assertIs(result['execution_ready'], False)
+        core = check_task_geometry(task)
+        with patch('archer_hardware.task_geometry.check_samples', wraps=check_samples) as samples:
+            reused = check_task_geometry(task, approach=approach, return_home=home,
+                                         return_targets=targets, verified_task_geometry=core)
+        self.assertEqual(samples.call_count, 2)
+        self.assertTrue(reused['task_geometry_reused'])
+        self.assertEqual(reused['phases'], result['phases'])
+        full = assemble_task_cycle(task, approach=approach, return_home=home,
+                                   return_targets=targets, max_excursion=.1)
+        fast = assemble_task_cycle(task, approach=approach, return_home=home,
+                                   return_targets=targets, max_excursion=.1,
+                                   verified_task_sha256=core['task_trajectory_sha256'])
+        for side in task:
+            self.assertEqual(full[side].times_ns, fast[side].times_ns)
+            self.assertEqual(full[side].position_bounds, fast[side].position_bounds)
+            for a, b in zip(full[side].polynomials, fast[side].polynomials):
+                np.testing.assert_array_equal(a, b)
+        for bad in ({**core, 'task_trajectory_sha256': 'changed'},
+                    {**core, 'joint_error_rad': .001},
+                    {**core, 'model_sha256': 'changed'}):
+            with self.subTest(proof=bad['model_sha256']), self.assertRaises(ValueError):
+                check_task_geometry(task, approach=approach, return_home=home,
+                                    return_targets=targets, verified_task_geometry=bad)
+        with self.assertRaisesRegex(ValueError, '主体轨迹已变化'):
+            assemble_task_cycle(task, approach=approach, return_home=home,
+                                return_targets=targets, max_excursion=.1,
+                                verified_task_sha256='changed')
+        for side in task:
+            self.assertEqual(home[side].goal[1], -1.575)
+            self.assertNotEqual(home[side].goal, approach[side].initial)
+
+    def test_explicit_return_targets_cannot_hide_wrong_home(self) -> None:
+        """明确目标仍需双臂、名义限位及归位段匹配，不放宽错误或缺失归位."""
+        saved = {'left': (-.01,) * 6, 'right': (-.02,) * 6}
+        approach = prepare_approach(self.plans, saved, max_excursion=.05)
+        home = prepare_return(self.plans, saved, max_excursion=.05)
+        with patch('archer_mujoco.dual_model_loader.load_dual_arm') as loader:
+            for targets in ({'left': saved['left']},
+                            {**saved, 'left': (1.001,) * 6},
+                            {**saved, 'right': (.001,) * 6}):
+                with self.subTest(targets=targets), self.assertRaises(ValueError):
+                    check_task_geometry(self.plans, approach=approach, return_home=home,
+                                        return_targets=targets)
+            with self.assertRaisesRegex(ValueError, '完整归位段'):
+                check_task_geometry(self.plans, return_targets=saved)
+            loader.assert_not_called()
+
+    def test_boundary_error_intersection_keeps_collision_clearance(self) -> None:
+        """边界起点允许误差集合取名义范围交集，碰撞膨胀仍覆盖完整误差盒."""
+        from archer_hardware.commissioning import load_limits
+        limits = load_limits(Path(__file__).resolve().parents[1] / 'config/position_control.yaml')
+        initial = (0., -1.5748, 3.13, -1.55, 0., 1.5)
+        goal = (.001, *initial[1:])
+        task = {side: ContinuousPositionTrajectory.prepare(
+            (0, 2_000_000_000), (initial, goal), ((0.,) * 6,) * 2,
+            ((0.,) * 6,) * 2, limits[side], .05) for side in ('left', 'right')}
+        with self.assertRaisesRegex(ValueError, 'URDF限位'):
+            check_task_geometry(task, joint_error_rad=.001)
+        result = check_task_geometry(task, joint_error_rad=.001, nominal_feedback_guarded=True)
+        self.assertTrue(result['sampled_cross_arm_table_passed'])
+        self.assertTrue(result['nominal_feedback_required'])
+        self.assertEqual(result['joint_error_rad'], .001)
+        self.assertGreater(result['checked_cross_arm_clearance_m'], .01)
+        self.assertGreater(result['checked_table_clearance_m'], .001)
+        self.assertFalse(result['execution_ready'])
+        approach = prepare_approach(task, {s: p.initial for s, p in task.items()},
+                                    max_excursion=.05)
+        startup = check_task_geometry(
+            task, approach=approach, joint_error_rad=.001,
+            startup_joint_error_rad=.01, nominal_feedback_guarded=True)
+        self.assertEqual(startup['joint_error_rad'], .001)
+        self.assertEqual(startup['startup_joint_error_rad'], .01)
+        self.assertGreater(startup['startup_displacement_bounds_m']['left'],
+                           startup['displacement_bounds_m']['left'])
+        widened = {s: replace(p, limits=replace(p.limits, lower=(-3.,) * 6))
+                   for s, p in task.items()}
+        with self.assertRaisesRegex(ValueError, '反馈限位必须位于URDF'):
+            check_task_geometry(widened, joint_error_rad=.001, nominal_feedback_guarded=True)
+        bounds = ((-3., 0.),) + task['left'].position_bounds[1:]
+        with self.assertRaisesRegex(ValueError, 'URDF限位'):
+            check_task_geometry({**task, 'left': replace(task['left'], position_bounds=bounds)},
+                                joint_error_rad=.001, nominal_feedback_guarded=True)
 
 
 class TaskCycleTests(unittest.TestCase):

@@ -1,0 +1,118 @@
+{
+  "format_version": 1,
+  "data_kind": "hardware_observation",
+  "trajectory_replay_ready": false,
+  "task_started_at": "2026-10-20T17:16:22.034344+08:00",
+  "control_arm": "left",
+  "readonly_arm": "right",
+  "observation_completed": true,
+  "reference_playback_completed": true,
+  "precision_passed": true,
+  "precision_criterion_rad": 0.003,
+  "result_note": "观察流程完成与精度达标分别评价；未验收六轴独立运动、多关节组合或双臂同步。",
+  "points_rad": {
+    "raw_initial": [
+      0.008322616188737805,
+      -1.55564598380502,
+      3.130809133884478,
+      -1.5725654266618778,
+      -0.055635266095004715,
+      1.6722499811536833
+    ],
+    "return_target": [
+      0.008322616188737805,
+      -1.55564598380502,
+      3.130809133884478,
+      -1.56,
+      -0.055635266095004715,
+      1.6722499811536833
+    ],
+    "outward_target": [
+      0.008322616188737805,
+      -1.55564598380502,
+      3.130809133884478,
+      -1.51,
+      -0.055635266095004715,
+      1.6722499811536833
+    ]
+  },
+  "final_positions_rad": [
+    0.008320404813904078,
+    -1.5556187339602947,
+    3.130809133884478,
+    -1.562480416065332,
+    -0.05586536321318756,
+    1.672604414605259
+  ],
+  "max_tracking_error_rad": 0.0055161592216717015,
+  "final_max_joint_error_rad": 0.002480416065332003,
+  "j4_result": {
+    "commanded_excursion_rad": 0.050000000000000044,
+    "actual_peak_rad": -1.5142968411479372,
+    "actual_peak_relative_to_return_target_rad": 0.045703158852062886,
+    "actual_peak_error_rad": -0.004296841147937158,
+    "return_target_rad": -1.56,
+    "actual_return_rad": -1.562480416065332,
+    "return_error_rad": -0.002480416065332003,
+    "return_error_deg": -0.14211737197996963
+  },
+  "reference_duration_s": 32.0,
+  "actual_duration_s": 49.18110369401984,
+  "transmission": {
+    "max_gap_ms": 9.693579049780965,
+    "mean_gap_ms": 4.558691409285005
+  },
+  "safety": {
+    "actual_within_nominal_limits_at_end": true,
+    "tracking_stop_rad": 0.03,
+    "brake_transport_returned": true,
+    "physical_brake_independently_confirmed": false,
+    "connections_closed": {
+      "left": true,
+      "right": true
+    },
+    "final_velocities_rad_s": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "errors": {}
+  },
+  "files": {
+    "reference.csv": "实际下发位置目标与主机时间记录",
+    "state.csv": "左右臂反馈及最近发送目标，非完整端到端时钟对齐",
+    "summary.json": "本轮范围、结果、精度、保护与源版本"
+  },
+  "source_sha256": {
+    "src/archer_hardware/archer_hardware/position_adapter.py": "0c9035cc66e4b2fee74c1b9d9ef870724e967edc3f1199c8de101d048c67f79f",
+    "src/archer_hardware/archer_hardware/hex_adapter.py": "af7ee88c527d5f8e55ee3cd45ab6e4b5733e97ec75298cd13d1bd0f290b7df46",
+    "src/archer_hardware/archer_hardware/sdk_position.py": "3344fbab4e9bb489d05ee418667aeff2408803d6c855acbbac024dd5b41720c7",
+    "src/archer_hardware/archer_hardware/sdk_cycle.py": "98f2b1e044e74c14c61f1adf9b5a912db56ef97e4c2311fc5d6e3a58efbff36d"
+  },
+  "limits_sha256": "f923b4a5189c1a7a49e5e9af923a09adc4d18ed118ed049e8be9f5806a3d937b",
+  "development_script_sha256": {
+    "verify_recovery62.py": "6ce6f15c1eb9887000ee74e0a283aa698f8e3096599882858e1c2aa5657d4ece",
+    "recovery62.sh": "a028411d9f61cdeac64860a73c04d14d87219838893ff5ada71186d69152792d"
+  },
+  "replay_note": "本目录CSV是观察记录，不是通过正式任务文件预检的可执行轨迹。",
+  "reported_parking_by_port_side": {
+    "right": {
+      "samples": 2312,
+      "parking_fields": {
+        "parking_stop_detail": {
+          "reason": "API communication timeout",
+          "category": "PscAPICommunicationTimeout",
+          "is_remotely_clearable": true
+        }
+      }
+    },
+    "left": {
+      "samples": 2312,
+      "parking_fields": {}
+    }
+  },
+  "parking_note": "右侧只读反馈保留API通信超时停车状态；本轮左臂自身反馈没有停车字段，未对右侧清除或申请控制。"
+}

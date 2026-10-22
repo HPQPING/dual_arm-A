@@ -1,0 +1,124 @@
+{
+  "task_started_at": "2026-10-20T20:12:54.431813+08:00",
+  "source_sha256": "d46701986c8c0bbee519d8072a8e8234840988a83e310c2d0d951763a1b57b2c",
+  "control_backend": "original_sdk_arm_motor_command",
+  "control_arm": "right",
+  "readonly_arm": "left",
+  "scope": "实测起点、必要时入限、仅右J3向内0.2rad/20.0墙钟秒往返，端点2秒保持；其余轴主段冻结.",
+  "large_j3": true,
+  "requested_amplitude_rad": 0.2,
+  "travel_seconds": 20.0,
+  "j3_diagnostic_window": true,
+  "tracking_error_bounds_rad": [
+    0.03,
+    0.03,
+    0.06,
+    0.03,
+    0.03,
+    0.03
+  ],
+  "diagnostic_reported_j3_torque_cap_nm": 6.0,
+  "errors": {},
+  "connections_closed": {
+    "right": true,
+    "left": true
+  },
+  "reference_playback_completed": true,
+  "observation_completed": true,
+  "precision_passed": false,
+  "self_collision_checked": false,
+  "continuous_collision_proven": false,
+  "physical_brake_confirmed": false,
+  "preflight": {
+    "samples": 2001,
+    "start_rad": {
+      "left": [
+        0.020505508155769486,
+        -1.555552392715283,
+        3.130359725450527,
+        -1.5664683095719336,
+        -0.055673615614701855,
+        1.6787598121222727
+      ],
+      "right": [
+        0.051666775619202354,
+        -1.5693877523604849,
+        3.1306450641387498,
+        -1.5665276600190838,
+        -0.007918876211836989,
+        1.6028661126416308
+      ]
+    }
+  },
+  "observation_points_rad": {
+    "raw_initial": [
+      0.051666775619202354,
+      -1.5693877523604849,
+      3.1306450641387498,
+      -1.5665276600190838,
+      -0.007918876211836989,
+      1.6028661126416308
+    ],
+    "return_target": [
+      0.051666775619202354,
+      -1.56,
+      3.1300000000000003,
+      -1.56,
+      -0.007918876211836989,
+      1.6028661126416308
+    ],
+    "outward_target": [
+      0.051666775619202354,
+      -1.56,
+      2.93,
+      -1.56,
+      -0.007918876211836989,
+      1.6028661126416308
+    ]
+  },
+  "planned_duration_s": 52.0,
+  "entry_duration_s": 8.0,
+  "requested_j3_delta_rad": -0.20000000000000018,
+  "pulse_per_rotation": [
+    88080384.0,
+    88080384.0,
+    88080384.0,
+    88080384.0,
+    20971520.0,
+    20971520.0
+  ],
+  "max_tracking_error_rad": 0.031011250648099953,
+  "final_positions_rad": [
+    0.05181978849076182,
+    -1.568372089299756,
+    3.1309940333544466,
+    -1.564365791447764,
+    -0.008206497609565546,
+    1.603518054476482
+  ],
+  "final_velocities_rad_s": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "final_goal_error_rad": 0.008372089299755858,
+  "j3_return_error_rad": 0.0009940333544462554,
+  "max_observed_j3_excursion_rad": 0.1744400950128644,
+  "motion_elapsed_s": 52.00105447601527,
+  "response_passed": true,
+  "brake_transport_returned": true,
+  "counts": {
+    "report_frequency": 1,
+    "clear_api_timeout": 1,
+    "initialize": 1,
+    "position_hold": 11420,
+    "brake": 1
+  },
+  "directory": "/home/user/.cache/archer_development/native_j3_small88_20261020_201347_720936",
+  "data_kind": "hardware_observation",
+  "trajectory_replay_ready": false,
+  "timestamp_note": "主机观测时间；已发送观察指令不是完整任务回放文件."
+}

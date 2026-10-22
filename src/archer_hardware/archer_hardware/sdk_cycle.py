@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from copy import deepcopy
 from threading import Event, RLock
 import time
 from typing import Any, Callable
@@ -16,6 +17,7 @@ class PendingCommand:
     epoch: int
     deadline: float
     delivered: Event
+    target: tuple[float, ...] | None = None
 
 
 class SdkCycleSender:
@@ -34,6 +36,37 @@ class SdkCycleSender:
         self.pending: dict[str, PendingCommand] = {}
         self.closed = False
         self.last_position: tuple[float, ...] | None = None
+        self.last_position_at: float | None = None
+        self.sample_position: Callable[[], tuple[float, ...] | None] | None = None
+
+    def encode_position(self, arm: Any, command: Any, encode: Callable[[Any], Any]) -> Any:
+        """在官方周期实际构包时取样，避免反复发送旧缓存后跳到较晚目标。"""
+        with self.lock:
+            request = self.pending.get('position')
+            if (self.closed or self.sample_position is None or request is None
+                    or command.command_type != self.types.POSITION):
+                return encode(command)
+            if request.epoch != self.epoch():
+                raise RuntimeError('SDK 构包时目标代次已失效')
+            if time.perf_counter() > request.deadline:
+                raise RuntimeError('SDK 目标超过40ms未更新，禁止周期取样复活旧任务')
+            target = self.sample_position()
+            if target is None:
+                return encode(command)
+            sampled = deepcopy(command)
+            sampled.position_command = list(target)
+            message = encode(sampled)
+            self.check(message, 'position')
+            request.encoded = message.arm_command.SerializeToString()
+            request.target = target
+            return message
+
+    def position_timing(self) -> tuple[tuple[float, ...], float] | None:
+        """返回上一实际发送位置及其单调时间间隔，不使用规划缓存更新时刻。"""
+        with self.lock:
+            if self.last_position is None or self.last_position_at is None:
+                return None
+            return self.last_position, time.perf_counter() - self.last_position_at
 
     def publish(
         self, arm: Any, message: Any, kind: str, target: tuple[float, ...] | None,
@@ -57,9 +90,18 @@ class SdkCycleSender:
                 arm.clear_parking_stop()
             elif kind not in ('calibrate', 'heartbeat'):
                 raise ValueError('未知 SDK 周期请求')
+            encoded = message.arm_command.SerializeToString()
+            previous = self.pending.get(kind)
+            if (kind == 'position' and previous is not None
+                    and previous.encoded == encoded and previous.epoch == self.epoch()
+                    and previous.target == target and not previous.delivered.is_set()):
+                # 重复同一目标刷新有效期，但保留正在等待的发送确认事件。
+                previous.deadline = time.perf_counter() + .04
+                return previous.delivered
             self.pending[kind] = PendingCommand(
-                message.arm_command.SerializeToString(), self.epoch(),
+                encoded, self.epoch(),
                 time.perf_counter() + .04, delivered,
+                target if kind == 'position' else None,
             )
             return delivered
 
@@ -68,6 +110,7 @@ class SdkCycleSender:
         with self.lock:
             self.pending.clear()
             self.last_position = None
+            self.last_position_at = None
 
     def close(self) -> None:
         """关闭发送准入，不发失能、归位或零力矩命令."""
@@ -75,6 +118,13 @@ class SdkCycleSender:
             self.closed = True
             self.pending.clear()
             self.last_position = None
+            self.last_position_at = None
+
+    def wait_pending_brake(self, timeout: float = .05) -> bool:
+        """等待已发布BRAKE的底层发送完成，不发布新命令，也不证明物理制动."""
+        with self.lock:
+            request = self.pending.get('brake')
+        return request is None or request.delivered.wait(timeout)
 
     async def dispatch(self, api: Any, base: Any, arm: Any, message: Any) -> None:
         """只转发仍有效且与项目预期完全相同的厂商原生周期报文."""
@@ -137,14 +187,18 @@ class SdkCycleSender:
                 self.check(message, kind)
                 captured = request
             # 只有这一处调用官方传输；没有第二套项目周期发送器。
+            sent_at = time.perf_counter()
             await base._send_down_message(api, message)
             with self.lock:
                 captured.delivered.set()
+                if (kind == 'position' and captured.epoch == self.epoch()
+                        and not self.closed):
+                    # 实际发送已完成，即使缓存已更新，也须登记这份包的原始目标。
+                    # 不读可能已被后来构造操作更新的SDK历史，更不复活取消代次。
+                    self.last_position = captured.target
+                    self.last_position_at = sent_at
                 if self.pending.get(kind) is captured:
-                    if kind == 'position':
-                        positions = arm.get_last_positions()
-                        self.last_position = tuple(positions) if positions is not None else None
-                    elif kind in ('initialize', 'calibrate', 'clear_api_timeout'):
+                    if kind in ('initialize', 'calibrate', 'clear_api_timeout'):
                         self.pending.pop(kind)
         except Exception as error:
             self.fail(str(error))

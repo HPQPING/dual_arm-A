@@ -7,6 +7,7 @@
     prefix：左右臂名称前缀，例如 left_ 或 right_。
     网格、惯性、关节原点和限位来自现有 archer_y6.urdf。
     所有长度单位为米，角度单位为弧度。
+    用户授权J2/J4下限增加0.005rad工程余量，不修改控制器固件限位。
   -->
 
   <xacro:macro name="archer_link"
@@ -160,7 +161,7 @@
       parent="link_1" child="link_2"
       xyz="0.02 0 0.045"
       axis="0 1 0"
-      lower="-1.57" upper="2.09"
+      lower="-1.575" upper="2.09"
       effort="6" velocity="6"/>
 
     <xacro:archer_joint
@@ -176,7 +177,7 @@
       parent="link_3" child="link_4"
       xyz="-0.06 0 0.245"
       axis="0 1 0"
-      lower="-1.57" upper="1.57"
+      lower="-1.575" upper="1.57"
       effort="3" velocity="3"/>
 
     <xacro:archer_joint

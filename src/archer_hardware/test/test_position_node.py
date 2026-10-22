@@ -450,8 +450,16 @@ class PositionNodeTests(unittest.TestCase):
         self.assertFalse(any(kind == 'move' for kind, _ in left.calls + right.calls))
         node.stage_target('left', self.target('left'))
         left.positions = (-2.001, 0.101) + (0.1,) * 4
-        self.assertTrue(self.service('left/recover_limits').success)
-        self.wait_until(lambda: node.workers['left'].snapshot().phase == 'SUCCEEDED')
+        response = self.service('left/recover_limits')
+        self.assertTrue(response.success)
+        identifier = response.message.split()[1].split('，', 1)[0]
+
+        def recovery_completed() -> bool:
+            """不能把上一条使能请求的SUCCEEDED误当成这次收回已完成."""
+            snapshot = node.workers['left'].snapshot()
+            return snapshot.command_id == identifier and snapshot.phase == 'SUCCEEDED'
+
+        self.wait_until(recovery_completed)
         self.assertEqual(left.goal, (-1.995, 0.101) + (0.1,) * 4)
         self.assertNotIn('left', node._targets)
         self.assertFalse(any(kind == 'move' for kind, _ in right.calls))
@@ -1037,7 +1045,8 @@ class PositionNodeTests(unittest.TestCase):
             self.assertFalse(any(kind == 'trajectory_start'
                                  for kind, _ in self.backend(node, side).calls))
 
-    def file_preflight(self, text, limits, excursion, starts, cancelled, *, saved_initial=None):
+    def file_preflight(self, text, limits, excursion, starts, cancelled, *, saved_initial=None,
+                       hold_start=None, joint_error_rad=0., startup_joint_error_rad=0.):
         """合成三段数学路径，替代磁盘和几何耗时步骤，始终不访问设备."""
         from archer_hardware.task_geometry import assemble_task_cycle, prepare_approach
         from archer_hardware.task_geometry import prepare_return
@@ -1046,7 +1055,8 @@ class PositionNodeTests(unittest.TestCase):
             (0, 500000000), ((.1,) * 6, (.105,) * 6),
             ((0.,) * 6,) * 2, ((0.,) * 6,) * 2, limits[side], excursion,
         ) for side in ('left', 'right')}
-        approach = prepare_approach(task, starts, max_excursion=excursion)
+        approach = prepare_approach(task, starts if hold_start is None else hold_start,
+                                    max_excursion=excursion)
         targets = {side: limits[side].return_goal((saved_initial or starts)[side])
                    for side in ('left', 'right')}
         home = prepare_return(task, targets, max_excursion=excursion)
@@ -1090,7 +1100,8 @@ class PositionNodeTests(unittest.TestCase):
                 side: replace(p, joint_error_rad=options['joint_error_rad'])
                 for side, p in result.continuous.items()
             }, details={**result.details, 'joint_error_rad': options['joint_error_rad'],
-                        'sampled_geometry': {'joint_error_rad': options['joint_error_rad']}})
+                        'sampled_geometry': {'joint_error_rad': options['joint_error_rad'],
+                                             'nominal_feedback_required': True}})
 
         with patch('archer_hardware.position_node.prepare_file_task_message',
                    side_effect=preflight):
@@ -1144,6 +1155,8 @@ class PositionNodeTests(unittest.TestCase):
                                  for kind, _ in self.backend(node, side).calls))
         node._file_execute_callback(String(data='a' * 32))
         self.wait_until(lambda: node._paired_phase == 'FINISHED', timeout=5.)
+        assert node._paired_gate is not None
+        self.assertEqual(node._paired_gate.playback_status()['stream_period_s'], .004)
         for side in node.sides:
             backend = self.backend(node, side)
             self.assertEqual(backend.positions, (.1,) * 6)

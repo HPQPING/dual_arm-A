@@ -31,11 +31,16 @@ def isolated_arm_class() -> Any:
             self._project_position_ready = False
             self._project_config_loaded = False
             self._project_position_error: Any = None
+            self._project_position_timing: Any = None
+            self._project_position_encoder: Any = None
             super().__init__(*args, **kwargs)
 
         def _construct_joint_command_msg(self, command: Any) -> Any:
             """编码异常传给项目故障锁存，防止厂商循环仅写日志后继续重试."""
             try:
+                if self._project_position_encoder is not None:
+                    return self._project_position_encoder(
+                        self, command, super()._construct_joint_command_msg)
                 return super()._construct_joint_command_msg(command)
             except Exception as error:
                 if self._project_position_error is not None:
@@ -82,7 +87,7 @@ def isolated_arm_class() -> Any:
                 self._project_position_ready = True
 
         def validate_joint_positions(self, positions: Any, dt: float = 0.002) -> list[float]:
-            """沿用厂商位置限速器，若目标被改变则还原历史并拒绝构造报文."""
+            """按实际发送间隔调用厂商限速器；不扩大速度上限或允许过期续发。"""
             requested = list(six_values(positions))
             if isinstance(dt, bool) or not math.isfinite(dt) or dt <= 0:
                 raise ValueError('SDK 位置校验周期必须为有限正数')
@@ -90,12 +95,30 @@ def isolated_arm_class() -> Any:
                 previous = self.get_last_positions()
                 if not self._project_position_ready or previous is None:
                     raise RuntimeError('SDK 位置历史未初始化，需要重新读取实际起点')
+                if self._project_position_timing is not None:
+                    timing = self._project_position_timing()
+                    if timing is not None:
+                        sent, elapsed = timing
+                        if (isinstance(elapsed, bool) or not math.isfinite(elapsed)
+                                or not 0. <= elapsed <= .04):
+                            raise RuntimeError('SDK 实际位置发送间隔超过40ms或时钟无效')
+                        # SDK漏过缓存时，实际包间隔大于名义周期。使用实际上一包
+                        # 而非未发送的构造历史；早到周期仍沿用厂商名义限速步长。
+                        dt = max(dt, elapsed)
+                        previous = list(six_values(sent))
+                        self._project_config.set_last_positions(
+                            self.robot_type, previous)
                 result = self._project_config.validate_joint_positions(
                     self.robot_type, requested, dt,
                 )
                 if result != requested:
                     self._project_config.set_last_positions(self.robot_type, previous)
-                    raise ValueError('SDK 将裁剪位置或速度，拒绝改写已验证路径')
+                    axis = next(i for i, (a, b) in enumerate(zip(result, requested)) if a != b)
+                    raise ValueError(
+                        'SDK 将裁剪位置或速度，拒绝改写已验证路径：'
+                        f'J{axis + 1}，前目标={previous[axis]:.9f}rad，'
+                        f'新目标={requested[axis]:.9f}rad，周期={dt:.6f}s，'
+                        f'包间速度={(requested[axis] - previous[axis]) / dt:.6f}rad/s')
                 return list(result)
 
         def get_last_positions(self) -> list[float] | None:

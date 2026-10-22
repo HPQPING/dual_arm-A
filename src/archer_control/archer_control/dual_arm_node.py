@@ -30,6 +30,7 @@ from .dual_arm_trajectory import (
     peak_target_speeds,
     plan_paired_joints,
     append_return_home,
+    continuous_paired_plan,
 )
 from .kinematics import ArmKinematics
 from .circle_planner import plan_circle, semicircle_points, inward_rotation
@@ -68,6 +69,7 @@ class DualArmTask(Node):
     def __init__(self) -> None:
         super().__init__("dual_arm_task")
         defaults = {
+            "acceleration_limits": [0.3] * 6,
             "task_type": "split_circle",
             "start_delay": 3.0,
             "feedback_timeout": 0.5,
@@ -136,6 +138,9 @@ class DualArmTask(Node):
         if min(self.feedback_timeout, self.minimum, self.tolerance, self.velocity_limit) <= 0:
             raise ValueError("Timeout, duration and tolerances must be positive")
         self.speeds = self.read_vector("speed_limits", 6)
+        self.accelerations = self.read_vector("acceleration_limits", 6)
+        if min(self.accelerations) <= 0:
+            raise ValueError('Acceleration limits must be positive')
         if min(self.speeds) <= 0:
             raise ValueError("Speed limits must be positive")
         tcp = self.read_vector("tcp_xyz", 3)
@@ -423,6 +428,13 @@ class DualArmTask(Node):
                 self.margin,
             ),
         )
+        count = len(result.plan.left.times)
+        result = replace(result, plan=continuous_paired_plan(
+            result.plan, self.kinematics.left.limits, self.kinematics.right.limits,
+            self.speeds, self.accelerations, (0, result.arc_first_index, count - 2, count - 1),
+            margin=self.margin,
+        ))
+        return_start = float(result.plan.left.times[-2])
         for arm_plan in (result.plan.left, result.plan.right):
             if np.any(peak_target_speeds(arm_plan) > np.asarray(self.speeds) + 1e-10):
                 raise ValueError("规划速度超出任务 speed_limits，请提高 time_margin 后重试")

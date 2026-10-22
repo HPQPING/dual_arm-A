@@ -35,8 +35,8 @@ single_arm_task:
 
     speed_limits: [0.1, 0.5, 0.5, 0.5, 0.5, 0.5]
     # Flat array: J1 lower/upper, J2 lower/upper, ... J6 lower/upper.
-    joint_limits: [-2.79, 2.79, -1.57, 2.09, 0.0, 3.14,
-                   -1.57, 1.57, -1.55, 1.55, -2.96, 2.96]
+    joint_limits: [-2.79, 2.79, -1.575, 2.09, 0.0, 3.14,
+                   -1.575, 1.57, -1.55, 1.55, -2.96, 2.96]
 
     # Six numbers per waypoint (radians). Small excursion then return.
     waypoints: [0.1, -0.7, 1.5, -0.8, 0.0, 0.0,

@@ -3,6 +3,7 @@
 import csv
 import io
 import json
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -12,7 +13,7 @@ from unittest.mock import patch
 import yaml
 
 from archer_hardware.commissioning import review_joint_plan
-from archer_hardware.csv_import import import_samples, prepare_samples
+from archer_hardware.csv_import import import_samples, prepare_samples, replace_conversion_pair
 from archer_hardware.operator_client import main
 from archer_hardware.position_plan import PositionLimits
 
@@ -122,7 +123,7 @@ class CsvImportTests(unittest.TestCase):
         plan, report = prepare_samples(samples, self.limits)
         self.assertEqual(plan['version'], 2)
         self.assertEqual(plan['interpolation'], 'quintic_c2')
-        self.assertGreater(report['uniform_time_scale'], 1.)
+        self.assertGreater(report['effective_time_scale'], 1.)
         self.assertTrue(report['continuous_constraints_passed'])
         self.assertFalse(report['execution_ready'])
         self.assertFalse(report['phase_execution_policy_verified'])
@@ -145,6 +146,22 @@ class CsvImportTests(unittest.TestCase):
         self.assertEqual(plan['left']['points'][1]['velocities'], [0.] * 6)
         self.assertEqual(report['reference_events'][1]['gripper_command'], 1.)
         self.assertNotIn('gripper_command', plan)
+
+    def test_local_timing_preserves_samples_and_event_boundary(self) -> None:
+        """局部瓶颈不拖慢整轮，参考事件落在新时间轴对应点而不是误用平均倍率."""
+        positions = (0., .0001, .0002, .0003, .0004, .0005, .0006, .0007,
+                     .03, .029, .028, .02, .01, .001, 0.)
+        samples, _ = import_samples(state_csv(
+            times=tuple(i * .05 for i in range(len(positions))), positions=positions), self.limits)
+        plan, report = prepare_samples(samples, self.limits)
+        self.assertEqual(report['timing_policy'], 'local_segment_c2')
+        self.assertLess(report['duration_s'], report['uniform_baseline_duration_s'])
+        for side in ('left', 'right'):
+            self.assertEqual([p['positions'] for p in plan[side]['points']],
+                             [p['positions'] for p in samples[side]['points']])
+        final = plan['left']['points'][-1]['time_from_start']
+        self.assertEqual(report['reference_events'][-1]['prepared_time_ns'],
+                         final['sec'] * 10 ** 9 + final['nanosec'])
         self.assertFalse(report['commands_sent'])
 
     def test_prepare_rejects_unpaired_or_unusable_candidates(self) -> None:
@@ -157,10 +174,13 @@ class CsvImportTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             prepare_samples(samples, self.limits)
 
-    def test_cli_uses_completed_run_no_ros_sdk_or_overwrite(self) -> None:
-        """仅在同一成功目录增加两个JSON，保留原始文件，禁止初始化ROS和SDK."""
+    def test_cli_replaces_latest_conversion_without_ros_or_sdk(self) -> None:
+        """默认独立目录同名替换，只读原记录，转换失败保留上次成功文件."""
         with TemporaryDirectory() as folder:
-            root = Path(folder)
+            workspace = Path(folder)
+            root = workspace / 'archer_results' / 'completed_task'
+            root.mkdir(parents=True)
+            converted = workspace / 'archer_results_trans' / root.name
             source, summary = root / 'state.csv', root / 'summary.json'
             config = root / 'limits.yaml'
             source.write_bytes(state_csv())
@@ -179,41 +199,84 @@ class CsvImportTests(unittest.TestCase):
             ):
                 self.assertEqual(main(args), 0)
                 initialize.assert_not_called()
-            report = json.loads((root / 'recorded_path_report.json').read_text())
+            report = json.loads((converted / 'state_report.json').read_text())
             self.assertEqual(len(report['csv_sha256']), 64)
             self.assertFalse(report['commands_sent'])
             self.assertEqual((source.read_bytes(), summary.read_bytes()), before)
-            saved = (root / 'recorded_path.json').read_bytes()
-            with self.assertRaises(SystemExit):
-                main(args)
-            self.assertEqual((root / 'recorded_path.json').read_bytes(), saved)
+            saved = (converted / 'state.json').read_bytes()
+            source.write_bytes(state_csv(positions=(0., .0015, .003)))
+            before = source.read_bytes(), summary.read_bytes()
+            self.assertEqual(main(args), 0)
+            self.assertNotEqual((converted / 'state.json').read_bytes(), saved)
+            self.assertEqual(sorted(p.name for p in converted.iterdir()),
+                             ['state.json', 'state_report.json'])
             with patch('rclpy.init') as initialize, patch(
                 'archer_hardware.hex_adapter.verified_sdk', side_effect=AssertionError('SDK'),
             ):
                 self.assertEqual(main(args + ['--prepare']), 0)
                 initialize.assert_not_called()
-            prepared = json.loads((root / 'prepared_path.json').read_text())
+            prepared = json.loads((converted / 'state.json').read_text())
             self.assertEqual(prepared['version'], 2)
-            prepared_report = json.loads((root / 'prepared_path_report.json').read_text())
+            prepared_report = json.loads((converted / 'state_report.json').read_text())
             self.assertTrue(prepared_report['preparation_succeeded'])
             self.assertFalse(prepared_report['execution_ready'])
+            self.assertEqual(prepared_report['conversion_mode'], 'prepared_continuous')
+            self.assertIn('converted_at', prepared_report)
             self.assertEqual((source.read_bytes(), summary.read_bytes()), before)
+            self.assertFalse((root / 'state.json').exists())
+            self.assertFalse((root / 'state_report.json').exists())
+            custom = workspace / 'custom' / 'trajectory.json'
+            self.assertEqual(main(args + ['--prepare', '--output', str(custom)]), 0)
+            self.assertTrue(custom.is_file())
+            self.assertTrue(custom.with_name('trajectory_report.json').is_file())
             params['left_max_velocity'] = [1e-8] * 6
             config.write_text(yaml.safe_dump({
                 'archer_position_driver': {'ros__parameters': params},
             }))
+            previous = ((converted / 'state.json').read_bytes(),
+                        (converted / 'state_report.json').read_bytes())
+            self.assertEqual(main(args + ['--prepare']), 1)
+            self.assertEqual(((converted / 'state.json').read_bytes(),
+                              (converted / 'state_report.json').read_bytes()), previous)
             self.assertEqual(main(args + [
                 '--prepare', '--output', str(root / 'too_slow.json'),
                 '--report', str(root / 'too_slow_report.json'),
             ]), 1)
             self.assertFalse((root / 'too_slow.json').exists())
-            rejected = json.loads((root / 'too_slow_report.json').read_text())
-            self.assertFalse(rejected['import_succeeded'])
+            self.assertFalse((root / 'too_slow_report.json').exists())
             summary.write_text(json.dumps({'state': 'FAILED'}))
             failure_args = args + ['--output', str(root / 'rejected.json'),
                                    '--report', str(root / 'failed_report.json')]
             self.assertEqual(main(failure_args), 1)
             self.assertFalse((root / 'rejected.json').exists())
+
+    def test_pair_replacement_rolls_back_on_report_failure(self) -> None:
+        """第二个文件替换失败时恢复旧轨迹，首次转换失败则不留下半套文件."""
+        real_replace = os.replace
+        for existed in (False, True):
+            with self.subTest(existed=existed), TemporaryDirectory() as folder:
+                root = Path(folder)
+                output, report = root / 'state.json', root / 'state_report.json'
+                if existed:
+                    output.write_bytes(b'old trajectory')
+                    report.write_bytes(b'old report')
+
+                def fail_report(source: Any, target: Any) -> None:
+                    if Path(target) == report and Path(source).name == 'new':
+                        raise OSError('模拟报告替换失败')
+                    real_replace(source, target)
+
+                with patch('archer_hardware.csv_import.os.replace', side_effect=fail_report):
+                    with self.assertRaises(OSError):
+                        replace_conversion_pair(output, b'new trajectory', report, b'new report')
+                if existed:
+                    self.assertEqual(output.read_bytes(), b'old trajectory')
+                    self.assertEqual(report.read_bytes(), b'old report')
+                else:
+                    self.assertFalse(output.exists())
+                    self.assertFalse(report.exists())
+                self.assertEqual(sorted(p.name for p in root.iterdir()),
+                                 ['state.json', 'state_report.json'] if existed else [])
 
 
 if __name__ == '__main__':

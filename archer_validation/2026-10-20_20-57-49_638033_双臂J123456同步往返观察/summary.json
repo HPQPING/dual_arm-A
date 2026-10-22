@@ -1,0 +1,388 @@
+{
+  "task_started_at": "2026-10-20T20:57:49.638033+08:00",
+  "scope": "双臂全六轴共同参考时钟：J3为0.20rad、J2为0.05rad、其余选中轴0.03rad，20参考秒去回、端点2秒；J3窗口0.06rad、其余0.03rad，J3反馈力矩幅值上限6Nm.",
+  "observation_joints": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "j3_observation_policy": true,
+  "control_arm": "both",
+  "states": [
+    {
+      "left": {
+        "calibrated": true,
+        "api_control_initialized": false,
+        "session_holder": 0,
+        "my_session_id": 9,
+        "parking": {
+          "reason": "API communication timeout",
+          "category": "PscAPICommunicationTimeout",
+          "is_remotely_clearable": true
+        },
+        "motor_errors": [
+          null,
+          null,
+          null,
+          null,
+          null,
+          null
+        ]
+      },
+      "right": {
+        "calibrated": true,
+        "api_control_initialized": false,
+        "session_holder": 0,
+        "my_session_id": 8,
+        "parking": {
+          "reason": "API communication timeout",
+          "category": "PscAPICommunicationTimeout",
+          "is_remotely_clearable": true
+        },
+        "motor_errors": [
+          null,
+          null,
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "left": {
+        "calibrated": true,
+        "api_control_initialized": false,
+        "session_holder": 0,
+        "my_session_id": 9,
+        "parking": {},
+        "motor_errors": [
+          null,
+          null,
+          null,
+          null,
+          null,
+          null
+        ]
+      },
+      "right": {
+        "calibrated": true,
+        "api_control_initialized": false,
+        "session_holder": 0,
+        "my_session_id": 8,
+        "parking": {
+          "reason": "API communication timeout",
+          "category": "PscAPICommunicationTimeout",
+          "is_remotely_clearable": true
+        },
+        "motor_errors": [
+          null,
+          null,
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "left": {
+        "calibrated": true,
+        "api_control_initialized": true,
+        "session_holder": 9,
+        "my_session_id": 9,
+        "parking": {},
+        "motor_errors": [
+          null,
+          null,
+          null,
+          null,
+          null,
+          null
+        ]
+      },
+      "right": {
+        "calibrated": true,
+        "api_control_initialized": false,
+        "session_holder": 0,
+        "my_session_id": 8,
+        "parking": {},
+        "motor_errors": [
+          null,
+          null,
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "left": {
+        "calibrated": true,
+        "api_control_initialized": true,
+        "session_holder": 9,
+        "my_session_id": 9,
+        "parking": {},
+        "motor_errors": [
+          null,
+          null,
+          null,
+          null,
+          null,
+          null
+        ]
+      },
+      "right": {
+        "calibrated": true,
+        "api_control_initialized": true,
+        "session_holder": 8,
+        "my_session_id": 8,
+        "parking": {},
+        "motor_errors": [
+          null,
+          null,
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    }
+  ],
+  "source_sha256": {
+    "src/archer_hardware/archer_hardware/position_adapter.py": "0c9035cc66e4b2fee74c1b9d9ef870724e967edc3f1199c8de101d048c67f79f",
+    "src/archer_hardware/archer_hardware/hex_adapter.py": "af7ee88c527d5f8e55ee3cd45ab6e4b5733e97ec75298cd13d1bd0f290b7df46",
+    "src/archer_hardware/archer_hardware/sdk_position.py": "3344fbab4e9bb489d05ee418667aeff2408803d6c855acbbac024dd5b41720c7",
+    "src/archer_hardware/archer_hardware/sdk_cycle.py": "98f2b1e044e74c14c61f1adf9b5a912db56ef97e4c2311fc5d6e3a58efbff36d"
+  },
+  "limits_sha256": "f923b4a5189c1a7a49e5e9af923a09adc4d18ed118ed049e8be9f5806a3d937b",
+  "errors": {},
+  "connections_closed": {
+    "left": true,
+    "right": true
+  },
+  "pulse_per_rotation": {
+    "left": [
+      88080384.0,
+      88080384.0,
+      88080384.0,
+      88080384.0,
+      20971520.0,
+      20971520.0
+    ],
+    "right": [
+      88080384.0,
+      88080384.0,
+      88080384.0,
+      88080384.0,
+      20971520.0,
+      20971520.0
+    ]
+  },
+  "reference_playback_completed": true,
+  "observation_completed": true,
+  "precision_passed": false,
+  "physical_brake_confirmed": false,
+  "continuous_collision_proven": false,
+  "self_collision_checked": false,
+  "cable_collision_checked": false,
+  "prior_stage": "/home/user/.cache/archer_development/suite81_combined_20261020_205322/suite.json",
+  "max_tracking_error_rad": 0.030416295724007725,
+  "max_observed_excursion_rad": {
+    "left": [
+      0.030581459248964188,
+      0.030387428940972905,
+      0.17303822603762598,
+      0.029342090656668596,
+      0.028599453919765556,
+      0.029251096148994238
+    ],
+    "right": [
+      0.029355572909687086,
+      0.03668556713676985,
+      0.17461843169300373,
+      0.02907487097514805,
+      0.02859885470852029,
+      0.02891553785164458
+    ]
+  },
+  "tracking_error_bounds_rad": [
+    0.03,
+    0.03,
+    0.06,
+    0.03,
+    0.03,
+    0.03
+  ],
+  "diagnostic_reported_j3_torque_cap_nm": 6.0,
+  "preflight": {
+    "samples": 2501,
+    "start_rad": {
+      "left": [
+        0.02428788647217854,
+        -1.5549725845008144,
+        3.1294828796616185,
+        -1.5645096021466283,
+        -0.056182046356311605,
+        1.680111632691597
+      ],
+      "right": [
+        0.0588366948421922,
+        -1.5675661501748708,
+        3.1312271550627244,
+        -1.5645074621064665,
+        -0.008081861670549839,
+        1.6060107732567963
+      ]
+    },
+    "cross_arm_clearance_m": 0.01,
+    "table_clearance_m": 0.001
+  },
+  "planned_duration_s": 52.0,
+  "observation_points_rad": {
+    "left": {
+      "raw_initial": [
+        0.02428788647217854,
+        -1.5549725845008144,
+        3.1294828796616185,
+        -1.5645096021466283,
+        -0.056182046356311605,
+        1.680111632691597
+      ],
+      "return_target": [
+        0.02428788647217854,
+        -1.5549725845008144,
+        3.1294828796616185,
+        -1.56,
+        -0.056182046356311605,
+        1.680111632691597
+      ],
+      "outward_target": [
+        0.05428788647217854,
+        -1.5049725845008144,
+        2.9294828796616184,
+        -1.53,
+        -0.026182046356311606,
+        1.650111632691597
+      ]
+    },
+    "right": {
+      "raw_initial": [
+        0.05884140293054787,
+        -1.5675661501748708,
+        3.1312271550627244,
+        -1.5645074621064665,
+        -0.008081861670549839,
+        1.6060107732567963
+      ],
+      "return_target": [
+        0.05884140293054787,
+        -1.56,
+        3.1300000000000003,
+        -1.56,
+        -0.008081861670549839,
+        1.6060107732567963
+      ],
+      "outward_target": [
+        0.08884140293054787,
+        -1.51,
+        2.93,
+        -1.53,
+        0.02191813832945016,
+        1.5760107732567963
+      ]
+    }
+  },
+  "entry_duration_s": 8.0,
+  "final_positions_rad": {
+    "left": [
+      0.02647707622289573,
+      -1.5548835588300889,
+      3.129391571281387,
+      -1.5625625936075402,
+      -0.056182046356311605,
+      1.68054306478819
+    ],
+    "right": [
+      0.06163765074045902,
+      -1.565235646438811,
+      3.1310008814829637,
+      -1.5622772549193173,
+      -0.008043811756475332,
+      1.606375093693919
+    ]
+  },
+  "final_velocities_rad_s": {
+    "left": [
+      2.247042169754357e-05,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "right": [
+      0.0,
+      -2.247042169754357e-05,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "final_goal_error_rad_by_side": {
+    "left": 0.0025625936075401867,
+    "right": 0.005235646438811026
+  },
+  "final_goal_error_rad": 0.005235646438811026,
+  "return_precision_passed": false,
+  "response_passed": true,
+  "return_observation_passed": true,
+  "motion_elapsed_s": 95.3558885549428,
+  "path_elapsed_s": 52.0,
+  "synchronization_note": "共享参考进度，等待双方已发送才推进；两条网络发送不保证设备物理同时执行.",
+  "counts": {
+    "left:report_frequency": 1,
+    "right:report_frequency": 1,
+    "left:clear_api_timeout": 1,
+    "right:clear_api_timeout": 1,
+    "left:initialize": 1,
+    "right:initialize": 1,
+    "left:position_hold": 20596,
+    "right:position_hold": 20605,
+    "right:brake": 1,
+    "left:brake": 1
+  },
+  "adapter_errors": {
+    "left": "",
+    "right": ""
+  },
+  "native_errors": {
+    "left": "",
+    "right": ""
+  },
+  "brake_returned_by_side": {
+    "left": true,
+    "right": true
+  },
+  "brake_transport_returned": true,
+  "directory": "/home/user/.cache/archer_development/dual_observation83_20261020_205929",
+  "data_kind": "hardware_observation",
+  "trajectory_replay_ready": false,
+  "task_name": "双臂J123456同步往返观察",
+  "timestamp_note": "CSV是主机观测时间，不是设备执行同步时间；reference为已发送观察命令，不是完整任务回放文件.",
+  "executed_position_messages": 41201,
+  "source_script_sha256": "ac388175f86c9372decaafc24943604c925ad1941e4e23b69db223323c4b685b",
+  "parking_samples_by_side": {
+    "left": 1,
+    "right": 1
+  },
+  "max_position_send_gap_ms": {
+    "left": 16.41007198486477,
+    "right": 13.660187949426472
+  }
+}

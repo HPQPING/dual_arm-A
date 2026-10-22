@@ -1,7 +1,7 @@
 """
 规划分段五次关节轨迹并按需转换ROS消息，不访问硬件.
 
-单位为弧度、弧度每秒和秒；每个路径点的目标速度及加速度均为零。 本模块生成关节空间路径，不保证TCP沿笛卡尔直线或圆运动。
+单位为弧度、弧度每秒和秒；支持普通停车点和带连续导数的路径。关节空间插值的TCP几何由具体任务预检。
 """
 
 from __future__ import annotations
@@ -20,13 +20,13 @@ if TYPE_CHECKING:
 FloatArray: TypeAlias = NDArray[np.float64]
 
 
-# Defaults match the archer_arm.xacro supplied in this project.
-# They are model limits, not newly verified hardware specifications.
+# 默认值与项目模型一致；J2/J4下限含用户授权的0.005rad工程余量。
+# 这是项目软件范围，不是新增的厂商硬件规格。
 DEFAULT_JOINT_LIMITS = (
     (-2.79, 2.79),
-    (-1.57, 2.09),
+    (-1.575, 2.09),
     (0.0, 3.14),
-    (-1.57, 1.57),
+    (-1.575, 1.57),
     (-1.55, 1.55),
     (-2.96, 2.96),
 )
@@ -113,6 +113,8 @@ class JointPlan:
     joint_names: tuple[str, ...]
     times: FloatArray
     positions: FloatArray
+    velocities: FloatArray | None = None
+    accelerations: FloatArray | None = None
 
     def __post_init__(self):
         names = tuple(self.joint_names)
@@ -137,6 +139,16 @@ class JointPlan:
         object.__setattr__(self, "joint_names", names)
         object.__setattr__(self, "times", times)
         object.__setattr__(self, "positions", positions)
+        if (self.velocities is None) != (self.accelerations is None):
+            raise ValueError('连续计划必须同时提供速度与加速度')
+        for name in ('velocities', 'accelerations'):
+            values = getattr(self, name)
+            if values is not None:
+                values = np.asarray(values, dtype=np.float64).copy()
+                if values.shape != positions.shape or not np.all(np.isfinite(values)):
+                    raise ValueError('连续计划导数必须与位置同形且全部有限')
+                values.setflags(write=False)
+                object.__setattr__(self, name, values)
 
     @property
     def duration(self) -> float:
@@ -207,6 +219,14 @@ def sample_joint_plan(plan: JointPlan, elapsed: float) -> tuple[FloatArray, bool
         return plan.positions[-1].copy(), True
     index = int(np.searchsorted(plan.times, t, side="right")) - 1
     u = (t - plan.times[index]) / (plan.times[index + 1] - plan.times[index])
+    if plan.velocities is not None and plan.accelerations is not None:
+        from archer_mujoco.joint_interpolation import coefficients, evaluate
+
+        h = float(plan.times[index + 1] - plan.times[index])
+        c = coefficients(plan.positions[index], plan.positions[index + 1],
+                         plan.velocities[index], plan.velocities[index + 1],
+                         plan.accelerations[index], plan.accelerations[index + 1], h)
+        return evaluate(c, float(u), h), False
     s = 6 * u**5 - 15 * u**4 + 10 * u**3
     position = plan.positions[index] + s * (plan.positions[index + 1] - plan.positions[index])
     return position, False
@@ -225,12 +245,14 @@ def stretch_plan(plan: JointPlan, total_duration: float) -> JointPlan:
         plan.joint_names,
         plan.times * (duration / plan.duration),
         plan.positions,
+        None if plan.velocities is None else plan.velocities * plan.duration / duration,
+        None if plan.accelerations is None else plan.accelerations * (plan.duration / duration)**2,
     )
 
 
 def to_ros_trajectory(plan: JointPlan) -> JointTrajectory:
     """
-    Build the positions-only message accepted by the current sim_node.
+    输出ROS轨迹；连续计划同时发送速度、加速度，避免接收端逐点停车。
 
     A zero header timestamp means start when received. This is not a hardware-timed dual-arm
     synchronization interface or an action server.
@@ -241,13 +263,16 @@ def to_ros_trajectory(plan: JointPlan) -> JointTrajectory:
     message.joint_names = list(plan.joint_names)
     points: list[JointTrajectoryPoint] = []
     previous_ns = -1
-    for time, position in zip(plan.times, plan.positions):
+    for index, (time, position) in enumerate(zip(plan.times, plan.positions)):
         nanoseconds = int(round(float(time) * 1_000_000_000))
         if nanoseconds <= previous_ns:
             raise ValueError("Time points are too close after nanosecond rounding")
         previous_ns = nanoseconds
         point = JointTrajectoryPoint()
         point.positions = [float(value) for value in position]
+        if plan.velocities is not None and plan.accelerations is not None:
+            point.velocities = plan.velocities[index].tolist()
+            point.accelerations = plan.accelerations[index].tolist()
         point.time_from_start.sec = nanoseconds // 1_000_000_000
         point.time_from_start.nanosec = nanoseconds % 1_000_000_000
         points.append(point)

@@ -18,9 +18,12 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_srvs.srv import SetBool, Trigger
-from trajectory_msgs.msg import JointTrajectory
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from .model_loader import DataInterface, FloatArray, ModelInterface, load_single_arm, mujoco
+from .joint_interpolation import coefficients, evaluate, _extrema
+
+ParsedPlan = tuple[FloatArray, FloatArray] | tuple[FloatArray, FloatArray, FloatArray, FloatArray]
 
 
 class ViewerCamera(Protocol):
@@ -53,8 +56,8 @@ def prepare_plan(
     limits: ArrayLike,
     speed_limits: ArrayLike,
     allow_scheduled: bool = False,
-) -> tuple[FloatArray, FloatArray]:
-    """Validate a positions-only trajectory and order its joints."""
+) -> ParsedPlan:
+    """校验停车点或带导数的连续轨迹，并统一关节顺序。"""
     message_names = list(message.joint_names)
     start_array = np.asarray(start, dtype=np.float64)
     bounds = np.asarray(limits, dtype=np.float64)
@@ -81,6 +84,8 @@ def prepare_plan(
     if not points or len(points) > 10000:
         raise ValueError("Trajectory must contain 1 to 10000 points")
     order = [message_names.index(name) for name in names]
+    if any(p.velocities or p.accelerations for p in points):
+        return prepare_continuous_plan(points, order, start_array, bounds, speeds)
     times = [0.0]
     positions: list[FloatArray] = [start_array.copy()]
     for point_index, point in enumerate(points):
@@ -113,10 +118,54 @@ def prepare_plan(
     return np.asarray(times, dtype=np.float64), np.asarray(positions, dtype=np.float64)
 
 
+def prepare_continuous_plan(
+    points: list[JointTrajectoryPoint], order: list[int], start: FloatArray,
+    bounds: FloatArray, speeds: FloatArray,
+) -> ParsedPlan:
+    """保留全部节点导数，解析核对段内位置和速度，不重新改成逐点停车。"""
+    times, positions = [0.], [start.copy()]
+    velocities, accelerations = [np.zeros(6)], [np.zeros(6)]
+    for index, point in enumerate(points):
+        if (any(len(values) != 6 for values in
+                (point.positions, point.velocities, point.accelerations)) or point.effort):
+            raise ValueError('连续轨迹每点必须同时包含六维位置、速度、加速度且不含力矩')
+        q, v, a = [np.asarray(list(values), dtype=np.float64)[order] for values in
+                   (point.positions, point.velocities, point.accelerations)]
+        if any(not np.all(np.isfinite(x)) for x in (q, v, a)):
+            raise ValueError('连续轨迹的节点及导数必须有限')
+        stamp = point.time_from_start
+        if stamp.sec < 0 or not 0 <= stamp.nanosec < 10**9:
+            raise ValueError('连续轨迹时间无效')
+        t = stamp.sec + stamp.nanosec * 1e-9
+        if index == 0 and t == 0.:
+            if (not np.allclose(q, start, atol=1e-6, rtol=0.)
+                    or np.any(v != 0.) or np.any(a != 0.)):
+                raise ValueError('连续轨迹起点必须匹配当前姿态并从零导数开始')
+            continue
+        if t <= times[-1] or t > 3600.:
+            raise ValueError('连续轨迹时间必须递增且不超过一小时')
+        h = float(t - times[-1])
+        c = coefficients(positions[-1], q, velocities[-1], v, accelerations[-1], a, h)
+        extent = _extrema(c, h, 0)
+        if (np.any(extent[:, 0] < bounds[:, 0] - 1e-12)
+                or np.any(extent[:, 1] > bounds[:, 1] + 1e-12)
+                or np.any(np.max(np.abs(_extrema(c, h, 1)), axis=1) > speeds + 1e-9)):
+            raise ValueError('连续轨迹段内位置或速度超限')
+        times.append(t)
+        positions.append(q)
+        velocities.append(v)
+        accelerations.append(a)
+    if len(times) < 2 or np.any(velocities[-1] != 0.) or np.any(accelerations[-1] != 0.):
+        raise ValueError('连续轨迹需要正时长并以零导数结束')
+    return (np.asarray(times, dtype=np.float64), np.asarray(positions, dtype=np.float64),
+            np.asarray(velocities, dtype=np.float64), np.asarray(accelerations, dtype=np.float64))
+
+
 def sample_plan(
-    times: FloatArray, positions: FloatArray, elapsed: float
+    times: FloatArray, positions: FloatArray, elapsed: float,
+    velocities: FloatArray | None = None, accelerations: FloatArray | None = None,
 ) -> tuple[FloatArray, bool]:
-    """Quintic interpolation; each waypoint is reached at zero target velocity."""
+    """使用节点导数连续插值；旧位置接口仍按零导数停车。"""
     if not np.isfinite(elapsed):
         raise ValueError("Elapsed time must be finite")
     if elapsed >= times[-1]:
@@ -124,8 +173,21 @@ def sample_plan(
     elapsed = max(0.0, float(elapsed))
     index = min(int(np.searchsorted(times, elapsed, side="right")) - 1, len(times) - 2)
     u = (elapsed - times[index]) / (times[index + 1] - times[index])
+    if velocities is not None and accelerations is not None:
+        h = float(times[index + 1] - times[index])
+        c = coefficients(positions[index], positions[index + 1],
+                         velocities[index], velocities[index + 1],
+                         accelerations[index], accelerations[index + 1], h)
+        return evaluate(c, float(u), h), False
     s = 6 * u**5 - 15 * u**4 + 10 * u**3
     return positions[index] + s * (positions[index + 1] - positions[index]), False
+
+
+def sample_prepared_plan(plan: ParsedPlan, elapsed: float) -> tuple[FloatArray, bool]:
+    """单臂、双臂和记录器使用同一份已校验曲线。"""
+    if len(plan) == 4:
+        return sample_plan(plan[0], plan[1], elapsed, plan[2], plan[3])
+    return sample_plan(plan[0], plan[1], elapsed)
 
 
 def checked_number(value: object, name: str) -> float:
@@ -215,7 +277,7 @@ class SingleArmSim(Node):
         )
         self.initial = self.arm.data.qpos[self.arm.qpos_indices].copy()
         self.target = self.initial.copy()
-        self.plan: tuple[FloatArray, FloatArray] | None = None
+        self.plan: ParsedPlan | None = None
         self.plan_start = 0.0
         self.plan_start_ros_ns: int | None = None
         self.last_schedule_clock: int | None = None
@@ -393,7 +455,7 @@ class SingleArmSim(Node):
                     if elapsed >= 0 and not self.schedule_running:
                         self.schedule_running = True
                         self.publish_trajectory_status(f"RUNNING:{start_ns}")
-                self.target, done = sample_plan(plan[0], plan[1], elapsed)
+                self.target, done = sample_prepared_plan(plan, elapsed)
                 if done:
                     self.plan = None
                     self.plan_start_ros_ns = None

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from importlib import import_module
+from threading import Event, RLock
 import time
 from typing import Any, Iterable, cast
 
@@ -19,7 +20,7 @@ from .sdk_position import isolated_arm_class
 from .position_plan import (
     ContinuousPositionTrajectory, JointPositionMove, JointPositionTrajectory,
     PairedTrajectoryStart, PositionLimits,
-    positive,
+    limit_preparation_complete, limit_preparation_goal, positive,
 )
 
 
@@ -56,6 +57,9 @@ class HexPositionAdapter(HexFeedbackAdapter):
             JointPositionMove | JointPositionTrajectory | ContinuousPositionTrajectory | None
         ) = None
         self._trajectory_gate: PairedTrajectoryStart | None = None
+        self._trajectory_side: str | None = None
+        self._delivery_generation: int | None = None
+        self._delivery_event: Event | None = None
         self.trajectory_start_at: float | None = None
         self.trajectory_observed_start_at: float | None = None
         self._native: SdkCycleSender | None = None
@@ -68,9 +72,12 @@ class HexPositionAdapter(HexFeedbackAdapter):
         self._settled_since: float | None = None
         self._nominal_required = False
         self._recovering_limits = False
+        self._limit_preparation = False
+        self._control_period_lock = RLock()
+        self._control_period_enabled = False
 
     def connect(self) -> None:
-        """建立反馈连接并启用有准入过滤的官方周期，未申请前不发控制命令."""
+        """建立反馈连接；显式申请控制时才启动有准入过滤的官方控制周期."""
         if self.state != 'DISCONNECTED':
             raise RuntimeError('需要先关闭原连接')
         module = verified_sdk()
@@ -78,10 +85,12 @@ class HexPositionAdapter(HexFeedbackAdapter):
         managed_base = managed_sdk_class(base)
         arm_type = isolated_arm_class()
         owner = self
+        self._control_period_enabled = False
         self._command_types = import_module('hex_device.motor_base').CommandType
         self._native = SdkCycleSender(
             self._check_dispatch, self._native_failure, lambda: self._epoch, self._command_types,
         )
+        self._native.sample_position = self._stream_position_sample
 
         class PositionAPI(managed_base):
             """替换机械臂类并保留附属设备反馈，控制下行经项目核对."""
@@ -92,10 +101,29 @@ class HexPositionAdapter(HexFeedbackAdapter):
                 )
 
             def _start_device_periodic_task(self, device_id: int) -> None:
-                arm = self._device_id_map.get(device_id)
-                if isinstance(arm, arm_type):
-                    arm._project_position_error = owner._native_failure
-                    super()._start_device_periodic_task(device_id)
+                with owner._control_period_lock:
+                    arm = self._device_id_map.get(device_id)
+                    if isinstance(arm, arm_type):
+                        arm._project_position_error = owner._native_failure
+                        if owner._control_period_enabled:
+                            super()._start_device_periodic_task(device_id)
+
+            def _project_start_control_periodic(self) -> None:
+                """显式准备后才启动官方控制周期；接收反馈不依赖此周期。"""
+                with owner._control_period_lock:
+                    if owner.state != 'REQUESTING':
+                        raise RuntimeError('只有显式准备控制时才能启动SDK控制周期')
+                    loop = getattr(self, '_HexDeviceApi__loop', None)
+                    if loop is None or not loop.is_running():
+                        raise RuntimeError('SDK事件循环未就绪，不能启动控制周期')
+                    devices = [(i, d) for i, d in self._device_id_map.items()
+                               if isinstance(d, arm_type)]
+                    if len(devices) != 1:
+                        raise RuntimeError('需要唯一的六轴机械臂才能启动控制周期')
+                    owner._control_period_enabled = True
+                    for device_id, _ in devices:
+                        if device_id not in self._device_tasks:
+                            self._start_device_periodic_task(device_id)
 
             async def _send_down_message(self, message: Any) -> None:
                 if self._HexDeviceApi__is_closing.is_set():
@@ -268,13 +296,37 @@ class HexPositionAdapter(HexFeedbackAdapter):
                         or len(control.motor_targets.targets) != 0):
                     raise RuntimeError('会话心跳必须只有空电机目标，禁止任何运动模式')
 
-    def _send(self, message: Any, kind: str) -> None:
+    def _send(self, message: Any, kind: str) -> Event:
         """只发布到官方 SDK 缓存，不运行项目传输协程或周期发送线程."""
         if self._native is None:
             raise RuntimeError('官方 SDK 发送器未连接')
+        self._arm()._project_position_timing = self._native.position_timing
+        self._arm()._project_position_encoder = self._native.encode_position
         event = self._native.publish(self._arm(), message, kind, self._target)
         if kind == 'brake' and not event.wait(.05):
             raise RuntimeError('BRAKE 未在50ms内确认底层发送，仍将继续关闭连接')
+        return event
+
+    def _stream_position_sample(self) -> tuple[float, ...] | None:
+        """完整文件在SDK构包时按共同时钟采样，同时复核实际反馈误差。"""
+        move, gate, side = self._move, self._trajectory_gate, self._trajectory_side
+        if (self.state != 'RUNNING' or not isinstance(move, ContinuousPositionTrajectory)
+                or not move.preserve_path or gate is None or side is None
+                or gate.playback_status()['stream_period_s'] is None):
+            return None
+        elapsed, _, _ = gate.playback(side, None)
+        target = move.sample(elapsed)
+        frame = self._feedback
+        if frame is None or not 0. <= (
+            time.perf_counter_ns() - frame.source_ns
+        ) / 1e9 <= self.stale_timeout:
+            raise RuntimeError('SDK周期取样前缺少新鲜反馈')
+        self.limits.check_positions(frame.positions)
+        tolerance = (min(move.tracking_error_at(elapsed), self.tracking_tolerance)
+                     if move.joint_error_rad else self.tracking_tolerance)
+        if max(abs(a - b) for a, b in zip(frame.positions, target)) > tolerance:
+            raise RuntimeError('SDK周期取样目标与实际反馈偏差超限')
+        return target
 
     def request_control(self) -> None:
         """在新鲜、静止反馈和无故障状态下显式申请控制权."""
@@ -299,6 +351,9 @@ class HexPositionAdapter(HexFeedbackAdapter):
                 self._send(arm._construct_clear_parking_stop_message(), 'clear_api_timeout')
             else:
                 self._send(arm._construct_init_message(True), 'initialize')
+            start_periodic = getattr(self._api, '_project_start_control_periodic', None)
+            if start_periodic is not None:
+                start_periodic()
         except Exception as error:
             self.last_error = str(error)
             self.stop(fault=True)
@@ -310,14 +365,16 @@ class HexPositionAdapter(HexFeedbackAdapter):
         self._start_move(frame, goal, duration, self.max_excursion)
 
     def recover_limits(self, duration: float) -> None:
-        """显式从同一帧实测角度生成收回目标，只改变轻微超限关节."""
+        """显式准备入限及边界余量，不改读取容差或普通移动的精度标准."""
         frame = self._single_move_feedback()
-        if self.limits.within_nominal(frame.positions):
+        goal = limit_preparation_goal(self.limits, frame.positions)
+        if goal == frame.positions:
             return
         self._start_move(
-            frame, self.limits.recovery_goal(frame.positions), duration,
+            frame, goal, duration,
             min(self.max_excursion, 0.02),
         )
+        self._limit_preparation = True
 
     def _single_move_feedback(self) -> JointFeedback:
         """单点移动和限位收回共用新鲜、静止及有效控制会话检查."""
@@ -342,6 +399,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
         self._recovering_limits = not self.limits.within_nominal(frame.positions)
         self._nominal_required = not self._recovering_limits
         self._move = move
+        self._limit_preparation = False
         self._trajectory_gate = None
         self._move_started = time.monotonic()
         self._settled_since = None
@@ -369,6 +427,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
             actual_start=frame.positions,
         )
         self._move = move
+        self._limit_preparation = False
         self._trajectory_gate = None
         self._target = frame.positions
         self._move_started = time.monotonic()
@@ -397,8 +456,12 @@ class HexPositionAdapter(HexFeedbackAdapter):
         if move.joint_error_rad and self._target != move.initial:
             raise ValueError('保持指令目标与已检路径起点不同，必须重新预检')
         self._move = move
+        self._limit_preparation = False
         self._target = move.initial if move.joint_error_rad else frame.positions
         self._trajectory_gate = gate
+        self._trajectory_side = side
+        self._delivery_generation = None
+        self._delivery_event = None
         self._settled_since = None
         self._recovering_limits = False
         self._nominal_required = True
@@ -516,8 +579,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
         if self._trajectory_gate is not None and self._trajectory_gate.cancelled:
             raise RuntimeError('双臂轨迹已取消，停止后续位置发送')
         if now - self._last_tick > 0.04:
-            raise RuntimeError('调用 tick 的间隔超过 40 ms')
-        self._last_tick = now
+            raise RuntimeError('位置目标更新间隔超过 40 ms')
         if self.state == 'ARMED':
             assert self._trajectory_gate is not None
             start = self._trajectory_gate.start_time()
@@ -539,34 +601,74 @@ class HexPositionAdapter(HexFeedbackAdapter):
                 self.trajectory_start_at = start
                 self.trajectory_observed_start_at = now
                 self.state = 'RUNNING'
+        playback_generation: int | None = None
+        tracking_elapsed = (self._move.duration if self.state == 'HOLDING'
+                            and isinstance(self._move, ContinuousPositionTrajectory) else 0.)
         if self.state == 'RUNNING':
             assert self._move is not None
             elapsed = now - self._move_started
+            terminal_age: float | None = elapsed - self._move.duration
+            paced = (self._trajectory_gate is not None
+                     and self._trajectory_gate.delivery_paced)
+            if paced:
+                assert self._trajectory_gate is not None and self._trajectory_side is not None
+                acknowledged = (self._delivery_generation if self._delivery_event is not None
+                                and self._delivery_event.is_set() else None)
+                tracking_ratio = None
+                if self._trajectory_gate.following_feedback:
+                    move = self._move
+                    if (not isinstance(move, ContinuousPositionTrajectory)
+                            or not move.joint_error_rad):
+                        raise RuntimeError('实际跟踪门控需要已检完整路径误差界限')
+
+                    def ratio_at(reference: float) -> float:
+                        # 锁内取得共用参考时间，避免另一臂推进后仍用上一代目标作比较。
+                        target = move.sample(reference)
+                        tolerance = min(move.tracking_error_at(reference), self.tracking_tolerance)
+                        return max(abs(a - b) for a, b in zip(frame.positions, target)) / tolerance
+
+                    tracking_ratio = ratio_at
+
+                elapsed, playback_generation, terminal_age = self._trajectory_gate.playback(
+                    self._trajectory_side, acknowledged, tracking_ratio=tracking_ratio)
             self._target = self._move.sample(elapsed)
-            if (self._recovering_limits and self.limits.within_nominal(frame.positions)
-                    and self.limits.within_nominal(self._target)):
-                self._nominal_required = True
-            if elapsed >= self._move.duration:
+            tracking_elapsed = elapsed
+            if elapsed >= self._move.duration and terminal_age is not None:
                 error = max(abs(a - b) for a, b in zip(frame.positions, self._move.goal))
                 stopped = max(abs(v) for v in frame.velocities) <= 0.02
                 recovered = (not self._recovering_limits
                              or self.limits.within_nominal(frame.positions))
-                # 小幅试运行不能以接近整段位移的误差提前报告到位。
-                if error <= min(0.003, self.tracking_tolerance) and stopped and recovered:
+                # 仅显式入限准备按实际范围和余量准入，普通移动与完整轨迹保持原精度。
+                if self._limit_preparation:
+                    assert isinstance(self._move, JointPositionMove)
+                    arrived = limit_preparation_complete(
+                        self.limits, self._move.start, self._move.goal, frame.positions,
+                    ) and error <= self.tracking_tolerance
+                elif (isinstance(self._move, ContinuousPositionTrajectory)
+                      and self._move.preserve_path and self._move.joint_error_rad):
+                    # 完整文件到位条件沿用已做几何预检的误差界限，不叠加另一套精度。
+                    arrived = error <= min(self._move.joint_error_rad, self.tracking_tolerance)
+                else:
+                    arrived = error <= min(0.003, self.tracking_tolerance)
+                if arrived and stopped and recovered:
                     if self._settled_since is None:
                         self._settled_since = now
                     if now - self._settled_since >= 0.2:
                         self.state = 'HOLDING'
                         self._recovering_limits = False
+                        self._limit_preparation = False
+                        # 入限过程允许既有限定的初值误差，完成后恢复严格限位。
+                        # 不能因途中一帧刚过边界便切换，造成边界量化波动误停。
+                        self._nominal_required = True
                 else:
                     self._settled_since = None
-                if self.state == 'RUNNING' and elapsed > self._move.duration + 2.0:
+                if self.state == 'RUNNING' and terminal_age > 2.0:
                     raise RuntimeError('目标位置未在允许时间内到位')
         assert self._target is not None
+        path_error = max(abs(a - b) for a, b in zip(frame.positions, self._target))
         if (isinstance(self._move, ContinuousPositionTrajectory)
-                and self._move.joint_error_rad and max(
-                    abs(a - b) for a, b in zip(frame.positions, self._target)
-                ) > self._move.joint_error_rad):
+                and self._move.joint_error_rad
+                and path_error > self._move.tracking_error_at(tracking_elapsed)):
             raise RuntimeError('实际反馈超出完整路径几何误差界限，取消后续位置发送')
         if max(abs(a - b) for a, b in zip(frame.positions, self._target)) > (
             self.tracking_tolerance
@@ -577,7 +679,13 @@ class HexPositionAdapter(HexFeedbackAdapter):
         targets = arm._construct_custom_motor_msg(
             self._command_types.POSITION, list(self._target),
         )
-        self._send(arm._construct_custom_joint_command_msg(targets), 'position')
+        event = self._send(arm._construct_custom_joint_command_msg(targets), 'position')
+        if self.state == 'RUNNING' and playback_generation is not None:
+            self._delivery_generation = playback_generation
+            self._delivery_event = event
+        # 记录成功更新缓存的时刻；上一轮计算或锁等待不能冒充后续调用空档。
+        # SDK发送器仍独立检查目标40ms有效期，不因本时间戳更新而延长旧请求。
+        self._last_tick = time.monotonic()
 
     def stop(self, *, fault: bool = False, wait: bool = True) -> None:
         """
@@ -598,6 +706,9 @@ class HexPositionAdapter(HexFeedbackAdapter):
         if self._native is not None:
             self._native.cancel()
         self._move = None
+        self._limit_preparation = False
+        self._delivery_generation = None
+        self._delivery_event = None
         self.state = 'FAULT' if fault else 'STOPPED'
         self.readiness_stage = self.state
         if active and self._api is not None:
@@ -622,13 +733,32 @@ class HexPositionAdapter(HexFeedbackAdapter):
         if self._api is not None:
             self.stop()
         if self._native is not None:
+            # SDK线程故障已缓存BRAKE时，stop()会保留FAULT，不再重复发布。
+            # 先给原生周期一次有界的发送机会，再清空缓存和关闭准入。
+            if not self._native.wait_pending_brake():
+                self.last_error += '；关闭前缓存BRAKE的底层发送未确认'
             self._native.close()
         try:
             super().close()
         finally:
+            self._control_period_enabled = False
             self.state = 'DISCONNECTED'
             self._feedback = None
             self.initial_positions = None
             self._nominal_required = False
             self._recovering_limits = False
+            self._limit_preparation = False
+            self._trajectory_side = None
+            self._delivery_generation = None
+            self._delivery_event = None
+            self._move = None
+            self._target = None
+            self._trajectory_gate = None
+            self._request_positions = None
+            self._startup_clear_source_ns = None
+            self._calibration_sent = False
+            self._initialization_seen = False
+            self._settled_since = None
+            self.trajectory_start_at = None
+            self.trajectory_observed_start_at = None
             self.readiness_stage = 'DISCONNECTED'

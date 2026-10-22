@@ -85,6 +85,16 @@ class DualArmPlan:
 def export_paired_plan(plan: DualArmPlan, destination: str | Path) -> Path:
     """导出共享时间轴的关节计划；只创建新文件，不覆盖已有计划."""
     payload: dict[str, object] = {"version": 1, "interpolation": "quintic_stop"}
+    continuous = plan.left.velocities is not None
+    if continuous != (plan.right.velocities is not None):
+        raise ValueError('左右计划必须使用相同插值格式')
+    if continuous:
+        payload.update(version=2, interpolation='quintic_c2')
+        stops = np.ones(len(plan.left.times), dtype=bool)
+        for arm in (plan.left, plan.right):
+            assert arm.velocities is not None and arm.accelerations is not None
+            stops &= np.all(arm.velocities == 0., axis=1) & np.all(arm.accelerations == 0., axis=1)
+        payload['stop_indices'] = np.flatnonzero(stops).tolist()
     shared_ns: list[int] | None = None
     for side, arm in (("left", plan.left), ("right", plan.right)):
         times = np.asarray(arm.times, dtype=np.float64)
@@ -112,12 +122,15 @@ def export_paired_plan(plan: DualArmPlan, destination: str | Path) -> Path:
             "points": [
                 {
                     "positions": [float(value) for value in position],
+                    **({'velocities': arm.velocities[index].tolist(),
+                        'accelerations': arm.accelerations[index].tolist()}
+                       if arm.velocities is not None and arm.accelerations is not None else {}),
                     "time_from_start": {
                         "sec": stamp // 1_000_000_000,
                         "nanosec": stamp % 1_000_000_000,
                     },
                 }
-                for stamp, position in zip(rounded, positions)
+                for index, (stamp, position) in enumerate(zip(rounded, positions))
             ],
         }
     # 提前完成序列化和校验，避免无效输入留下半份文件。
@@ -202,10 +215,33 @@ def append_return_home(
                     np.concatenate((original.positions, returning.positions[1:]), axis=0),
                     dtype=np.float64,
                 ),
+                None if original.velocities is None else np.concatenate(
+                    (original.velocities, np.zeros_like(returning.positions[1:])), axis=0),
+                None if original.accelerations is None else np.concatenate(
+                    (original.accelerations, np.zeros_like(returning.positions[1:])), axis=0),
             )
             for original, returning in ((plan.left, home.left), (plan.right, home.right))
         )
     )
+
+
+def continuous_paired_plan(
+    plan: DualArmPlan, left_limits: ArrayLike, right_limits: ArrayLike,
+    speed_limits: ArrayLike, acceleration_limits: ArrayLike, stops: tuple[int, ...],
+    margin: float = 1.2,
+) -> DualArmPlan:
+    """保留几何路径点，重算共同时间与连续导数，仅在指定阶段边界停车。"""
+    from .continuous_trajectory import plan_continuous_pair
+
+    bounds = [np.asarray(x, dtype=np.float64) for x in (left_limits, right_limits)]
+    curve, _ = plan_continuous_pair(
+        plan.left.positions, plan.right.positions, [b[:, 0] for b in bounds],
+        [b[:, 1] for b in bounds], [speed_limits] * 2, [acceleration_limits] * 2,
+        stops=stops, margin=margin,
+    )
+    plans = [JointPlan(joint_names(s), curve.times, curve.positions[s],
+                       curve.velocities[s], curve.accelerations[s]) for s in ('left', 'right')]
+    return DualArmPlan(*plans)
 
 
 class DualArmKinematics:
@@ -330,5 +366,15 @@ class DualArmKinematics:
 
 
 def peak_target_speeds(plan: JointPlan) -> FloatArray:
-    """Quintic peak target speeds for each segment and joint, radians/s."""
+    """解析计算每段关节峰值速度，同时支持停车点和连续导数。"""
+    if plan.velocities is not None and plan.accelerations is not None:
+        from archer_mujoco.joint_interpolation import coefficients, _extrema
+
+        return np.stack([
+            np.max(np.abs(_extrema(coefficients(
+                plan.positions[i], plan.positions[i + 1],
+                plan.velocities[i], plan.velocities[i + 1],
+                plan.accelerations[i], plan.accelerations[i + 1], float(h)), float(h), 1)), axis=1)
+            for i, h in enumerate(np.diff(plan.times))
+        ])
     return 1.875 * np.abs(np.diff(plan.positions, axis=0)) / np.diff(plan.times)[:, None]

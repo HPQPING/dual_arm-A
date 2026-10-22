@@ -26,3 +26,14 @@ ros2 service call /dual/grasp/start std_srvs/srv/Trigger '{}'
 `single_arm_display.launch.py`、`single_arm_sim.launch.py` 用于单臂调试，保留供开发排查。
 
 只允许同时运行一套仿真场景，避免重复发布左右关节反馈。以上仿真入口不启动实机SDK。
+
+## 画圆仿真初值
+
+`config/dual_circle.yaml`的`dual_arm_scene.ros__parameters.left_initial_joints`和
+`right_initial_joints`已更新为2026-10-20 21:29只读采集的实际静止角度，未裁剪或改写。
+每组按J1到J6填写，单位rad；本次两臂均在名义限位内。
+它们是固定的仿真参数，启动仿真不会重新连接真机。实机姿态改变后，需要重新取得实际角度再更新。
+
+完整画圆仍按“读取仿真反馈起点→接近→左右半圆→自动归位→COMPLETED”执行。
+沿用上面的一个launch命令和开始服务即可，成功后只在archer_results下生成一份新的日期时间任务目录。
+画圆的新初值不修改独立抓取任务的配置，也不改变真机驱动的实时读取规则。

@@ -1,0 +1,269 @@
+{
+  "scope": "left臂只读，right臂必要时每轴最多0.02rad入限；该臂关节[2]用10参考秒向限位内移动0.05rad、保持2秒、10秒返回、保持2秒，主段未选关节保持；偏差0.03rad结束，精度单独记录，随后BRAKE关闭",
+  "source_sha256": {
+    "src/archer_hardware/archer_hardware/position_adapter.py": "0c9035cc66e4b2fee74c1b9d9ef870724e967edc3f1199c8de101d048c67f79f",
+    "src/archer_hardware/archer_hardware/hex_adapter.py": "af7ee88c527d5f8e55ee3cd45ab6e4b5733e97ec75298cd13d1bd0f290b7df46",
+    "src/archer_hardware/archer_hardware/sdk_position.py": "3344fbab4e9bb489d05ee418667aeff2408803d6c855acbbac024dd5b41720c7",
+    "src/archer_hardware/archer_hardware/sdk_cycle.py": "98f2b1e044e74c14c61f1adf9b5a912db56ef97e4c2311fc5d6e3a58efbff36d"
+  },
+  "limits_sha256": "f923b4a5189c1a7a49e5e9af923a09adc4d18ed118ed049e8be9f5806a3d937b",
+  "control_arm": "right",
+  "readonly_arm": "left",
+  "task_started_at": "2026-10-20T17:47:54.043629+08:00",
+  "states": [
+    {
+      "calibrated": true,
+      "api_control_initialized": false,
+      "session_holder": 0,
+      "my_session_id": 7,
+      "parking": {
+        "reason": "API communication timeout",
+        "category": "PscAPICommunicationTimeout",
+        "is_remotely_clearable": true
+      },
+      "motor_errors": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "calibrated": true,
+      "api_control_initialized": false,
+      "session_holder": 0,
+      "my_session_id": 7,
+      "parking": {},
+      "motor_errors": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "calibrated": true,
+      "api_control_initialized": true,
+      "session_holder": 7,
+      "my_session_id": 7,
+      "parking": {},
+      "motor_errors": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ]
+    }
+  ],
+  "errors": {},
+  "motion_passed": false,
+  "hold_passed": false,
+  "motion_required": true,
+  "connections_closed": {
+    "right": true,
+    "left": true
+  },
+  "inward_target_margin_rad": 0.005,
+  "planned_duration_s": 24.0,
+  "limit_entry_passed": true,
+  "single_joint_test": false,
+  "selected_joint": null,
+  "requested_j2_delta_rad": null,
+  "wrist_entry_authorized": false,
+  "observation_experiment": true,
+  "observation_joint": 2,
+  "observation_joints": [
+    2
+  ],
+  "observation_amplitude_rad": 0.05,
+  "boundary_reserve_rad": 0.01,
+  "reference_playback_completed": true,
+  "physical_brake_confirmed": false,
+  "runtime_pose_checks": 15710,
+  "continuous_collision_proven": false,
+  "self_collision_checked": false,
+  "object_collision_checked": false,
+  "cable_collision_checked": false,
+  "diagnostic_gc": {
+    "enabled_before": true,
+    "paused_during_connection": true,
+    "original_setting_restored": true
+  },
+  "max_raw_read_ms": 0.694204936735332,
+  "max_poll_ms": 1.077317981980741,
+  "max_audit_ms": 3.626904101110995,
+  "preflight": {
+    "samples": 2001,
+    "start_rad": {
+      "right": [
+        0.03564215488861128,
+        -1.5704015607197404,
+        3.1316266292262362,
+        -1.5694242757125774,
+        -0.008599580186461243,
+        1.5909873489154411
+      ],
+      "left": [
+        0.008318122104398296,
+        -1.5556048950339159,
+        3.1308022857559608,
+        -1.564461665247007,
+        -0.05613410945669018,
+        1.6730744958271717
+      ]
+    },
+    "right_goal_rad": [
+      0.03564215488861128,
+      -1.56,
+      3.1300000000000003,
+      -1.56,
+      -0.008599580186461243,
+      1.5909873489154411
+    ],
+    "cross_arm_clearance_m": 0.01,
+    "table_clearance_m": 0.001
+  },
+  "observation_points_rad": {
+    "raw_initial": [
+      0.03564215488861128,
+      -1.570397137970073,
+      3.1316266292262362,
+      -1.5694242757125774,
+      -0.008599580186461243,
+      1.5909873489154411
+    ],
+    "return_target": [
+      0.03564215488861128,
+      -1.56,
+      3.1300000000000003,
+      -1.56,
+      -0.008599580186461243,
+      1.5909873489154411
+    ],
+    "outward_target": [
+      0.03564215488861128,
+      -1.51,
+      3.1300000000000003,
+      -1.56,
+      -0.008599580186461243,
+      1.5909873489154411
+    ]
+  },
+  "observation_tracking_stop_rad": 0.03,
+  "response_baseline_rad": [
+    0.03685648501101536,
+    -1.5688765681005337,
+    3.1314460098365915,
+    -1.564450251699478,
+    -0.008599580186461243,
+    1.5918307387431556
+  ],
+  "max_observed_excursion_rad": [
+    0.0,
+    0.04011633685461646,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "saved_initial_rad": [
+    0.03564215488861128,
+    -1.570397137970073,
+    3.1316266292262362,
+    -1.5694242757125774,
+    -0.008599580186461243,
+    1.5909873489154411
+  ],
+  "actual_plan": {
+    "start_rad": [
+      0.03564215488861128,
+      -1.570397137970073,
+      3.1316266292262362,
+      -1.5694242757125774,
+      -0.008599580186461243,
+      1.5909873489154411
+    ],
+    "goal_rad": [
+      0.03564215488861128,
+      -1.56,
+      3.1300000000000003,
+      -1.56,
+      -0.008599580186461243,
+      1.5909873489154411
+    ],
+    "duration_s": 40.0
+  },
+  "diagnostic_pacing": "发送确认后按原路径推进，不改位置点，实际时长可增加",
+  "reference_step_s": 0.0032,
+  "path_elapsed_s": 40.0,
+  "max_tracking_error_rad": 0.02187996554349625,
+  "pulse_per_rotation": [
+    88080384.0,
+    88080384.0,
+    88080384.0,
+    88080384.0,
+    20971520.0,
+    20971520.0
+  ],
+  "max_geometry_ms": 3.2443630043417215,
+  "final_positions_rad": [
+    0.03687246397755583,
+    -1.5652540507842014,
+    3.1314143372421985,
+    -1.5639071095064458,
+    -0.008599580186461243,
+    1.5918307387431556
+  ],
+  "final_goal_error_rad": 0.005254050784201381,
+  "motion_elapsed_s": 60.87033029797021,
+  "actual_inward_margins_rad": {
+    "2": 0.004745949215798628,
+    "3": 0.008585662757801593,
+    "4": 0.006092890493554215
+  },
+  "goal_tracking_passed": false,
+  "final_velocities_rad_s": [
+    0.0,
+    -2.247042169754357e-05,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "precision_passed": false,
+  "response_passed": true,
+  "return_observation_passed": true,
+  "observation_completed": true,
+  "counts": {
+    "right:report_frequency": 1,
+    "left:report_frequency": 1,
+    "right:clear_api_timeout": 1,
+    "right:initialize": 1,
+    "right:position_hold": 13337,
+    "right:brake": 1
+  },
+  "right_adapter_error": "",
+  "native_error": "",
+  "brake_transport_returned": true,
+  "directory": "/home/user/.cache/archer_development/right_axes81_2_20261020_174857",
+  "data_kind": "hardware_observation",
+  "trajectory_replay_ready": false,
+  "task_name": "右臂J2往返观察",
+  "timestamp_note": "CSV是主机观测时间，不是设备执行同步时间；reference为已发送观察命令，不是完整任务回放文件.",
+  "executed_position_messages": 13337,
+  "source_script_sha256": "4f0412ea0b2b994a3d6db40f1fceb8fee3adc2a344c337a08f0e8ccadd106546",
+  "parking_samples_by_side": {
+    "left": 2868,
+    "right": 2
+  },
+  "max_position_send_gap_ms": {
+    "left": 0.0,
+    "right": 8.261124952696264
+  }
+}

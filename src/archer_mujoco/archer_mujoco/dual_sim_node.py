@@ -32,7 +32,8 @@ from .sim_node import (
     checked_bool,
     checked_number,
     checked_vector,
-    sample_plan,
+    sample_prepared_plan,
+    ParsedPlan,
 )
 
 
@@ -48,7 +49,7 @@ class SceneArmEndpoint(SingleArmSim):
         self.speed_limits = speed_limits.copy()
         self.initial = self.arm.data.qpos[self.arm.qpos_indices].copy()
         self.target = self.initial.copy()
-        self.plan: tuple[FloatArray, FloatArray] | None = None
+        self.plan: ParsedPlan | None = None
         self.plan_start = 0.0
         self.plan_start_ros_ns: int | None = None
         self.last_schedule_clock: int | None = None
@@ -127,7 +128,7 @@ class SceneArmEndpoint(SingleArmSim):
         if start_ns is not None and elapsed >= 0 and not self.schedule_running:
             self.schedule_running = True
             self.publish_trajectory_status(f"RUNNING:{start_ns}")
-        self.target, done = sample_plan(plan[0], plan[1], elapsed)
+        self.target, done = sample_prepared_plan(plan, elapsed)
         if done:
             self.plan = None
             self.plan_start_ros_ns = None

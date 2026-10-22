@@ -14,6 +14,7 @@ from typing import Any, Callable
 
 import yaml
 
+from archer_control.continuous_trajectory import RecordedTimeMap
 from .commissioning import load_limits
 from .csv_import import import_samples
 from .position_plan import ContinuousPositionTrajectory, positive, prepare_continuous_pair
@@ -128,9 +129,6 @@ def load_reviewed_task(
     limits = load_limits(paths['limits'], content=snapshots['limits'])
     samples, measured = import_samples(snapshots['csv'], limits)
     plans = prepare_continuous_pair(payload, limits, excursion, cancelled=cancelled)
-    scale = positive(report.get('uniform_time_scale'), 'uniform_time_scale')
-    if scale < 1.:
-        raise ValueError('准备过程不允许缩短原始采样时间')
     for field in ('source_time_origin_ns', 'source_time_basis', 'paired_samples', 'source_rows'):
         if report.get(field) != measured[field]:
             raise ValueError('准备报告与原始采样不一致：' + field)
@@ -149,6 +147,15 @@ def load_reviewed_task(
     if not isinstance(stage_report, dict) or set(stage_report) != {'left', 'right'}:
         raise ValueError('准备报告缺少双侧原始阶段')
     required_stops = {0, count - 1}
+    tolerance = 0.
+    if report.get('position_filter') is not None:
+        value = report.get('position_smoothing_tolerance_rad')
+        if (report['position_filter'] != 'bounded_spatial_spline'
+                or isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or not 0. < value <= .0005):
+            raise ValueError('空间路径拟合的节点误差上限无效')
+        tolerance = float(value)
+    changes = {}
     source_times: list[int] = []
     for side in ('left', 'right'):
         raw = samples[side]['points']
@@ -157,29 +164,47 @@ def load_reviewed_task(
         check_task_stages(labels, task)
         if labels != stage_report[side] or len(points) != len(raw):
             raise ValueError(side + '采样数量或阶段被改动')
+        maximum = 0.
         for i, (original, prepared) in enumerate(zip(raw, points)):
             if cancelled is not None and cancelled():
                 raise ValueError('任务采样核对已取消')
-            if prepared['positions'] != original['positions']:
+            difference = max(abs(a - b) for a, b in
+                             zip(prepared['positions'], original['positions']))
+            maximum = max(maximum, difference)
+            if difference > tolerance + (1e-12 if tolerance else 0.):
                 raise ValueError(side + '原始实际关节角被改写')
+            if tolerance and i in payload['stop_indices'] and difference != 0.:
+                raise ValueError(side + '阶段停车边界不得进行位置拟合修改')
             t = original['time_from_start']
             source_ns = t['sec'] * 10 ** 9 + t['nanosec']
             if side == 'left':
                 source_times.append(source_ns)
-            # 原准备器先转秒再统一伸长，允许往返浮点和纳秒向上取整的2ns差异。
-            if abs(plans[side].times_ns[i] - math.ceil(source_ns * scale)) > 2:
-                raise ValueError(side + '准备时间与统一时间伸长不一致')
             if i and labels[i] != labels[i - 1]:
                 required_stops.update((i - 1, i))
+        changes[side] = maximum
+        if tolerance:
+            reported_changes = report.get('max_sample_position_change_rad')
+            if not isinstance(reported_changes, Mapping):
+                raise ValueError('缺少双侧节点拟合偏差报告')
+            value = reported_changes.get(side)
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                    or not math.isclose(value, maximum, rel_tol=0., abs_tol=1e-12)):
+                raise ValueError(side + '节点拟合偏差与实际文件不一致')
     # 复用准备器的事件停顿规则，参考事件依然不会转换为SDK指令。
     from bisect import bisect_left
 
+    held = tuple(all(
+        samples[s]['points'][i]['positions'] == samples[s]['points'][i + 1]['positions']
+        for s in ('left', 'right')) for i in range(count - 1))
+    mapping = RecordedTimeMap.from_report(report, tuple(source_times), plans['left'].times_ns,
+                                          held_intervals=held)
     events = []
     for event in samples['reference_events']:
         relative = event['source_time_ns'] - samples['source_time_origin_ns']
         index = min(count - 1, bisect_left(source_times, relative))
         required_stops.update((max(0, index - 1), index))
-        events.append({**event, 'prepared_time_ns': math.ceil(relative * scale)})
+        events.append({**event, 'prepared_time_ns': mapping.map_ns(relative)})
     if report.get('reference_events') != events:
         raise ValueError('参考事件或事件时间与原始记录不同')
     if not required_stops <= set(payload['stop_indices']):
@@ -188,6 +213,8 @@ def load_reviewed_task(
     details = {
         'task_files_verified': True, 'task_type': task, 'paired_samples': count,
         'duration_s': duration, 'max_excursion_rad': excursion, 'sha256': hashes,
+        'position_smoothing_tolerance_rad': tolerance,
+        'verified_max_sample_position_change_rad': changes,
         'execution_ready': False, 'commands_sent': False,
         'geometry_preflight_passed': False, 'actual_start_verified': False,
         'gripper_execution_verified': False,

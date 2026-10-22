@@ -53,7 +53,8 @@ class TaskFileTests(unittest.TestCase):
                           'task_completed': True, 'sample_count': len(labels)},
         })
         self.assertEqual(prepare_main(['--run-dir', str(self.root), '--limits-file',
-                                      str(self.config), '--prepare']), 0)
+                                      str(self.config), '--prepare',
+                                      '--output', str(self.root / 'prepared_path.json')]), 0)
 
     def write(self, name: str, data: object) -> None:
         """写入测试JSON，保持有限数值."""
@@ -84,6 +85,39 @@ class TaskFileTests(unittest.TestCase):
                      'actual_start_verified', 'gripper_execution_verified'):
             self.assertIs(result[name], False)
         self.assertEqual(before, {p.name: p.read_bytes() for p in self.root.iterdir()})
+
+    def test_spatial_mode_is_explicit_and_bounds_verified(self) -> None:
+        """空间模式成功仍不授予执行许可，误差声明超出硬上限则拒绝。"""
+        try:
+            from scipy.interpolate import BSpline
+            self.assertTrue(callable(BSpline))
+        except (ImportError, ValueError):
+            self.skipTest('需要兼容的SciPy转换环境')
+        self.assertEqual(prepare_main([
+            '--run-dir', str(self.root), '--limits-file', str(self.config), '--prepare',
+            '--path-retime', '--output', str(self.root / 'prepared_path.json')]), 0)
+        result = self.review()
+        self.assertEqual(result['position_smoothing_tolerance_rad'], .0005)
+        self.assertFalse(result['execution_ready'])
+        report = self.read('prepared_path_report.json')
+        report['position_smoothing_tolerance_rad'] = .001
+        self.write('prepared_path_report.json', report)
+        with self.assertRaisesRegex(ValueError, '误差上限'):
+            self.review()
+
+    def test_spatial_metadata_cannot_hide_boundary_changes(self) -> None:
+        """即使伪造空间模式声明，阶段边界仍必须保留原采样。"""
+        report = self.read('prepared_path_report.json')
+        report.update(position_filter='bounded_spatial_spline',
+                      position_smoothing_tolerance_rad=.0005,
+                      max_sample_position_change_rad={'left': .00001, 'right': 0.})
+        self.write('prepared_path_report.json', report)
+        payload = self.read('prepared_path.json')
+        payload['left']['points'][4]['positions'][0] += .00001
+        self.write('prepared_path.json', payload)
+        self.repin('prepared_path.json', 'output_sha256')
+        with self.assertRaisesRegex(ValueError, '停车边界'):
+            self.review()
 
     def test_mismatched_snapshots_are_rejected(self) -> None:
         """原CSV、摘要、配置或准备文件变化，原报告均不能继续使用."""
@@ -152,6 +186,67 @@ class TaskFileTests(unittest.TestCase):
                     self.review()
         self.write('prepared_path_report.json', original)
 
+    def test_legacy_uniform_report_remains_readable(self) -> None:
+        """旧报告没有时间策略字段时仍按原统一倍率规则核对，不迁移或改写文件."""
+        # 明确构造旧统一倍率格式，避免依赖新优化器恰好选择哪种时间策略。
+        payload = self.read('prepared_path.json')
+        for side in ('left', 'right'):
+            for index, point in enumerate(payload[side]['points']):
+                point['time_from_start'] = {'sec': index, 'nanosec': 0}
+                point['velocities'] = [0.] * 6
+                point['accelerations'] = [0.] * 6
+        self.write('prepared_path.json', payload)
+        report = self.read('prepared_path_report.json')
+        for field in ('timing_policy', 'source_times_ns', 'prepared_times_ns',
+                      'effective_time_scale'):
+            report.pop(field, None)
+        report['uniform_time_scale'] = 20.
+        report['duration_s'] = 8.
+        for event in report['reference_events']:
+            event['prepared_time_ns'] = (event['source_time_ns']
+                                         - report['source_time_origin_ns']) * 20
+        report['output_sha256'] = hashlib.sha256(
+            (self.root / 'prepared_path.json').read_bytes()).hexdigest()
+        self.write('prepared_path_report.json', report)
+        self.assertTrue(self.review()['task_files_verified'])
+
+    def test_local_time_mapping_is_checked_against_original_and_payload(self) -> None:
+        """局部时间报告可审阅，但改写来源轴、候选映射或策略不能只靠更新哈希通过."""
+        self.make_circle_record()
+        positions = (0., .0001, .0002, .0003, .0004, .0005, .0006, .0007,
+                     .03, .029, .028, .02, .01, .001, 0.)
+        stream = io.StringIO(newline='')
+        writer = csv.writer(stream)
+        writer.writerow(['feedback_stamp_ns', 'side', 'phase',
+                         *[f'actual_J{i}_rad' for i in range(1, 7)]])
+        for i, q in enumerate(positions):
+            phase = 'APPROACH' if i < 4 else 'ARC' if i < 11 else 'RETURN_HOME'
+            for side in ('left', 'right'):
+                writer.writerow([1792316000123456789 + i * 50000000, side, phase, *([q] * 6)])
+        (self.root / 'tracking.csv').write_text(stream.getvalue())
+        summary = self.read('summary.json')
+        summary['records'] = {s: len(positions) for s in ('left', 'right')}
+        self.write('summary.json', summary)
+        self.assertEqual(prepare_main(['--run-dir', str(self.root), '--limits-file',
+                                      str(self.config), '--prepare',
+                                      '--output', str(self.root / 'prepared_path.json')]), 0)
+        report = self.read('prepared_path_report.json')
+        self.assertEqual(report['timing_policy'], 'local_segment_c2')
+        self.assertTrue(self.review()['task_files_verified'])
+        changes = []
+        for field in ('source_times_ns', 'prepared_times_ns'):
+            axis = list(report[field])
+            axis[2] += 1
+            changes.append({field: axis})
+        changes.extend(({'timing_policy': 'unknown'}, {'uniform_time_scale': 1.},
+                        {'effective_time_scale': report['effective_time_scale'] + .01}))
+        for change in changes:
+            with self.subTest(change=change):
+                self.write('prepared_path_report.json', {**report, **change})
+                with self.assertRaises(ValueError):
+                    self.review()
+        self.write('prepared_path_report.json', report)
+
     def test_ambiguous_csv_and_legacy_object_rejected(self) -> None:
         """不自动选择混合CSV，也不把旧参考物协同示意当作圆柱抓取."""
         (self.root / 'tracking.csv').write_text('unused')
@@ -202,7 +297,8 @@ class TaskFileTests(unittest.TestCase):
                    'records': {'left': 3, 'right': 3}}
         self.write('summary.json', summary)
         self.assertEqual(prepare_main(['--run-dir', str(self.root), '--limits-file',
-                                      str(self.config), '--prepare']), 0)
+                                      str(self.config), '--prepare',
+                                      '--output', str(self.root / 'prepared_path.json')]), 0)
         self.assertEqual(self.review()['task_type'], 'split_circle')
         summary['task_type'] = 'cooperative'
         summary['reference_object_only'] = True
@@ -254,7 +350,8 @@ class TaskFileTests(unittest.TestCase):
             'reference_object_only': False, 'records': {'left': 3, 'right': 3},
         })
         self.assertEqual(prepare_main(['--run-dir', str(self.root), '--limits-file',
-                                      str(self.config), '--prepare']), 0)
+                                      str(self.config), '--prepare',
+                                      '--output', str(self.root / 'prepared_path.json')]), 0)
 
     def test_file_return_uses_saved_initial_after_recovery(self) -> None:
         """当前保持位不同于初值时，归位仍返回初值；轻微超限只裁归位目标."""
@@ -284,6 +381,7 @@ class TaskFileTests(unittest.TestCase):
                 self.assertEqual(plan.initial, starts[side])
                 self.assertEqual(plan.goal, limits[side].return_goal(saved[side]))
                 self.assertEqual(geometry.call_args.kwargs['return_home'][side].goal, plan.goal)
+                self.assertEqual(geometry.call_args.kwargs['return_targets'][side], plan.goal)
                 for expected, polynomial in zip(
                     original.plans[side].polynomials, plan.polynomials[1:-1],
                 ):
@@ -308,12 +406,51 @@ class TaskFileTests(unittest.TestCase):
         assert result.continuous is not None and result.details is not None
         self.assertEqual(result.details['request_id'], 'a' * 32)
         self.assertFalse(result.details['gripper_commands_included'])
+        # 安全向上取整可能因浮点表示多出1纳秒。
+        self.assertIn(result.details['phase_start_ns']['TASK'],
+                      (3_150_000_000, 3_150_000_001))
         for side, plan in result.continuous.items():
             self.assertTrue(plan.preserve_path)
             self.assertEqual(plan.initial, starts[side])
             self.assertEqual(plan.goal, starts[side])
+            self.assertIn(plan.times_ns[-1] - plan.times_ns[-2],
+                          (3_150_000_000, 3_150_000_001))
             for expected, actual in zip(original.plans[side].polynomials, plan.polynomials[1:-1]):
                 self.assertEqual(expected.tobytes(), actual.tobytes())
+
+    def test_core_precheck_reuses_snapshot_but_uses_latest_start(self) -> None:
+        """主体先检查；之后不重读文件，但接近与归位使用新的实测起点。"""
+        from archer_hardware.position_node import prepare_file_core_message
+        from archer_hardware.task_file import read_snapshot
+        from archer_hardware.task_geometry import trajectory_fingerprint
+
+        self.make_circle_record()
+        text = self.file_request()
+
+        def geometry(task, **kwargs):
+            return {'sampled_cross_arm_table_passed': True,
+                    'task_trajectory_sha256': trajectory_fingerprint(task)}
+
+        with patch('archer_hardware.task_file.read_snapshot', wraps=read_snapshot) as read, \
+                patch('archer_hardware.task_geometry.check_task_geometry', side_effect=geometry):
+            core = prepare_file_core_message(
+                text, self.file_limits(), .05, Event(), joint_error_rad=0.)
+            self.assertEqual(read.call_count, 5)
+            starts = {'left': (-.01,) * 6, 'right': (-.02,) * 6}
+            result = prepare_file_task_message(text, self.file_limits(), .05, starts,
+                                               Event(), saved_initial=starts, prepared_core=core)
+            self.assertEqual(read.call_count, 5)
+            self.assertEqual(result.details['return_targets'],
+                             {s: list(q) for s, q in starts.items()})
+            for side, plan in result.continuous.items():
+                self.assertEqual(plan.initial, starts[side])
+                self.assertEqual(plan.goal, starts[side])
+            changed = json.loads(text)
+            changed['request_id'] = 'b' * 32
+            with self.assertRaisesRegex(ValueError, '主体检查与请求'):
+                prepare_file_task_message(
+                    json.dumps(changed), self.file_limits(), .05, starts, Event(),
+                    prepared_core=core)
 
     def test_guarded_file_preserves_raw_feedback_and_requires_geometry_proof(self) -> None:
         """只替换几何模型，真实文件绑定和完整路径组装仍运行，原始反馈不能被覆盖."""
@@ -331,15 +468,33 @@ class TaskFileTests(unittest.TestCase):
         with patch('archer_hardware.task_file.load_reviewed_task', return_value=reviewed), patch(
             'archer_hardware.task_geometry.check_task_geometry', return_value={
                 'sampled_cross_arm_table_passed': True, 'joint_error_rad': .0001,
+                'nominal_feedback_required': True,
             },
         ) as geometry:
             result = prepare_file_task_message(self.file_request(), limits, .05, actual, Event(),
                                                hold_start=hold, joint_error_rad=.0001)
         self.assertEqual(geometry.call_args.kwargs['joint_error_rad'], .0001)
+        self.assertIs(geometry.call_args.kwargs['nominal_feedback_guarded'], True)
+        with patch('archer_hardware.task_file.load_reviewed_task', return_value=reviewed), patch(
+            'archer_hardware.task_geometry.check_task_geometry', return_value={
+                'sampled_cross_arm_table_passed': True, 'joint_error_rad': .0001,
+                'nominal_feedback_required': True, 'startup_joint_error_rad': .01,
+            },
+        ):
+            startup = prepare_file_task_message(
+                self.file_request(), limits, .05, actual, Event(), hold_start=hold,
+                joint_error_rad=.0001, startup_joint_error_rad=.01)
+        assert startup.continuous is not None
+        for curve in startup.continuous.values():
+            self.assertEqual(curve.tracking_error_at(0.), .01)
+            self.assertEqual(curve.tracking_error_at(curve.times_ns[1] / 1e9), .0001)
         assert result.details is not None and result.continuous is not None
         self.assertEqual(result.details['actual_initial_positions'],
                          {s: list(q) for s, q in actual.items()})
         self.assertEqual(result.details['return_reference'], 'actual_feedback')
+        self.assertEqual(result.details['reference_clock'], 'shared_periodic_latest_target')
+        self.assertGreater(result.details['delivery_reference_step_s'], 0.)
+        self.assertLessEqual(result.details['delivery_reference_step_s'], .02)
         for side, plan in result.continuous.items():
             self.assertEqual(plan.initial, hold[side])
             self.assertEqual(plan.goal, actual[side])

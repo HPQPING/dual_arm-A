@@ -21,7 +21,7 @@ from trajectory_msgs.msg import JointTrajectory
 from visualization_msgs.msg import Marker, MarkerArray
 import yaml
 
-from archer_mujoco.sim_node import prepare_plan, sample_plan
+from archer_mujoco.sim_node import prepare_plan, sample_prepared_plan, ParsedPlan
 from .model_checks import validate_tool_chain
 from .circle_planner import semicircle_points
 from .dual_arm_trajectory import checked_pose, rigid_transform
@@ -137,7 +137,7 @@ class DualTrace(Node):
                 numbers(params[side + "_base_rpy"], side + "_base_rpy"),
             )
         self.feedback: dict[str, tuple[int, FloatArray]] = {}
-        self.plans: dict[str, tuple[FloatArray, FloatArray]] = {}
+        self.plans: dict[str, ParsedPlan] = {}
         self.traces: dict[str, list[FloatArray]] = {"left": [], "right": []}
         self.last_saved: dict[str, int] = {}
         self.counts = {"left": 0, "right": 0}
@@ -414,7 +414,7 @@ class DualTrace(Node):
             plan = self.plans[side]
             stamp, q = self.feedback[side]
             elapsed = (stamp - self.start_ns) * 1e-9
-            target_q, _ = sample_plan(plan[0], plan[1], elapsed)
+            target_q, _ = sample_prepared_plan(plan, elapsed)
             actual = (self.world[side] @ self.models[side].forward(q))[:3, 3]
             desired = (self.world[side] @ self.models[side].forward(target_q))[:3, 3]
             error = float(np.linalg.norm(actual - desired)) * 1000.0

@@ -298,10 +298,10 @@ class PositionWorker:
                 backend.recover_limits(command.duration)
                 if backend.state == 'HOLDING':
                     self._phase = 'SUCCEEDED'
-                    self._message = '实际角度已在名义限位内，未启动收回动作'
+                    self._message = '实际角度已满足入限准备要求，未启动动作'
                 else:
                     self._phase = 'RUNNING'
-                    self._message = '仅收回轻微超限关节，等待实际反馈进入名义限位'
+                    self._message = '本段仅准备入限或边界余量，等待实际反馈满足准入条件'
             elif command.kind == 'trajectory':
                 if command.gate is None:
                     raise ValueError('成对轨迹缺少共同启动门控')
@@ -359,13 +359,17 @@ class PositionWorker:
                 backend.tick()
                 if backend.state == 'RUNNING' and previous == 'ARMED':
                     self._phase = 'RUNNING'
-                    self._message = '按共同单调时刻推进轨迹，非控制器硬同步'
+                    self._message = '按共同参考时间推进轨迹，非控制器硬同步'
                 if backend.state == 'HOLDING' and previous in (
                     'REQUESTING', 'ARMED', 'RUNNING',
                 ):
                     self._phase = 'SUCCEEDED'
-                    self._message = ('控制权已确认，保持实际当前位置' if previous == 'REQUESTING'
-                                     else '实际反馈已稳定到位')
+                    if previous == 'REQUESTING':
+                        self._message = '控制权已确认，保持实际当前位置'
+                    elif self._job is not None and self._job.kind == 'recover_limits':
+                        self._message = '本段实际入限及余量已满足，保持当前位置；不代表轨迹精度验收'
+                    else:
+                        self._message = '实际反馈已稳定到位'
         except Exception as error:
             if terminal:
                 # 停止后继续读取反馈；读取失败不重复触发两臂联锁。

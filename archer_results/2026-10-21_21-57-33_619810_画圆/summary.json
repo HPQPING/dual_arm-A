@@ -1,0 +1,39 @@
+{
+  "recording_policy": "paired_fresh_feedback",
+  "max_record_pair_skew_s": 0.005,
+  "task_name": "画圆",
+  "started_at": "2026-10-21T21:57:33.619810+08:00",
+  "task_state": "COMPLETED",
+  "start_stamp_ns": 1792591056548444947,
+  "task_type": "split_circle",
+  "records": {
+    "left": 3556,
+    "right": 3556
+  },
+  "arc_records": {
+    "left": 2121,
+    "right": 2121
+  },
+  "cooperative_records": {
+    "left": 0,
+    "right": 0
+  },
+  "maximum_tracking_error_mm": {
+    "left": 15.746816872294639,
+    "right": 14.692619840634798
+  },
+  "maximum_distance_to_circle_mm": {
+    "left": 0.653566303454248,
+    "right": 0.47375835267491695
+  },
+  "maximum_object_tcp_error_mm": {
+    "left": null,
+    "right": null
+  },
+  "paired_records": 0,
+  "maximum_relative_position_error_mm": null,
+  "maximum_relative_rotation_error_rad": null,
+  "max_pair_skew_s": 0.005,
+  "reference_object_only": false,
+  "source": "实际 TCP 由 ROS 关节反馈和模型正运动学计算，不是实机外部测量"
+}

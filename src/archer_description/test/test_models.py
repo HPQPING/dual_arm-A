@@ -35,6 +35,8 @@ def test_single_arm_has_six_finite_revolute_joints(side: str) -> None:
         assert limit is not None and axis is not None
         low, high = float(limit.attrib["lower"]), float(limit.attrib["upper"])
         assert math.isfinite(low) and math.isfinite(high) and low < high
+        if joint.get("name") in (f"{side}_joint_2", f"{side}_joint_4"):
+            assert low == -1.575
         vector = [float(x) for x in axis.attrib["xyz"].split()]
         assert len(vector) == 3 and math.isclose(sum(v * v for v in vector), 1.0, abs_tol=1e-9)
 

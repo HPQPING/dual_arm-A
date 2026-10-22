@@ -6,12 +6,16 @@ import argparse
 from bisect import bisect_left
 import csv
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 import hashlib
 import io
 import json
 import math
+import os
 from pathlib import Path
+import shutil
+from tempfile import mkdtemp
 from typing import Any
 
 import yaml
@@ -188,33 +192,90 @@ def import_samples(
     }
 
 
+def replace_conversion_pair(
+    output: Path, content: bytes, report_path: Path, report: bytes,
+) -> None:
+    """先暂存两文件再替换，普通写入异常回滚；回滚异常保留备份位置."""
+    staged: list[tuple[Path, Path, Path | None]] = []
+    directories: list[Path] = []
+    keep_backups = False
+    try:
+        for target, data in ((output, content), (report_path, report)):
+            if target.is_symlink() or (target.exists() and not target.is_file()):
+                raise OSError('转换目标必须为普通文件，不能为目录或符号链接')
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = Path(mkdtemp(prefix='.conversion_', dir=target.parent))
+            directories.append(temporary)
+            candidate = temporary / 'new'
+            with candidate.open('xb') as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            backup = temporary / 'previous' if target.exists() else None
+            if backup is not None:
+                shutil.copyfile(target, backup)
+            staged.append((target, candidate, backup))
+        committed: list[tuple[Path, Path | None]] = []
+        try:
+            for target, candidate, backup in staged:
+                os.replace(candidate, target)
+                committed.append((target, backup))
+        except OSError:
+            try:
+                for target, backup in reversed(committed):
+                    if backup is None:
+                        target.unlink(missing_ok=True)
+                    else:
+                        os.replace(backup, target)
+            except OSError as error:
+                keep_backups = True
+                raise OSError(f'回滚失败，保留备份目录：{directories}；{error}') from error
+            raise
+    finally:
+        if not keep_backups:
+            for directory in directories:
+                shutil.rmtree(directory)
+
+
 def main(args: list[str] | None = None) -> int:
-    """从成功任务目录读取CSV并排他写入候选与报告，不初始化ROS或连接SDK."""
+    """从成功任务CSV生成最新同名转换；成功替换，失败保留旧结果，不连接设备."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run-dir', type=Path, required=True)
     parser.add_argument('--limits-file', type=Path, required=True)
     parser.add_argument('--csv-name', choices=('state.csv', 'tracking.csv'))
-    parser.add_argument('--output', type=Path)
-    parser.add_argument('--report', type=Path)
+    parser.add_argument('--output-dir', type=Path,
+                        help='转换文件目录；默认工作空间/archer_results_trans/原任务目录名')
+    parser.add_argument('--output', type=Path, help='显式指定轨迹文件，覆盖默认输出位置')
+    parser.add_argument('--report', type=Path, help='显式指定转换报告；默认与轨迹文件放在一起')
     parser.add_argument('--max-gap', type=float, default=.2)
     parser.add_argument('--pair-skew-ms', type=float, default=5.)
     parser.add_argument('--prepare', action='store_true', help='生成连续插值及限速后的版本二候选')
+    parser.add_argument('--smooth', action='store_true', help='配合--prepare平滑普通节点导数；需兼容的SciPy')
+    parser.add_argument('--path-retime', action='store_true',
+                        help='有界空间样条与共同弧长重定时；已包含平滑，不与--smooth混用')
     parser.add_argument('--margin', type=float, default=1.05, help='连续轨迹限速时间余量')
     options = parser.parse_args(args)
-    root = options.run_dir.expanduser()
-    stem = 'prepared_path' if options.prepare else 'recorded_path'
-    output = options.output or root / (stem + '.json')
-    report_path = options.report or root / (stem + '_report.json')
+    if options.smooth and not options.prepare:
+        parser.error('--smooth需要同时使用--prepare')
+    if options.path_retime and (not options.prepare or options.smooth):
+        parser.error('--path-retime需要--prepare，且不要同时使用--smooth')
+    root = options.run_dir.expanduser().resolve()
     existing = [name for name in ('state.csv', 'tracking.csv') if (root / name).is_file()]
     selected = options.csv_name or (existing[0] if len(existing) == 1 else None)
     if selected is None:
         parser.error('任务目录必须恰有一种可识别CSV，否则请显式指定--csv-name')
+    stem = Path(selected).stem
+    workspace = (root.parent.parent if root.parent.name == 'archer_results'
+                 else Path.home() / 'archer_ws')
+    destination = (options.output_dir.expanduser() if options.output_dir else
+                   workspace / 'archer_results_trans' / root.name)
+    output = options.output.expanduser() if options.output else destination / (stem + '.json')
+    report_path = (options.report.expanduser() if options.report else
+                   output.with_name(output.stem + '_report.json'))
     source, summary = root / selected, root / 'summary.json'
     paths = (source, summary, options.limits_file, output, report_path)
     if len({p.resolve() for p in paths}) != len(paths):
         parser.error('输入、配置、候选和报告不能使用相同文件路径')
-    if output.exists() or report_path.exists():
-        parser.error('候选或报告已存在，请指定新名称；不覆盖旧数据')
     report: dict[str, Any] = {'import_succeeded': False, 'execution_ready': False,
                               'commands_sent': False}
     candidate = None
@@ -240,31 +301,34 @@ def main(args: list[str] | None = None) -> int:
         )
         report.update(measured)
         if options.prepare:
-            candidate, timing = prepare_samples(candidate, limits, margin=options.margin)
+            frequency = 250
+            if options.path_retime:
+                frequency = yaml.safe_load(limits_bytes)['archer_position_driver'][
+                    'ros__parameters'].get('control_hz', 250)
+            candidate, timing = prepare_samples(candidate, limits, margin=options.margin,
+                                                smooth=options.smooth,
+                                                path_retime=options.path_retime,
+                                                execution_hz=frequency)
             report.update(timing)
     except (OSError, ValueError, TypeError, KeyError, UnicodeError,
             csv.Error, yaml.YAMLError) as error:
         candidate = None
         report['import_succeeded'] = False
         report['error'] = str(error)
-    created_output = created_report = False
+    if candidate is None or not report['import_succeeded']:
+        print(f"导入或准备失败：{report.get('error', '没有有效轨迹')}；未替换旧结果，未发送动作")
+        return 1
     try:
-        with report_path.open('x', encoding='utf-8') as evidence:
-            created_report = True
-            if candidate is not None and report['import_succeeded']:
-                content = (json.dumps(candidate, ensure_ascii=False, indent=2, allow_nan=False)
-                           + '\n').encode('utf-8')
-                with output.open('xb') as stream:
-                    created_output = True
-                    stream.write(content)
-                report['output_sha256'] = hashlib.sha256(content).hexdigest()
-            json.dump(report, evidence, ensure_ascii=False, indent=2, allow_nan=False)
-            evidence.write('\n')
+        content = (json.dumps(candidate, ensure_ascii=False, indent=2, allow_nan=False)
+                   + '\n').encode('utf-8')
+        report['output_sha256'] = hashlib.sha256(content).hexdigest()
+        report['converted_at'] = datetime.now().astimezone().isoformat(timespec='microseconds')
+        report['conversion_mode'] = ('prepared_continuous' if options.prepare
+                                     else 'recorded_samples')
+        evidence = (json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False)
+                    + '\n').encode('utf-8')
+        replace_conversion_pair(output, content, report_path, evidence)
     except (OSError, ValueError) as error:
-        if created_output:
-            output.unlink(missing_ok=True)
-        if created_report:
-            report_path.unlink(missing_ok=True)
         print(f'写入失败：{error}；未发送动作')
         return 1
     action = '已准备连续候选' if options.prepare else '已导入采样候选'
@@ -274,9 +338,13 @@ def main(args: list[str] | None = None) -> int:
 
 def prepare_samples(
     samples: dict[str, Any], limits: dict[str, PositionLimits], *, margin: float = 1.05,
+    smooth: bool = False,
+    path_retime: bool = False, execution_hz: int = 250,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """接续本模块的采样结果，保留位置并调整双臂时间；事件仍只作为参考."""
-    from archer_control.continuous_trajectory import retime_recorded_pair
+    """准备受限双臂轨迹；空间模式允许有界节点拟合，阶段事件仍仅作为参考。"""
+    from archer_control.continuous_trajectory import (
+        RecordedTimeMap, retime_recorded_pair, smooth_recorded_pair, retime_spatial_pair,
+    )
 
     if (samples.get('version') != 3 or samples.get('kind') != 'recorded_joint_samples'
             or samples.get('interpolation') != 'unassigned'):
@@ -317,24 +385,65 @@ def prepare_samples(
             raise ValueError('参考事件超出记录时间范围')
         index = min(len(source_times) - 1, bisect_left(source_times, relative))
         stops.update((max(0, index - 1), index))
-    plan, measured = retime_recorded_pair(
-        source_times, positions['left'], positions['right'],
-        [limits[s].lower for s in ('left', 'right')],
-        [limits[s].upper for s in ('left', 'right')],
-        [limits[s].max_velocity for s in ('left', 'right')],
-        [limits[s].max_acceleration for s in ('left', 'right')],
-        stops=tuple(sorted(stops)), margin=margin,
-    )
+    if path_retime:
+        if smooth or type(execution_hz) is not int or execution_hz not in (250, 500):
+            raise ValueError('路径重定时需250/500Hz配置，且不混用旧平滑选项')
+        # 与现有SDK单包保护匹配：避免全程因最陡段的统一推进上限被再次放慢。
+        fraction = .8 * execution_hz / 500.
+        plan, measured = retime_spatial_pair(
+            source_times, positions['left'], positions['right'],
+            [limits[s].lower for s in ('left', 'right')],
+            [limits[s].upper for s in ('left', 'right')],
+            [[v * fraction for v in limits[s].max_velocity] for s in ('left', 'right')],
+            [limits[s].max_acceleration for s in ('left', 'right')],
+            stops=tuple(sorted(stops)), margin=margin,
+        )
+        measured.update(planned_control_hz=execution_hz,
+                        planning_velocity_fraction=fraction)
+    else:
+        plan, measured = retime_recorded_pair(
+            source_times, positions['left'], positions['right'],
+            [limits[s].lower for s in ('left', 'right')],
+            [limits[s].upper for s in ('left', 'right')],
+            [limits[s].max_velocity for s in ('left', 'right')],
+            [limits[s].max_acceleration for s in ('left', 'right')],
+            stops=tuple(sorted(stops)), margin=margin,
+        )
+    if smooth:
+        plan, smoothed = smooth_recorded_pair(
+            plan, [limits[s].lower for s in ('left', 'right')],
+            [limits[s].upper for s in ('left', 'right')],
+            [limits[s].max_velocity for s in ('left', 'right')],
+            [limits[s].max_acceleration for s in ('left', 'right')], margin=margin,
+        )
+        # 重新登记最终时间轴，阶段和参考事件仍沿用同一映射；保持旧执行格式。
+        measured['max_segment_shape_change_rad'] = {
+            s: measured['max_segment_shape_change_rad'][s]
+            + smoothed['smoothing_max_segment_change_rad'][s] for s in ('left', 'right')}
+        measured.update(smoothed)
+        measured.update({
+            'timing_policy': 'local_segment_c2', 'uniform_time_scale': None,
+            'effective_time_scale': float(plan.times[-1] / (source_times[-1] / 1e9)),
+            'source_times_ns': list(source_times),
+            'prepared_times_ns': [int(round(float(t) * 1e9)) for t in plan.times],
+            'stop_indices': list(plan.stops),
+        })
     payload = plan.payload()
+    prepared_ns = tuple(p['time_from_start']['sec'] * 10 ** 9
+                        + p['time_from_start']['nanosec'] for p in payload['left']['points'])
+    held = tuple(all(positions[s][i] == positions[s][i + 1] for s in ('left', 'right'))
+                 for i in range(len(source_times) - 1))
+    mapping = RecordedTimeMap.from_report(measured, source_times, prepared_ns, held_intervals=held)
     # 版本二执行字段保持原格式；来源、阶段和事件放在报告中，避免伪装成已实现的夹爪指令。
     remapped = []
     for event in events:
-        elapsed_ns = math.ceil((event['source_time_ns'] - origin) * measured['uniform_time_scale'])
+        elapsed_ns = mapping.map_ns(event['source_time_ns'] - origin)
         remapped.append({**event, 'prepared_time_ns': elapsed_ns})
     return payload, {
         **measured, 'preparation_succeeded': True, 'execution_ready': False,
         'commands_sent': False, 'phase_execution_policy_verified': False,
         'source_stages': stages, 'reference_events': remapped,
         'geometry_preflight_passed': False, 'actual_start_verified': False,
-        'scope': '保留实际关节路径并解析验证段内角度、速度及加速度；未验证碰撞、实际起点或夹爪事件执行',
+        'scope': ('保留源采样数量和阶段；空间重定时允许有界节点拟合变化，普通模式保留原角度；'
+                  '解析验证段内角度、速度及加速度，未验证碰撞、实际起点或夹爪执行'),
     }
