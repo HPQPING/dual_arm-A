@@ -283,6 +283,84 @@ class SpatialRecordedTimingTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 self.prepare(tolerance=value)
 
+    def test_smooth_cruise_keeps_shared_stops_and_constraints(self):
+        """平滑起落与匀速段共用时间轴，双臂仍在阶段边界零速零加速度。"""
+        from archer_control.continuous_trajectory import trajectory_jerk_metrics
+
+        plan, report = self.prepare(ramp_fraction=.35)
+        self.assertEqual(report['path_progress_profile'], 'smooth_cruise')
+        self.assertEqual(report['jerk_metrics'], trajectory_jerk_metrics(plan))
+        for side in ('left', 'right'):
+            np.testing.assert_array_equal(plan.positions[side][list(plan.stops)],
+                                          self.q[list(plan.stops)])
+            np.testing.assert_array_equal(plan.velocities[side][list(plan.stops)], 0.)
+            np.testing.assert_array_equal(plan.accelerations[side][list(plan.stops)], 0.)
+            for t in np.linspace(0., plan.times[-1], 501):
+                self.assertLessEqual(float(np.max(abs(plan.sample(side, float(t), 1)))), .2 + 1e-9)
+                self.assertLessEqual(float(np.max(abs(plan.sample(side, float(t), 2)))), .3 + 1e-9)
+
+    def test_progress_law_is_monotonic_and_smooth_at_cruise(self):
+        """归一化进度单调，起落与匀速连接处的位置、速度和加速度连续。"""
+        from archer_control.continuous_trajectory import _path_progress
+
+        r = .35
+        x, v, a = _path_progress(np.linspace(0., 1., 1001), r)
+        self.assertTrue(np.all(np.diff(x) > 0.))
+        np.testing.assert_allclose(x[[0, -1]], (0., 1.))
+        np.testing.assert_allclose(v[[0, -1]], 0.)
+        np.testing.assert_allclose(a[[0, -1]], 0.)
+        for boundary in (r, 1. - r):
+            p, speed, acceleration = _path_progress(
+                np.array([boundary - 1e-8, boundary, boundary + 1e-8]), r)
+            self.assertLess(float(np.ptp(p)), 4e-8)
+            self.assertLess(float(np.ptp(speed)), 1e-12)
+            self.assertLess(float(np.max(abs(acceleration))), 1e-10)
+        for bad in (0., .1, .5, True, float('nan')):
+            with self.assertRaises(ValueError):
+                self.prepare(ramp_fraction=bad)
+
+    def test_jerk_limit_retimes_and_checks_actual_polynomials(self):
+        """更严格加加速度延长共同时间，独立解析峰值仍不超过规划界限。"""
+        from archer_control.continuous_trajectory import _extrema
+
+        normal, _ = self.prepare(ramp_fraction=.25)
+        limited, report = self.prepare(ramp_fraction=.25, max_jerk=.01)
+        self.assertGreater(limited.times[-1], normal.times[-1])
+        for side, polynomials in limited.polynomials.items():
+            peak = np.zeros(6)
+            for c, h in zip(polynomials, np.diff(limited.times)):
+                peak = np.maximum(peak, np.max(abs(_extrema(c, float(h), 3)), axis=1))
+            self.assertLessEqual(float(np.max(peak)), .01 + 1e-9)
+            np.testing.assert_allclose(peak, report['jerk_metrics'][side]['peak_jerk_rad_s3'],
+                                       atol=1e-10, rtol=1e-8)
+        for bad in (0., -.1, True, float('inf')):
+            with self.assertRaises(ValueError):
+                self.prepare(max_jerk=bad)
+
+    def test_global_derivatives_preserve_timing_and_bound_shape(self):
+        """全局导数降低普通节点跳变，保留双臂节点和停点并限制段内偏移。"""
+        from archer_control.continuous_trajectory import smooth_recorded_pair
+
+        original, _ = self.prepare(ramp_fraction=.25, max_jerk=2.)
+        plan, report = smooth_recorded_pair(original, self.low, self.high, self.speed,
+                                            self.accel, max_jerk=2., max_shape_change=.00005)
+        for side in ('left', 'right'):
+            np.testing.assert_array_equal(plan.positions[side], original.positions[side])
+            self.assertLess(report['smoothing_jerk_jump_after_rad_s3'][side], 1e-5)
+            self.assertLessEqual(report['smoothing_max_segment_change_rad'][side], .00005)
+            self.assertLessEqual(max(report['jerk_metrics'][side]['peak_jerk_rad_s3']), 2. + 1e-8)
+            for index in plan.stops:
+                np.testing.assert_array_equal(plan.velocities[side][index], 0.)
+                np.testing.assert_array_equal(plan.accelerations[side][index], 0.)
+        np.testing.assert_array_equal(plan.times, original.times)
+        with self.assertRaisesRegex(ValueError, '位置变化'):
+            smooth_recorded_pair(original, self.low, self.high, self.speed, self.accel,
+                                 max_shape_change=1e-20)
+        for options in ({'max_jerk': 0.}, {'max_shape_change': True}):
+            with self.assertRaises(ValueError):
+                smooth_recorded_pair(original, self.low, self.high, self.speed, self.accel,
+                                     **options)
+
 
 if __name__ == "__main__":
     unittest.main()

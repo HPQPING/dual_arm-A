@@ -560,12 +560,18 @@ def smooth_recorded_pair(
     max_acceleration: ArrayLike,
     *,
     margin: float = 1.05,
+    max_jerk: float | None = None,
+    max_shape_change: float | None = None,
 ) -> tuple[ContinuousPair, dict[str, Any]]:
     """离线用五次样条重算节点导数，保留位置和停点；执行器不依赖SciPy。"""
     try:
         from scipy.interpolate import make_interp_spline
     except (ImportError, ValueError) as error:
         raise ValueError('平滑转换需要与NumPy兼容的SciPy；请在隔离转换环境安装') from error
+    for value, name in ((max_jerk, '规划加加速度'), (max_shape_change, '段形变化上界')):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
+                                  or not math.isfinite(value) or value <= 0.):
+            raise ValueError(name + '必须是有限正数')
     bounds = [np.asarray(p, dtype=np.float64) for p in
               (lower, upper, max_velocity, max_acceleration)]
     low, high, speed, accel = bounds
@@ -620,7 +626,7 @@ def smooth_recorded_pair(
                 coefficients(q[i], q[i + 1], v[i], v[i + 1], a[i], a[i + 1], float(h))
                 for i, h in enumerate(np.diff(times))
             ])
-            peak_v, peak_a = zeros.copy(), zeros.copy()
+            peak_v, peak_a, peak_j = zeros.copy(), zeros.copy(), zeros.copy()
             for i, (c, h) in enumerate(zip(polys, np.diff(times))):
                 extent = _extrema(c, float(h), 0)
                 if np.any(extent[:, 0] < low[arm] - 1e-12) or np.any(
@@ -628,8 +634,12 @@ def smooth_recorded_pair(
                     raise ValueError(f'{side} 平滑后第{i + 1}段角度超限，未生成')
                 peak_v = np.maximum(peak_v, np.max(np.abs(_extrema(c, float(h), 1)), axis=1))
                 peak_a = np.maximum(peak_a, np.max(np.abs(_extrema(c, float(h), 2)), axis=1))
+                if max_jerk is not None:
+                    peak_j = np.maximum(peak_j, np.max(abs(_extrema(c, float(h), 3)), axis=1))
             ratio = max(ratio, float(np.max(peak_v / speed[arm])),
                         math.sqrt(float(np.max(peak_a / accel[arm]))))
+            if max_jerk is not None:
+                ratio = max(ratio, float(np.max(peak_j) / max_jerk)**(1. / 3.))
             velocities[side], accelerations[side], polynomials[side] = v, a, polys
             peaks[side] = {'peak_velocity_rad_s': peak_v.tolist(),
                            'peak_acceleration_rad_s2': peak_a.tolist()}
@@ -644,6 +654,8 @@ def smooth_recorded_pair(
                   for a, b in zip(polynomials[side], plan.polynomials[side]))
         for side in ('left', 'right')
     }
+    if max_shape_change is not None and any(v > max_shape_change for v in changes.values()):
+        raise ValueError('全局导数平滑的段内位置变化超过声明上界，未生成')
     report = {
         'smoothing_policy': 'clamped_quintic_spline',
         'smoothing_time_scale': scale,
@@ -655,22 +667,78 @@ def smooth_recorded_pair(
             s: jerk_jump(polynomials[s], times, side_stops[s]) for s in ('left', 'right')},
         'arms': peaks, 'duration_s': float(times[-1]),
     }
+    if max_jerk is not None:
+        report['planning_jerk_limit_rad_s3'] = max_jerk
+        report['jerk_metrics'] = trajectory_jerk_metrics(ContinuousPair(
+            times, plan.positions, velocities, accelerations, polynomials, tuple(stops)))
+    if max_shape_change is not None:
+        report['smoothing_shape_change_limit_rad'] = max_shape_change
     for array in (times, *velocities.values(), *accelerations.values(), *polynomials.values()):
         array.setflags(write=False)
     return ContinuousPair(times, plan.positions, velocities, accelerations,
                           polynomials, tuple(stops)), report
 
 
+def _path_progress(u: FloatArray, ramp_fraction: float | None) -> tuple[FloatArray, ...]:
+    """共同标量进度；可选五次速度起落加匀速段，不分别定时左右臂。"""
+    if ramp_fraction is None:
+        return (u**3 * (10. + u * (-15. + 6. * u)),
+                30. * u**2 * (1. - u)**2, 60. * u * (1. - u) * (1. - 2. * u))
+    r = ramp_fraction
+    peak = 1. / (1. - r)
+    w = np.clip(np.minimum(u, 1. - u) / r, 0., 1.)
+    integral = w**4 * (2.5 + w * (-3. + w))
+    rising = peak * r * integral
+    progress = np.where(u < r, rising,
+                        np.where(u > 1. - r, 1. - rising, peak * (u - r / 2.)))
+    velocity = peak * w**3 * (10. + w * (-15. + 6. * w))
+    acceleration = (peak / r * 30. * w**2 * (1. - w)**2
+                    * np.where(u < .5, 1., -1.))
+    return progress, velocity, acceleration
+
+
+def trajectory_jerk_metrics(plan: ContinuousPair) -> dict[str, dict[str, list[float]]]:
+    """解析计算最终五次段的加加速度峰值和连接跳变，不作为厂商允许值。"""
+    result = {}
+    for side, polynomials in plan.polynomials.items():
+        peak = np.zeros(6)
+        jump = np.zeros(6)
+        previous = np.zeros(6)
+        for c, h in zip(polynomials, np.diff(plan.times)):
+            a, b, d = 6. * c[:, 3] / h**3, 24. * c[:, 4] / h**3, 60. * c[:, 5] / h**3
+            start, end = a, a + b + d
+            vertex = np.divide(-b, 2. * d, out=np.zeros(6), where=d != 0.)
+            middle = np.where((vertex > 0.) & (vertex < 1.), a + vertex * (b + vertex * d), 0.)
+            peak = np.maximum(peak, np.maximum(np.maximum(abs(start), abs(end)), abs(middle)))
+            jump = np.maximum(jump, abs(start - previous))
+            previous = end
+        jump = np.maximum(jump, abs(previous))
+        result[side] = {'peak_jerk_rad_s3': peak.tolist(), 'max_jerk_jump_rad_s3': jump.tolist()}
+    return result
+
+
 def retime_spatial_pair(
     source_times_ns: tuple[int, ...], left: ArrayLike, right: ArrayLike,
     lower: ArrayLike, upper: ArrayLike, max_velocity: ArrayLike, max_acceleration: ArrayLike,
     *, stops: tuple[int, ...], margin: float = 1.05, tolerance: float = .0005,
+    ramp_fraction: float | None = None,
+    max_jerk: float | None = None,
 ) -> tuple[ContinuousPair, dict[str, Any]]:
     """按共同关节弧长拟合有界路径，再分阶段定时；不连接设备或改写源记录。"""
     try:
         from scipy.interpolate import BSpline
     except (ImportError, ValueError) as error:
         raise ValueError('路径重定时需要与NumPy兼容的SciPy转换环境') from error
+    if ramp_fraction is not None and (
+        isinstance(ramp_fraction, bool) or not isinstance(ramp_fraction, (int, float))
+        or not math.isfinite(ramp_fraction) or not .15 <= ramp_fraction <= .45
+    ):
+        raise ValueError('平滑起落比例必须在0.15到0.45之间')
+    if max_jerk is not None and (
+        isinstance(max_jerk, bool) or not isinstance(max_jerk, (int, float))
+        or not math.isfinite(max_jerk) or max_jerk <= 0.
+    ):
+        raise ValueError('规划加加速度必须是有限正数，不是厂商参数')
     count = len(source_times_ns)
     source = np.asarray(source_times_ns, dtype=np.float64) / 1e9
     raw = np.asarray([left, right], dtype=np.float64)
@@ -741,13 +809,12 @@ def retime_spatial_pair(
             lo, hi = np.zeros(n), np.ones(n)
             for _ in range(55):
                 u = (lo + hi) / 2.
-                progress = u**3 * (10. + u * (-15. + 6. * u))
+                progress = _path_progress(u, ramp_fraction)[0]
                 lo = np.where(progress < x, u, lo)
                 hi = np.where(progress >= x, u, hi)
             u = (lo + hi) / 2.
             u[0], u[-1] = 0., 1.
-        progress_v = 30. * u**2 * (1. - u)**2
-        progress_a = 60. * u * (1. - u) * (1. - 2. * u)
+        _, progress_v, progress_a = _path_progress(u, ramp_fraction)
         unit_v = dx * progress_v[:, None]
         # 同时计入路径曲率，不能只限制沿路径的加速度。
         unit_a = dxx * progress_v[:, None]**2 + dx * progress_a[:, None]
@@ -764,6 +831,9 @@ def retime_spatial_pair(
                                                      / speed[arm, :, None])),
                                margin * math.sqrt(float(np.max(
                                    np.abs(_extrema(c, float(h), 2)) / accel[arm, :, None]))))
+                if max_jerk is not None:
+                    duration = max(duration, margin * float(
+                        np.max(np.abs(_extrema(c, float(h), 3))) / max_jerk)**(1. / 3.))
         if times_ns[first] / 1e9 + duration > 3600.:
             raise ValueError('路径重定时超过一小时，未生成')
         duration_ns = max(math.ceil(duration * 1e9),
@@ -793,6 +863,10 @@ def retime_spatial_pair(
                         or np.any(pv > speed[arm] * (1. + 1e-8))
                         or np.any(pa > accel[arm] * (1. + 1e-8))):
                     raise ValueError(f'{side} 重定时后段内位置、速度或加速度超限，未生成')
+                if max_jerk is not None and np.max(abs(_extrema(c, float(h), 3))) > (
+                    max_jerk * (1. + 1e-6)
+                ):
+                    raise ValueError(f'{side} 纳秒定时后的加加速度超限，未生成')
                 polys[side].append(c)
                 peaks[side]['peak_velocity_rad_s'] = np.maximum(
                     peaks[side]['peak_velocity_rad_s'], pv)
@@ -808,7 +882,8 @@ def retime_spatial_pair(
         values.setflags(write=False)
     changes = {s: float(np.max(np.abs(q[i] - raw[i])))
                for i, s in enumerate(('left', 'right'))}
-    return ContinuousPair(times, *arrays, polynomials, stops), {
+    plan = ContinuousPair(times, *arrays, polynomials, stops)
+    return plan, {
         'continuous_constraints_passed': True, 'samples_preserved': count,
         'positions_preserved': False, 'position_filter': 'bounded_spatial_spline',
         'position_smoothing_tolerance_rad': tolerance, 'max_sample_position_change_rad': changes,
@@ -817,6 +892,9 @@ def retime_spatial_pair(
         'effective_time_scale': float(times[-1] / source[-1]),
         'source_times_ns': list(source_times_ns), 'prepared_times_ns': times_ns.tolist(),
         'stop_indices': list(stops), 'spatial_blocks': blocks,
+        'path_progress_profile': 'quintic' if ramp_fraction is None else 'smooth_cruise',
+        'ramp_fraction': ramp_fraction, 'jerk_metrics': trajectory_jerk_metrics(plan),
+        'planning_jerk_limit_rad_s3': max_jerk,
         'arms': {s: {name: values.tolist() for name, values in arm.items()}
                  for s, arm in peaks.items()},
     }

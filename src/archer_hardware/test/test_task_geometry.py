@@ -380,6 +380,41 @@ class TaskGeometryTests(unittest.TestCase):
             self.assertEqual(home[side].goal[1], -1.575)
             self.assertNotEqual(home[side].goal, approach[side].initial)
 
+    def test_contact_candidates_match_all_geometry_bounds(self) -> None:
+        """真实模型上，按碰撞候选计算与对所有零件计算得到相同的完整预检报告。"""
+        from archer_hardware.commissioning import load_limits
+        from archer_mujoco.dual_model_loader import load_dual_arm
+
+        limits = load_limits(Path(__file__).resolve().parents[1] / 'config/position_control.yaml')
+        initial = (0., -1.55, 3.13, -1.55, 0., 1.5)
+        goal = (.01, *initial[1:])
+        task = {side: ContinuousPositionTrajectory.prepare(
+            (0, 1000000000), (initial, goal), ((0.,) * 6,) * 2, ((0.,) * 6,) * 2,
+            limits[side], .05,
+        ) for side in ('left', 'right')}
+        loaded = None
+
+        def capture_model(**kwargs):
+            nonlocal loaded
+            loaded = load_dual_arm(**kwargs)
+            return loaded
+
+        def all_bounds(data, selected, chains, tolerance, *, direction=None):
+            assert loaded is not None
+            all_radii = {g: float(loaded.model.geom_rbound[g]) for g in chains}
+            complete = _pose_geometry_error_bounds(
+                data, all_radii, chains, tolerance, direction=direction)
+            return {g: complete[g] for g in selected}
+
+        for error in (.001, .05):
+            expected = check_task_geometry(task, joint_error_rad=error,
+                                           nominal_feedback_guarded=True)
+            with patch('archer_mujoco.dual_model_loader.load_dual_arm', capture_model), \
+                    patch('archer_hardware.task_geometry._pose_geometry_error_bounds', all_bounds):
+                reference = check_task_geometry(task, joint_error_rad=error,
+                                                nominal_feedback_guarded=True)
+            self.assertEqual(expected, reference)
+
     def test_explicit_return_targets_cannot_hide_wrong_home(self) -> None:
         """明确目标仍需双臂、名义限位及归位段匹配，不放宽错误或缺失归位."""
         saved = {'left': (-.01,) * 6, 'right': (-.02,) * 6}

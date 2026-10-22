@@ -34,10 +34,16 @@ def evaluate(c: FloatArray, u: float, duration: float, derivative: int = 0) -> F
     """计算一段的关节位置或时间导数；输入进度范围为零到一."""
     if derivative not in (0, 1, 2) or not math.isfinite(u) or not 0.0 <= u <= 1.0:
         raise ValueError("进度或导数阶数无效")
-    result = np.zeros(6, dtype=np.float64)
-    for power in range(derivative, 6):
-        multiplier = math.factorial(power) / math.factorial(power - derivative)
-        result += c[:, power] * multiplier * u ** (power - derivative)
+    # Horner形式与原五次多项式完全相同，减少250/500Hz取样中的临时数组与幂运算。
+    if derivative == 0:
+        result = ((((c[:, 5] * u + c[:, 4]) * u + c[:, 3]) * u
+                   + c[:, 2]) * u + c[:, 1]) * u + c[:, 0]
+    elif derivative == 1:
+        result = (((5. * c[:, 5] * u + 4. * c[:, 4]) * u
+                   + 3. * c[:, 3]) * u + 2. * c[:, 2]) * u + c[:, 1]
+    else:
+        result = ((20. * c[:, 5] * u + 12. * c[:, 4]) * u
+                  + 6. * c[:, 3]) * u + 2. * c[:, 2]
     return np.asarray(result / duration**derivative, dtype=np.float64)
 
 

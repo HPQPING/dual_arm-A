@@ -174,6 +174,40 @@ class CsvImportTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             prepare_samples(samples, self.limits)
 
+    def test_explicit_smooth_cruise_and_planning_jerk(self) -> None:
+        """新时间律必须显式选择路径模式，输出可复核的加加速度统计。"""
+        samples, _ = import_samples(state_csv(), self.limits)
+        for options in ({'smooth_cruise': True}, {'planning_jerk': 2.}):
+            with self.assertRaisesRegex(ValueError, '路径重定时'):
+                prepare_samples(samples, self.limits, **options)
+        before = json.dumps(samples, sort_keys=True)
+        try:
+            from scipy.interpolate import BSpline
+            self.assertTrue(callable(BSpline))
+        except (ImportError, ValueError):
+            self.skipTest('需要兼容的SciPy离线转换环境')
+        candidate, report = prepare_samples(samples, self.limits, path_retime=True,
+                                            smooth_cruise=True, planning_jerk=2.)
+        self.assertEqual(json.dumps(samples, sort_keys=True), before)
+        self.assertEqual(candidate['version'], 2)
+        self.assertEqual(report['path_progress_profile'], 'smooth_cruise')
+        self.assertEqual(report['planning_jerk_limit_rad_s3'], 2.)
+        self.assertFalse(report['commands_sent'])
+        for side in ('left', 'right'):
+            self.assertLessEqual(max(report['jerk_metrics'][side]['peak_jerk_rad_s3']), 2. + 1e-6)
+
+        with self.assertRaisesRegex(ValueError, '导数平滑'):
+            prepare_samples(samples, self.limits, path_retime=True, continuous_jerk=True)
+        final, polished = prepare_samples(
+            samples, self.limits, path_retime=True, smooth_cruise=True,
+            planning_jerk=2., continuous_jerk=True)
+        self.assertTrue(polished['continuous_jerk_postprocess'])
+        self.assertEqual(polished['smoothing_shape_change_limit_rad'], .00005)
+        for side in ('left', 'right'):
+            self.assertEqual([p['positions'] for p in candidate[side]['points']],
+                             [p['positions'] for p in final[side]['points']])
+            self.assertLessEqual(max(polished['jerk_metrics'][side]['peak_jerk_rad_s3']), 2. + 1e-6)
+
     def test_cli_replaces_latest_conversion_without_ros_or_sdk(self) -> None:
         """默认独立目录同名替换，只读原记录，转换失败保留上次成功文件."""
         with TemporaryDirectory() as folder:

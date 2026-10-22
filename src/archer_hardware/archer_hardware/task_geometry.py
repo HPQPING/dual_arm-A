@@ -414,27 +414,29 @@ def _pose_geometry_error_bounds(
     for geom, radius in radii.items():
         if not np.all(np.isfinite(data.geom_xpos[geom])):
             raise ValueError('当前姿态包含无效碰撞零件位置')
-        total = 0.
-        for depth, joint in enumerate(joints[geom]):
-            axis = data.xaxis[joint]
-            offset = data.geom_xpos[geom] - data.xanchor[joint]
-            if (not np.all(np.isfinite(offset)) or not np.all(np.isfinite(axis))
-                    or abs(float(np.linalg.norm(axis)) - 1.) > 1e-6):
-                raise ValueError('当前姿态包含无效关节轴或碰撞零件位置')
-            axis = axis / float(np.linalg.norm(axis))
-            tangent = np.cross(axis, offset)
-            radial = float(np.linalg.norm(tangent)) + radius
-            if normal is None:
-                total += radial * delta
-            else:
-                transverse = float(np.linalg.norm(np.cross(normal, axis)))
-                first = abs(float(np.dot(normal, tangent))) + radius * transverse
-                second = (abs(float(np.dot(normal, np.cross(axis, tangent))))
-                          + radius * transverse)
-                # Rodrigues公式：sin项不超过delta，1-cos项不超过delta²/2。
-                # 前depth个祖先转动会改变世界投影方向，额外变化不超过
-                # depth*delta；乘本步整体位移上界，完整计入二阶余量。
-                total += first * delta + (.5 * second + depth * radial) * delta ** 2
+        indices = list(joints[geom])
+        if not indices:
+            result[geom] = 0.
+            continue
+        # 同一零件的祖先关节批量计算，公式与原逐关节累加一致。
+        axes = data.xaxis[indices]
+        offsets = data.geom_xpos[geom] - data.xanchor[indices]
+        lengths = np.linalg.norm(axes, axis=1)
+        if (not np.all(np.isfinite(offsets)) or not np.all(np.isfinite(axes))
+                or np.any(np.abs(lengths - 1.) > 1e-6)):
+            raise ValueError('当前姿态包含无效关节轴或碰撞零件位置')
+        axes = axes / lengths[:, None]
+        tangents = np.cross(axes, offsets)
+        radial = np.linalg.norm(tangents, axis=1) + radius
+        if normal is None:
+            total = float(np.sum(radial * delta))
+        else:
+            transverse = np.linalg.norm(np.cross(normal, axes), axis=1)
+            first = np.abs(tangents @ normal) + radius * transverse
+            second = np.abs(np.cross(axes, tangents) @ normal) + radius * transverse
+            # Rodrigues公式及祖先转动二阶余量均保留；索引顺序仍为根到末端。
+            depth = np.arange(len(indices), dtype=np.float64)
+            total = float(np.sum(first * delta + (.5 * second + depth * radial) * delta ** 2))
         # 从根到末端依次扰动关节：此前的上游转动对当前关节轴与下游零件
         # 施加同一个刚体变换，因此本步半径仍等于名义姿态半径。
         # 每步转动位移不超过半径*误差角，三角不等式覆盖所有同时误差。
@@ -598,19 +600,40 @@ def check_task_geometry(
         for side, q in (('left', left), ('right', right)):
             loaded.data.qpos[loaded.arms[side].qpos_indices] = q
         mujoco.mj_forward(loaded.model, loaded.data)
+        data = cast(CollisionData, loaded.data)
+        candidates: set[int] = set()
+        table_candidates: set[int] = set()
+        # MuJoCo宽阶段已按最大保护包围膨胀；只对会参与实际判定的零件计算姿态上界。
+        # 保留全部接触与原采样网格，不用减少采样或缩小保护距离换取速度。
+        for i in range(data.ncon):
+            contact = data.contact[i]
+            a, b = int(contact.geom1), int(contact.geom2)
+            if ((a in active_bounds['left'] and b in active_bounds['right'])
+                    or (b in active_bounds['left'] and a in active_bounds['right'])):
+                candidates.update((a, b))
+            if floor in (a, b):
+                robot = b if a == floor else a
+                if robot in flat_bounds:
+                    candidates.add(robot)
+                    table_candidates.add(robot)
+        if not candidates:
+            return None
+        needed = {geom: radii[geom] for geom in candidates}
         posed = _pose_geometry_error_bounds(
-            cast(EnvelopeData, loaded.data), radii, chains, active_error)
+            cast(EnvelopeData, loaded.data), needed, chains, active_error)
         # 固定长度上界与姿态上界均成立，取两者较小值仍保守。
         contact_bounds = {geom: min(bound, flat_bounds[geom]) for geom, bound in posed.items()}
         table_bounds = contact_bounds
-        if int(envelope.geom_type[floor]) == 0 and int(envelope.geom_bodyid[floor]) == 0:
+        if (table_candidates and int(envelope.geom_type[floor]) == 0
+                and int(envelope.geom_bodyid[floor]) == 0):
             # 固定平面距离只受法向位移影响；非平面台面保留整体位移保护。
             normal = cast(EnvelopeData, loaded.data).geom_xmat[floor].reshape(3, 3)[:, 2]
             projected = _pose_geometry_error_bounds(
-                cast(EnvelopeData, loaded.data), radii, chains, active_error, direction=normal)
+                cast(EnvelopeData, loaded.data),
+                {geom: radii[geom] for geom in table_candidates}, chains,
+                active_error, direction=normal)
             table_bounds = {geom: min(contact_bounds[geom], bound)
                             for geom, bound in projected.items()}
-        data = cast(CollisionData, loaded.data)
         for i in range(data.ncon):
             contact = data.contact[i]
             a, b = int(contact.geom1), int(contact.geom2)

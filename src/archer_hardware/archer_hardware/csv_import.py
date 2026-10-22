@@ -254,11 +254,21 @@ def main(args: list[str] | None = None) -> int:
     parser.add_argument('--path-retime', action='store_true',
                         help='有界空间样条与共同弧长重定时；已包含平滑，不与--smooth混用')
     parser.add_argument('--margin', type=float, default=1.05, help='连续轨迹限速时间余量')
+    parser.add_argument('--smooth-cruise', action='store_true',
+                        help='配合--path-retime使用平滑速度起落及匀速段')
+    parser.add_argument('--planning-jerk', type=float,
+                        help='配合--path-retime约束规划加加速度rad/s³，不是厂商允许值')
+    parser.add_argument('--continuous-jerk', action='store_true',
+                        help='空间重定时后统一普通节点导数；需--path-retime和--planning-jerk')
     options = parser.parse_args(args)
     if options.smooth and not options.prepare:
         parser.error('--smooth需要同时使用--prepare')
     if options.path_retime and (not options.prepare or options.smooth):
         parser.error('--path-retime需要--prepare，且不要同时使用--smooth')
+    if (options.smooth_cruise or options.planning_jerk is not None) and not options.path_retime:
+        parser.error('--smooth-cruise和--planning-jerk需要--path-retime')
+    if options.continuous_jerk and (not options.path_retime or options.planning_jerk is None):
+        parser.error('--continuous-jerk需要--path-retime和--planning-jerk')
     root = options.run_dir.expanduser().resolve()
     existing = [name for name in ('state.csv', 'tracking.csv') if (root / name).is_file()]
     selected = options.csv_name or (existing[0] if len(existing) == 1 else None)
@@ -308,7 +318,10 @@ def main(args: list[str] | None = None) -> int:
             candidate, timing = prepare_samples(candidate, limits, margin=options.margin,
                                                 smooth=options.smooth,
                                                 path_retime=options.path_retime,
-                                                execution_hz=frequency)
+                                                execution_hz=frequency,
+                                                smooth_cruise=options.smooth_cruise,
+                                                planning_jerk=options.planning_jerk,
+                                                continuous_jerk=options.continuous_jerk)
             report.update(timing)
     except (OSError, ValueError, TypeError, KeyError, UnicodeError,
             csv.Error, yaml.YAMLError) as error:
@@ -340,11 +353,21 @@ def prepare_samples(
     samples: dict[str, Any], limits: dict[str, PositionLimits], *, margin: float = 1.05,
     smooth: bool = False,
     path_retime: bool = False, execution_hz: int = 250,
+    smooth_cruise: bool = False, planning_jerk: float | None = None,
+    continuous_jerk: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """准备受限双臂轨迹；空间模式允许有界节点拟合，阶段事件仍仅作为参考。"""
     from archer_control.continuous_trajectory import (
         RecordedTimeMap, retime_recorded_pair, smooth_recorded_pair, retime_spatial_pair,
     )
+    if type(smooth_cruise) is not bool or (
+        (smooth_cruise or planning_jerk is not None) and not path_retime
+    ):
+        raise ValueError('平滑匀速和规划加加速度只用于路径重定时')
+    if type(continuous_jerk) is not bool or (
+        continuous_jerk and (not path_retime or planning_jerk is None)
+    ):
+        raise ValueError('普通节点导数平滑需要路径重定时和规划加加速度')
 
     if (samples.get('version') != 3 or samples.get('kind') != 'recorded_joint_samples'
             or samples.get('interpolation') != 'unassigned'):
@@ -397,6 +420,7 @@ def prepare_samples(
             [[v * fraction for v in limits[s].max_velocity] for s in ('left', 'right')],
             [limits[s].max_acceleration for s in ('left', 'right')],
             stops=tuple(sorted(stops)), margin=margin,
+            ramp_fraction=.25 if smooth_cruise else None, max_jerk=planning_jerk,
         )
         measured.update(planned_control_hz=execution_hz,
                         planning_velocity_fraction=fraction)
@@ -409,17 +433,27 @@ def prepare_samples(
             [limits[s].max_acceleration for s in ('left', 'right')],
             stops=tuple(sorted(stops)), margin=margin,
         )
-    if smooth:
+    if smooth or continuous_jerk:
+        fraction = .8 * execution_hz / 500. if continuous_jerk else 1.
         plan, smoothed = smooth_recorded_pair(
             plan, [limits[s].lower for s in ('left', 'right')],
             [limits[s].upper for s in ('left', 'right')],
-            [limits[s].max_velocity for s in ('left', 'right')],
+            [[v * fraction for v in limits[s].max_velocity] for s in ('left', 'right')],
             [limits[s].max_acceleration for s in ('left', 'right')], margin=margin,
+            max_jerk=planning_jerk if continuous_jerk else None,
+            max_shape_change=.00005 if continuous_jerk else None,
         )
         # 重新登记最终时间轴，阶段和参考事件仍沿用同一映射；保持旧执行格式。
-        measured['max_segment_shape_change_rad'] = {
-            s: measured['max_segment_shape_change_rad'][s]
-            + smoothed['smoothing_max_segment_change_rad'][s] for s in ('left', 'right')}
+        if smooth:
+            measured['max_segment_shape_change_rad'] = {
+                s: measured['max_segment_shape_change_rad'][s]
+                + smoothed['smoothing_max_segment_change_rad'][s] for s in ('left', 'right')}
+        else:
+            measured['continuous_jerk_postprocess'] = True
+            measured['spatial_blocks'] = [
+                {**block, 'duration_s': float(
+                    plan.times[block['last']] - plan.times[block['first']])}
+                for block in measured['spatial_blocks']]
         measured.update(smoothed)
         measured.update({
             'timing_policy': 'local_segment_c2', 'uniform_time_scale': None,
