@@ -5,9 +5,12 @@ from __future__ import annotations
 from bisect import bisect_right
 from dataclasses import dataclass, replace
 import math
+from pathlib import Path
 from threading import Lock
 import time
 from typing import TYPE_CHECKING, Callable, Iterable
+
+import yaml
 
 from .hex_adapter import six_values
 
@@ -105,6 +108,21 @@ class PositionLimits:
             high - min(0.005, (high - low) / 2) if q > high else q
             for q, low, high in zip(positions, self.lower, self.upper)
         )
+
+
+def load_limits(path: Path, *, content: bytes | None = None) -> dict[str, PositionLimits]:
+    """读取已有位置配置作比较，不启用其中连接或控制开关."""
+    text = path.read_text(encoding='utf-8') if content is None else content.decode('utf-8')
+    data = yaml.safe_load(text)
+    parameters = data['archer_position_driver']['ros__parameters']
+    return {
+        side: PositionLimits(
+            tuple(parameters[f'{side}_lower']), tuple(parameters[f'{side}_upper']),
+            tuple(parameters[f'{side}_max_velocity']),
+            tuple(parameters[f'{side}_max_acceleration']),
+            parameters['feedback_tolerance'],
+        ) for side in ('left', 'right')
+    }
 
 
 def limit_preparation_goal(
@@ -255,8 +273,9 @@ class JointPositionTrajectory:
 
 def checked_joint_error(value: object, feedback_tolerance: float, *,
                         nominal_feedback_guarded: bool = False) -> float:
-    """完整文件逐帧检查名义限位时，可显式采用最多0.05rad的跟踪误差界限。"""
-    maximum = MAX_TASK_JOINT_ERROR_RAD if nominal_feedback_guarded else min(.01, feedback_tolerance)
+    """完整文件逐帧检查名义限位时，可显式采用最多0.05rad的跟踪误差界限."""
+    maximum = (MAX_TASK_JOINT_ERROR_RAD if nominal_feedback_guarded
+               else min(.01, feedback_tolerance))
     if (isinstance(value, bool) or not isinstance(value, (int, float))
             or not math.isfinite(value) or not 0. <= value <= maximum):
         raise ValueError('joint_error_rad需有限非负且不超过0.05；未启用名义限位保护时不能超过读取容差')
@@ -264,7 +283,7 @@ def checked_joint_error(value: object, feedback_tolerance: float, *,
 
 
 def checked_startup_error(value: object, body_error: float) -> float:
-    """只有启用了主体误差保护，才接受不大于0.05rad的独立接近段容差。"""
+    """只有启用了主体误差保护，才接受不大于0.05rad的独立接近段容差."""
     if (isinstance(value, bool) or not isinstance(value, (int, float))
             or not math.isfinite(value) or not 0. <= value <= MAX_TASK_JOINT_ERROR_RAD
             or value and (not body_error or value < body_error)):
@@ -288,7 +307,7 @@ class ContinuousPositionTrajectory:
     startup_duration_s: float = 0.
 
     def tracking_error_at(self, elapsed: float) -> float:
-        """接近段可使用独立已检容差，跨入文件主体立即恢复主体标准。"""
+        """接近段可使用独立已检容差，跨入文件主体立即恢复主体标准."""
         return (self.startup_joint_error_rad if self.startup_duration_s > 0.
                 and elapsed < self.startup_duration_s else self.joint_error_rad)
 
@@ -477,11 +496,15 @@ def prepare_continuous_pair(
     return result
 
 
-def delivery_reference_step(plans: dict[str, ContinuousPositionTrajectory]) -> float:
+def delivery_reference_step(
+    plans: dict[str, ContinuousPositionTrajectory], *, control_hz: int = 500,
+) -> float:
     """离线按全路径解析速度峰值计算单次参考推进量，不扩大SDK限速或重拟合路径."""
     import numpy as np
     from archer_control.continuous_trajectory import _extrema
 
+    if type(control_hz) is not int or control_hz not in (250, 500):
+        raise ValueError('发送节拍频率仅支持250或500Hz')
     if set(plans) != {'left', 'right'}:
         raise ValueError('发送节拍需要完整双臂计划')
     ratio = 0.
@@ -490,16 +513,16 @@ def delivery_reference_step(plans: dict[str, ContinuousPositionTrajectory]) -> f
             duration = (plan.times_ns[i + 1] - plan.times_ns[i]) / 1e9
             peaks = np.max(np.abs(_extrema(polynomial, duration, 1)), axis=1)
             ratio = max(ratio, float(np.max(peaks / np.asarray(plan.limits.max_velocity))))
-    # 对250/500Hz均按更短的2ms校验周期预留20%编码余量。
+    # 按已配置的真实SDK周期预留20%编码余量；未知调用保留500Hz默认值。
     # 实际推进同时受单调时间约束，不能因为峰值很小而提前播放。
-    return min(.02, .8 / 500. / ratio) if ratio else .02
+    return min(.02, .8 / control_hz / ratio) if ratio else .02
 
 
 class PairedTrajectoryStart:
     """两侧准备确认后给出共同单调时刻，取消状态不可恢复."""
 
     def __init__(self, *, reference_step_s: float | None = None,
-                 duration_s: float | None = None, following_feedback: bool = False,
+                 duration_s: float | None = None,
                  stream_period_s: float | None = None) -> None:
         """准备最多等待0.5秒，两侧就绪后预留0.2秒软件启动窗口."""
         self._lock = Lock()
@@ -507,8 +530,9 @@ class PairedTrajectoryStart:
         self._start: float | None = None
         self._cancelled = False
         self._expires = time.monotonic() + 0.5
-        if (reference_step_s is None) != (duration_s is None):
-            raise ValueError('发送确认时钟需要同时提供推进上限与总时长')
+        provided = (reference_step_s, duration_s, stream_period_s)
+        if any(x is not None for x in provided) and any(x is None for x in provided):
+            raise ValueError('周期播放需要同时提供推进上限、总时长与更新周期')
         self._step = (None if reference_step_s is None else
                       positive(reference_step_s, '参考时间推进上限'))
         self._duration = 0. if duration_s is None else positive(duration_s, '参考路径时长')
@@ -516,29 +540,18 @@ class PairedTrajectoryStart:
             raise ValueError('参考时间单次推进不能大于20ms')
         self._reference = 0.
         self._generation = 0
-        self._acknowledged: set[str] = set()
         self._advanced_at: float | None = None
         self._end_delivered_at: float | None = None
         self._delivered_reference = 0.
-        if type(following_feedback) is not bool or following_feedback and self._step is None:
-            raise ValueError('实际跟踪门控只能用于完整文件参考时钟')
-        self.following_feedback = following_feedback
         self._stream_period = (None if stream_period_s is None else
                                positive(stream_period_s, '共同目标更新周期'))
-        if self._stream_period is not None and (
-                self._step is None or following_feedback or self._stream_period > .02):
-            raise ValueError('周期播放需要完整轨迹时钟且不启用逐点跟踪等待，周期最多20ms')
+        if self._stream_period is not None and self._stream_period > .02:
+            raise ValueError('周期播放更新周期最多20ms')
         self._stream_seen = {'left': -1, 'right': -1}
         self._stream_sent_reference = {'left': 0., 'right': 0.}
         self._stream_references = {0: 0.}
         self._stream_tick = 0
-        self._feedback_seen: dict[str, float] = {}
         self._delivery_seen: dict[str, float] = {}
-        self._tracking_ratios: dict[str, float] = {}
-        self._tracking_generation: dict[str, int] = {}
-        self._tracking_paused = False
-        self._tracking_since: float | None = None
-        self._tracking_waits = 0
 
     def ready(self, side: str) -> None:
         """必须是两个不同侧的确认，不能重复一侧来提前释放."""
@@ -559,90 +572,21 @@ class PairedTrajectoryStart:
         """只有完整文件显式安装参考时钟，原单点和逐点接口保持原行为."""
         return self._step is not None
 
-    def playback(self, side: str, delivered_generation: int | None, *,
-                 tracking_ratio: Callable[[float], float] | None = None,
-                 ) -> tuple[float, int, float | None]:
-        """完整文件按共同周期推进；旧接口仍可显式选择发送确认时钟。"""
+    def playback(
+        self, side: str, delivered_generation: int | None,
+    ) -> tuple[float, int, float | None]:
+        """按共同周期推进；发送确认只用于失联检查和末包计时."""
         now = time.monotonic()
         with self._lock:
             if (not self.delivery_paced or side not in ('left', 'right')
                     or self._start is None or now < self._start or self._cancelled):
                 raise RuntimeError('共用参考时钟未启动或已经取消')
-            assert self._advanced_at is not None and self._step is not None
-            if self._stream_period is not None:
-                return self._stream_playback(side, delivered_generation, now)
-            if (self._end_delivered_at is None and now - self._advanced_at > .04
-                    and (not self.following_feedback
-                         or self._acknowledged != {'left', 'right'})):
-                self._cancelled = True
-                raise RuntimeError('双臂参考目标超过40ms未共同确认发送')
-            if self.following_feedback and self._end_delivered_at is None:
-                if any(now - seen > .04 for seen in
-                       (*self._feedback_seen.values(), *self._delivery_seen.values())):
-                    self._cancelled = True
-                    raise RuntimeError('跟踪等待期间反馈调度或发送确认超过40ms未更新')
-                if self._tracking_since is not None and now - self._tracking_since > 10.:
-                    self._cancelled = True
-                    raise RuntimeError('实际跟踪单次等待超过10秒，取消双臂路径')
-                try:
-                    if tracking_ratio is None:
-                        raise ValueError('完整路径缺少实际跟踪检查')
-                    ratio = tracking_ratio(self._reference)
-                    if (isinstance(ratio, bool) or not isinstance(ratio, (int, float))
-                            or not math.isfinite(ratio) or not 0. <= ratio <= 1.):
-                        raise RuntimeError('实际跟踪偏差超过已检界限或反馈比例无效')
-                except Exception:
-                    self._cancelled = True
-                    raise
-                self._feedback_seen[side] = now
-                self._tracking_ratios[side] = ratio
-                self._tracking_generation[side] = self._generation
-            if delivered_generation is not None:
-                if (type(delivered_generation) is not int or delivered_generation < 0
-                        or delivered_generation > self._generation):
-                    raise ValueError('发送确认代次无效')
-                if delivered_generation == self._generation:
-                    self._acknowledged.add(side)
-                    self._delivery_seen[side] = now
-            if self._acknowledged == {'left', 'right'}:
-                self._delivered_reference = self._reference
-                if self._reference >= self._duration:
-                    if self._end_delivered_at is None:
-                        self._end_delivered_at = now
-                elif now > self._advanced_at:
-                    tracking_scale = 1.
-                    if self.following_feedback:
-                        if any(self._tracking_generation.get(s) != self._generation
-                               for s in ('left', 'right')):
-                            return self._reference, self._generation, None
-                        worst = max(self._tracking_ratios.values())
-                        # 容差80%以内按原节奏，80%至95%逐步放慢；不要求逐点精确到位。
-                        tracking_scale = min(1., max(0., (.95 - worst) / .15))
-                        if not self._tracking_paused and worst >= .95:
-                            self._tracking_paused = True
-                            self._tracking_since = now
-                            self._tracking_waits += 1
-                        if self._tracking_paused:
-                            if worst >= .95:
-                                return self._reference, self._generation, None
-                            self._tracking_paused = False
-                            self._tracking_since = None
-                            # 等待时间作废；恢复这一拍不把等待欠账变成大目标增量。
-                            self._advanced_at = now
-                            return self._reference, self._generation, None
-                    self._reference = min(self._duration, self._reference + min(
-                        self._step, now - self._advanced_at) * tracking_scale)
-                    self._advanced_at = now
-                    self._generation += 1
-                    self._acknowledged.clear()
-                    self._tracking_generation.clear()
-            age = None if self._end_delivered_at is None else now - self._end_delivered_at
-            return self._reference, self._generation, age
+            return self._stream_playback(side, delivered_generation, now)
 
     def _stream_playback(
         self, side: str, delivered_generation: int | None, now: float,
     ) -> tuple[float, int, float | None]:
-        """锁内推进共同周期；发送确认只监视失联及末包，不逐点阻塞进度。"""
+        """锁内推进共同周期；发送确认只监视失联及末包，不逐点阻塞进度."""
         assert self._stream_period is not None and self._advanced_at is not None
         assert self._step is not None
         if self._end_delivered_at is None and (
@@ -698,11 +642,7 @@ class PairedTrajectoryStart:
                     'delivered_reference_elapsed_s': self._delivered_reference,
                     'reference_step_cap_s': self._step, 'generation': self._generation,
                     'end_transport_delivered': self._end_delivered_at is not None,
-                    'following_feedback': self.following_feedback,
                     'stream_period_s': self._stream_period,
-                    'tracking_paused': self._tracking_paused,
-                    'tracking_waits': self._tracking_waits,
-                    'tracking_error_ratio': dict(self._tracking_ratios),
                     'cancelled': self._cancelled}
 
     def start_time(self) -> float | None:

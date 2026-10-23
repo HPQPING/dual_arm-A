@@ -87,7 +87,7 @@ def isolated_arm_class() -> Any:
                 self._project_position_ready = True
 
         def validate_joint_positions(self, positions: Any, dt: float = 0.002) -> list[float]:
-            """按实际发送间隔调用厂商限速器；不扩大速度上限或允许过期续发。"""
+            """按实际发送间隔调用厂商限速器；不扩大速度上限或允许过期续发."""
             requested = list(six_values(positions))
             if isinstance(dt, bool) or not math.isfinite(dt) or dt <= 0:
                 raise ValueError('SDK 位置校验周期必须为有限正数')

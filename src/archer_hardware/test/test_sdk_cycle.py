@@ -152,7 +152,7 @@ class NativeCycleTests(unittest.TestCase):
         asyncio.run(run())
 
     def test_control_periodic_is_deferred_and_starts_only_once(self) -> None:
-        """发现设备不启动控制周期；显式准备后启动一次，重复调用不重复建任务。"""
+        """发现设备不启动控制周期；显式准备后启动一次，重复调用不重复建任务."""
         with patch.object(self.sdk, '_start_device_periodic_task') as start:
             self.api._start_device_periodic_task(1)
             start.assert_not_called()
@@ -171,7 +171,7 @@ class NativeCycleTests(unittest.TestCase):
             start.assert_called_once_with(1)
 
     def test_startup_request_is_queued_before_periodic_start(self) -> None:
-        """控制周期第一拍之前已有明确的初始化请求，不先运行厂商自动重连。"""
+        """控制周期第一拍之前已有明确的初始化请求，不先运行厂商自动重连."""
         observed = []
 
         def start():
@@ -432,7 +432,7 @@ class NativeCycleTests(unittest.TestCase):
         asyncio.run(run())
 
     def test_sdk_sampling_prevents_stale_cache_then_jump(self) -> None:
-        """缓存每12ms才更新时，SDK每4ms仍按路径取样；过期后不能自行续跑。"""
+        """缓存每12ms才更新时，SDK每4ms仍按路径取样；过期后不能自行续跑."""
         async def run() -> None:
             with patch.object(self.sdk, '_send_down_message', self.capture):
                 task = await self.acquire()
@@ -481,8 +481,8 @@ class NativeCycleTests(unittest.TestCase):
                         message = self.arm._construct_joint_command_msg(self.arm._target_command)
                         await self.api._send_down_message(message)
                         assert native.last_position is not None
-                        self.assertAlmostEqual(native.last_position[0], plan.sample(tick * .004)[0],
-                                               places=11)
+                        self.assertAlmostEqual(
+                            native.last_position[0], plan.sample(tick * .004)[0], places=11)
                         self.assertEqual(self.adapter.state, 'RUNNING')
                     send_clock.return_value += .041
                     with self.assertRaisesRegex(RuntimeError, '40ms'):
@@ -613,10 +613,9 @@ class NativeCycleTests(unittest.TestCase):
             packet_counts = {'left': 0, 'right': 0}
             right_target = (0.,) * 6
             lag_until = 0.
-            saw_tracking_pause = False
 
             def right_feedback() -> JointFeedback:
-                """在内存中模拟右侧短暂跟踪滞后，不接触真实设备。"""
+                """在内存中模拟右侧短暂跟踪滞后，不接触真实设备."""
                 offset = ((.00095 if time.monotonic() < lag_until else .000835)
                           if enable_delay else 0.)
                 frame = JointFeedback(tuple(q + offset for q in right_target),
@@ -668,7 +667,7 @@ class NativeCycleTests(unittest.TestCase):
                         preserve_path=True, joint_error_rad=.001)
                     original = tuple(c.tobytes() for c in plan.polynomials)
                     gate = PairedTrajectoryStart(reference_step_s=.01, duration_s=plan.duration,
-                                                 following_feedback=True)
+                                                 stream_period_s=.004)
                     self.adapter.arm_continuous(plan, 'left', gate)
                     peer.arm_continuous(plan, 'right', gate)
                     enable_delay = True
@@ -680,12 +679,9 @@ class NativeCycleTests(unittest.TestCase):
                         await asyncio.sleep(.003)
                         self.adapter.tick()
                         peer.tick()
-                        saw_tracking_pause = (saw_tracking_pause
-                                              or bool(gate.playback_status()['tracking_paused']))
                         if self.adapter.state == peer.state == 'HOLDING':
                             break
                     self.assertTrue(delayed)
-                    self.assertTrue(saw_tracking_pause)
                     self.assertEqual(self.adapter.state, 'HOLDING')
                     self.assertEqual(peer.state, 'HOLDING')
                     self.assertTrue(gate.playback_status()['end_transport_delivered'])

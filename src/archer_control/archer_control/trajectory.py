@@ -252,7 +252,7 @@ def stretch_plan(plan: JointPlan, total_duration: float) -> JointPlan:
 
 def to_ros_trajectory(plan: JointPlan) -> JointTrajectory:
     """
-    输出ROS轨迹；连续计划同时发送速度、加速度，避免接收端逐点停车。
+    输出ROS轨迹；连续计划同时发送速度、加速度，避免接收端逐点停车.
 
     A zero header timestamp means start when received. This is not a hardware-timed dual-arm
     synchronization interface or an action server.

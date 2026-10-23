@@ -73,7 +73,7 @@ class StagedPair:
 
 @dataclass(frozen=True)
 class PreparedFileCore:
-    """本次启动中、尚未申请控制时完成的主体检查，不是执行许可。"""
+    """本次启动中、尚未申请控制时完成的主体检查，不是执行许可."""
 
     request_sha256: str
     max_excursion: float
@@ -81,6 +81,7 @@ class PreparedFileCore:
     report: dict[str, Any]
     geometry: dict[str, Any]
     reference_step_s: float
+    control_hz: int = 500
 
 
 def vector_parameter(value: object, name: str) -> tuple[float, ...]:
@@ -142,7 +143,7 @@ def _review_file_request(
     text: str, limits: dict[str, PositionLimits], max_excursion: float,
     cancelled: PreparationCancellation,
 ) -> Any:
-    """共用定位请求解析与文件快照核对，不重复实现文件验证规则。"""
+    """共用定位请求解析与文件快照核对，不重复实现文件验证规则."""
     from .task_file import json_mapping, load_reviewed_task
 
     data = json_mapping(text.encode('utf-8'))
@@ -178,9 +179,9 @@ def _review_file_request(
 
 def prepare_file_core_message(
     text: str, limits: dict[str, PositionLimits], max_excursion: float,
-    cancelled: PreparationCancellation, *, joint_error_rad: float,
+    cancelled: PreparationCancellation, *, joint_error_rad: float, control_hz: int = 500,
 ) -> PreparedFileCore:
-    """只在未申请控制时核对文件主体，返回可跨进程复用的数值与几何结果。"""
+    """只在未申请控制时核对文件主体，返回可跨进程复用的数值与几何结果."""
     from .task_geometry import check_task_geometry
 
     reviewed = _review_file_request(text, limits, max_excursion, cancelled)
@@ -193,7 +194,8 @@ def prepare_file_core_message(
         raise ValueError('主体检查已取消')
     return PreparedFileCore(hashlib.sha256(text.encode()).hexdigest(), max_excursion,
                             dict(reviewed.plans), dict(reviewed.report), geometry,
-                            delivery_reference_step(dict(reviewed.plans)))
+                            delivery_reference_step(dict(reviewed.plans), control_hz=control_hz),
+                            control_hz)
 
 
 def prepare_file_task_message(
@@ -202,8 +204,9 @@ def prepare_file_task_message(
     hold_start: dict[str, tuple[float, ...]] | None = None, joint_error_rad: float = 0.,
     saved_initial: dict[str, tuple[float, ...]] | None = None,
     startup_joint_error_rad: float = 0., prepared_core: PreparedFileCore | None = None,
+    control_hz: int = 500,
 ) -> StagedPair:
-    """根据最新实测和保持目标检查衔接；匹配的主体结果不重复计算。"""
+    """根据最新实测和保持目标检查衔接；匹配的主体结果不重复计算."""
     from .task_file import ReviewedTask, json_mapping
     from .task_geometry import assemble_task_cycle, check_task_geometry, prepare_approach
     from .task_geometry import prepare_return, trajectory_fingerprint
@@ -214,6 +217,7 @@ def prepare_file_task_message(
         reviewed = _review_file_request(text, limits, max_excursion, cancelled)
     else:
         if (prepared_core.request_sha256 != hashlib.sha256(text.encode()).hexdigest()
+                or prepared_core.control_hz != control_hz
                 or prepared_core.max_excursion != max_excursion
                 or set(prepared_core.plans) != {'left', 'right'}
                 or any(prepared_core.plans[s].limits != limits[s] for s in limits)
@@ -289,10 +293,12 @@ def prepare_file_task_message(
         'return_targets': {s: list(p) for s, p in return_targets.items()},
         'joint_error_rad': error,
         'startup_joint_error_rad': startup_error,
-        'delivery_reference_step_s': (delivery_reference_step(cycle) if prepared_core is None else
-                                      min(prepared_core.reference_step_s,
-                                          delivery_reference_step(approach),
-                                          delivery_reference_step(home))),
+        'delivery_reference_step_s': (
+            delivery_reference_step(cycle, control_hz=control_hz) if prepared_core is None else
+            min(prepared_core.reference_step_s,
+                delivery_reference_step(approach, control_hz=control_hz),
+                delivery_reference_step(home, control_hz=control_hz))),
+        'control_hz': control_hz,
         'reference_clock': 'shared_periodic_latest_target',
         'phase_start_ns': {'APPROACH_FILE': 0, 'TASK': approach['left'].times_ns[-1],
                            'RETURN_ACTUAL': (approach['left'].times_ns[-1]
@@ -746,6 +752,7 @@ class PositionControlNode(Node):
                     hold_start=hold if self.task_joint_error_rad else None,
                     joint_error_rad=self.task_joint_error_rad,
                     startup_joint_error_rad=self.task_startup_joint_error_rad,
+                    control_hz=round(1. / self._control_period),
                     **({'prepared_core': prepared_core} if prepared_core is not None else {}),
                 )
             else:
@@ -867,10 +874,7 @@ class PositionControlNode(Node):
                 gate = PairedTrajectoryStart(
                     reference_step_s=positive(step, '完整文件参考推进上限'),
                     duration_s=plan.continuous['left'].duration,
-                    stream_period_s=self._control_period,
-                    # 连续播放原轨迹，不把中间采样点作为逐点到位门槛。
-                    # 实际反馈仍用于异常偏差和限位检查，不再控制参考进度。
-                    following_feedback=False)
+                    stream_period_s=self._control_period)
             else:
                 gate = PairedTrajectoryStart()
             self._paired_gate = gate

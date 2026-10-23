@@ -14,8 +14,8 @@ from typing import Any, Callable
 
 import yaml
 
-from archer_control.continuous_trajectory import RecordedTimeMap
-from .commissioning import load_limits
+from archer_control.continuous_trajectory import RecordedTimeMap, circle_blend_windows
+from .position_plan import load_limits
 from .csv_import import import_samples
 from .position_plan import ContinuousPositionTrajectory, positive, prepare_continuous_pair
 
@@ -207,6 +207,28 @@ def load_reviewed_task(
         events.append({**event, 'prepared_time_ns': mapping.map_ns(relative)})
     if report.get('reference_events') != events:
         raise ValueError('参考事件或事件时间与原始记录不同')
+    blend = report.get('boundary_blend')
+    if blend is not None:
+        if (task != 'split_circle' or events or tolerance != .0005
+                or not isinstance(blend, dict) or blend.get('policy') != 'circle_local_v1'):
+            raise ValueError('局部边界融合仅支持无事件的有界空间画圆记录')
+        windows = circle_blend_windows(
+            [t / 1e9 for t in plans['left'].times_ns], stage_report,
+            tuple(sorted(required_stops)))
+        claimed = blend.get('windows')
+        if not isinstance(claimed, list) or len(claimed) != len(windows):
+            raise ValueError('缺少两个独立画圆衔接窗口')
+        for expected, supplied in zip(windows, claimed):
+            if (not isinstance(supplied, dict)
+                    or any(supplied.get(k) != v for k, v in expected.items())
+                    or type(supplied.get('strength')) not in (int, float)
+                    or supplied['strength'] not in (1., .8, .6, .4, .2)):
+                raise ValueError('画圆融合窗口与原始阶段或实际时间轴不一致')
+            if any(held[expected['first']:expected['last']]) or any(
+                k in payload['stop_indices'] for k in expected['removed_stops']
+            ):
+                raise ValueError('实际保持区间或未融合边界不得声明连续通过')
+            required_stops.difference_update(expected['removed_stops'])
     if not required_stops <= set(payload['stop_indices']):
         raise ValueError('任务阶段或夹爪参考事件缺少必要停顿')
     duration = plans['left'].times_ns[-1] / 1e9

@@ -112,10 +112,10 @@ class ContinuousTrajectoryTests(unittest.TestCase):
 
 
 class RecordedSmoothingTests(unittest.TestCase):
-    """检查样条导数、阶段停顿和真实静止段，不连接机械臂。"""
+    """检查样条导数、阶段停顿和真实静止段，不连接机械臂."""
 
     def setUp(self) -> None:
-        """使用隔离环境的SciPy；旧转换和驱动不需要它。"""
+        """使用隔离环境的SciPy；旧转换和驱动不需要它."""
         try:
             from scipy.interpolate import make_interp_spline
             self.assertTrue(callable(make_interp_spline))
@@ -125,7 +125,7 @@ class RecordedSmoothingTests(unittest.TestCase):
         self.speed, self.accel = np.full((2, 6), .5), np.full((2, 6), .3)
 
     def prepare(self, values, *, stops=()):
-        """先用已有转换器得到受限基线。"""
+        """先用已有转换器得到受限基线."""
         q = np.repeat(np.asarray(values, dtype=np.float64)[:, None], 6, axis=1)
         plan, _ = retime_recorded_pair(
             tuple(i * 1000000000 for i in range(len(q))), q, q,
@@ -134,7 +134,7 @@ class RecordedSmoothingTests(unittest.TestCase):
         return plan
 
     def test_samples_stops_and_jerk_continuity(self) -> None:
-        """普通点连续三阶导数，保留所有位置采样和指定阶段停点。"""
+        """普通点连续三阶导数，保留所有位置采样和指定阶段停点."""
         old = self.prepare([0., .01, .03, .06, .08, .09, .1], stops=(3,))
         new, report = smooth_recorded_pair(
             old, self.low, self.high, self.speed, self.accel)
@@ -150,7 +150,7 @@ class RecordedSmoothingTests(unittest.TestCase):
         np.testing.assert_array_equal(old.times, new.times)
 
     def test_tighter_acceleration_retimes_both_arms(self) -> None:
-        """导数超限只放慢时间，最终导出纳秒时间可重建同一曲线。"""
+        """导数超限只放慢时间，最终导出纳秒时间可重建同一曲线."""
         old = self.prepare([0., .01, .03, .06, .08])
         limit = np.full((2, 6), .001)
         new, report = smooth_recorded_pair(old, self.low, self.high, self.speed, limit)
@@ -167,20 +167,20 @@ class RecordedSmoothingTests(unittest.TestCase):
                 np.testing.assert_allclose(rebuilt, new.polynomials[side][i], atol=1e-12)
 
     def test_stationary_interval_stays_stationary(self) -> None:
-        """即使没有阶段标签变化，也不能让真实静止区间产生样条摆动。"""
+        """即使没有阶段标签变化，也不能让真实静止区间产生样条摆动."""
         old = self.prepare([0., .01, .01, .03, .04])
         new, _ = smooth_recorded_pair(old, self.low, self.high, self.speed, self.accel)
         for elapsed in np.linspace(new.times[1], new.times[2], 20):
             np.testing.assert_allclose(new.sample('left', float(elapsed)), .01, atol=1e-14)
 
     def test_segment_overshoot_is_rejected(self) -> None:
-        """所有采样都合法仍须检查段内过冲，不能靠夹紧角度掩盖。"""
+        """所有采样都合法仍须检查段内过冲，不能靠夹紧角度掩盖."""
         old = self.prepare([0., .9, 1., .9, .8])
         with self.assertRaisesRegex(ValueError, '角度超限'):
             smooth_recorded_pair(old, self.low, self.high, self.speed, self.accel)
 
     def test_one_arm_hold_does_not_stop_other_arm(self) -> None:
-        """单臂静止段保持原位置，另一臂不额外增加停点。"""
+        """单臂静止段保持原位置，另一臂不额外增加停点."""
         left = np.repeat(np.asarray([0., .01, .01, .03, .04])[:, None], 6, axis=1)
         right = np.repeat(np.asarray([0., .01, .02, .03, .04])[:, None], 6, axis=1)
         old, _ = retime_recorded_pair(
@@ -192,6 +192,155 @@ class RecordedSmoothingTests(unittest.TestCase):
         middle = float((new.times[1] + new.times[2]) / 2.)
         np.testing.assert_allclose(new.sample('left', middle), .01, atol=1e-14)
         self.assertGreater(float(np.min(new.sample('right', middle, 1))), 0.)
+
+
+class CircleBoundaryTests(unittest.TestCase):
+    """用三阶段合成数据核对局部融合及窗口外逐段不变."""
+
+    def fixture(self):
+        """构造两个有间隙的阶段边界；角度很小，仅用于算法测试."""
+        from archer_control.continuous_trajectory import ContinuousPair
+        times = np.arange(61) * .1
+        q = np.repeat((np.arange(61) * .00001)[:, None], 6, axis=1)
+        zero = np.zeros_like(q)
+        velocity = np.full_like(q, .0001)
+        velocity[[0, 20, 21, 41, 42, 60]] = 0.
+        polys = np.array([coefficients(q[i], q[i + 1], velocity[i], velocity[i + 1],
+                                       zero[i], zero[i + 1], float(h))
+                          for i, h in enumerate(np.diff(times))])
+        plan = ContinuousPair(times, {s: q.copy() for s in ('left', 'right')},
+                              {s: velocity.copy() for s in ('left', 'right')},
+                              {s: zero.copy() for s in ('left', 'right')},
+                              {s: polys.copy() for s in ('left', 'right')},
+                              (0, 20, 21, 41, 42, 60))
+        labels = ['APPROACH'] * 21 + ['ARC'] * 21 + ['RETURN_HOME'] * 19
+        return plan, {s: labels.copy() for s in ('left', 'right')}
+
+    def blend(self, old, labels):
+        """使用显式位置、速度、加速度与jerk上限."""
+        from archer_control.continuous_trajectory import blend_circle_boundaries
+        return blend_circle_boundaries(old, labels, old.positions, -np.ones((2, 6)),
+                                       np.ones((2, 6)), np.full((2, 6), .25),
+                                       np.full((2, 6), .2), max_jerk=2.)
+
+    def test_local_both_boundaries_keep_time_and_outside_polynomials(self):
+        """入口出口都处理，起终点停车与外部段严格不变，所有拼接仍C2."""
+        old, labels = self.fixture()
+        new, windows = self.blend(old, labels)
+        np.testing.assert_array_equal(new.times, old.times)
+        self.assertEqual(new.stops, (0, 60))
+        self.assertEqual([w['transition'] for w in windows], [21, 42])
+        for window in windows:
+            for measured in window['arms'].values():
+                before, after = measured['jerk_jump_before_after_rad_s3']
+                self.assertLess(after, before)
+        for s in ('left', 'right'):
+            touched = {i for w in windows for i in range(w['first'], w['last'])}
+            for i, h in enumerate(np.diff(old.times)):
+                if i not in touched:
+                    np.testing.assert_array_equal(new.polynomials[s][i], old.polynomials[s][i])
+                for order in (0, 1, 2):
+                    target = (new.positions, new.velocities, new.accelerations)[order][s][i + 1]
+                    actual = evaluate(new.polynomials[s][i], 1., float(h), order)
+                    np.testing.assert_allclose(actual, target, atol=1e-10)
+            self.assertLessEqual(float(np.max(abs(new.positions[s] - old.positions[s]))), .0005)
+            self.assertTrue(np.any(abs(new.velocities[s][[20, 21, 41, 42]]) > 0.))
+
+    def test_other_stops_or_wrong_phase_are_rejected(self):
+        """不得把抓取、额外停车或单侧阶段不一致当作画圆融合."""
+        from dataclasses import replace
+        old, labels = self.fixture()
+        with self.assertRaises(ValueError):
+            self.blend(replace(old, stops=tuple(sorted((*old.stops, 19)))), labels)
+        labels['right'][21] = 'INSERT'
+        with self.assertRaises(ValueError):
+            self.blend(old, labels)
+
+    def test_real_hold_boundary_is_not_removed(self):
+        """双臂确实静止的边界必须拒绝连续通过."""
+        old, labels = self.fixture()
+        for s in old.positions:
+            old.positions[s][21] = old.positions[s][20]
+        with self.assertRaisesRegex(ValueError, '保持区间'):
+            self.blend(old, labels)
+
+
+class ArcInteriorTests(unittest.TestCase):
+    """高频小扰动合成路径验证圆弧拟合，不能作为实机振动测量."""
+
+    def fixture(self):
+        """两端已衔接的三阶段示例，圆弧中部含很小的高频位置扰动."""
+        from scipy.interpolate import make_interp_spline
+        from archer_control.continuous_trajectory import ContinuousPair
+        times = np.arange(801) * .01
+        envelope = np.sin(np.pi * np.clip((times - 3.2) / 2., 0., 1.))**6
+        data = .0005 * times + 1e-6 * envelope * np.sin(80. * times)
+        q = np.repeat(data[:, None], 6, axis=1)
+        zero = np.zeros(6)
+        curve = make_interp_spline(times, q, k=5,
+                                   bc_type=([(1, zero), (2, zero)], [(1, zero), (2, zero)]))
+        v, a = curve(times, 1), curve(times, 2)
+        v[[0, -1]], a[[0, -1]] = 0., 0.
+        c = np.stack([coefficients(q[i], q[i + 1], v[i], v[i + 1], a[i], a[i + 1], float(h))
+                      for i, h in enumerate(np.diff(times))])
+        fields = [{s: x.copy() for s in ('left', 'right')} for x in (q, v, a, c)]
+        labels = ['APPROACH'] * 201 + ['ARC'] * 400 + ['RETURN_HOME'] * 200
+        return ContinuousPair(times, *fields, (0, 800)), {s: labels for s in ('left', 'right')}
+
+    def smooth(self, plan, labels, speed=.25, source=None):
+        """复用原时轴和显式导数上限，只计算离线候选."""
+        from archer_control.continuous_trajectory import smooth_circle_interior
+        return smooth_circle_interior(
+            plan, labels, plan.positions if source is None else source,
+            -np.ones((2, 6)), np.ones((2, 6)), np.full((2, 6), speed),
+            np.full((2, 6), .2), max_jerk=2.)
+
+    def test_bounded_roughness_reduction_keeps_both_blends_and_clock(self):
+        """降低最终五次执行段的jerk/snap积分，窗口外、两端导数和源时轴不变."""
+        old, labels = self.fixture()
+        new, report = self.smooth(old, labels)
+        first, last = report['first'], report['last']
+        np.testing.assert_array_equal(new.times, old.times)
+        self.assertEqual(new.stops, old.stops)
+        for metric in ('jerk_energy_rad2_s5', 'snap_energy_rad2_s7'):
+            self.assertLess(report['after'][metric], report['before'][metric])
+        for side in ('left', 'right'):
+            for field in ('positions', 'velocities', 'accelerations'):
+                before, after = getattr(old, field)[side], getattr(new, field)[side]
+                np.testing.assert_array_equal(after[:first + 1], before[:first + 1])
+                np.testing.assert_array_equal(after[last:], before[last:])
+                self.assertFalse(after.flags.writeable)
+            np.testing.assert_array_equal(new.polynomials[side][:first],
+                                          old.polynomials[side][:first])
+            np.testing.assert_array_equal(new.polynomials[side][last:],
+                                          old.polynomials[side][last:])
+            self.assertLessEqual(report['arms'][side]['max_segment_change_rad'], .0001)
+            for i in (first, (first + last) // 2, last - 1):
+                h = float(new.times[i + 1] - new.times[i])
+                for order, field in enumerate(('positions', 'velocities', 'accelerations')):
+                    np.testing.assert_allclose(evaluate(new.polynomials[side][i], 1., h, order),
+                                               getattr(new, field)[side][i + 1], atol=1e-9)
+
+    def test_no_feasible_candidate_keeps_input(self):
+        """更严限速使拟合不合格时拒绝，不原地修改成功输入."""
+        old, labels = self.fixture()
+        saved = {s: a.copy() for s, a in old.positions.items()}
+        with self.assertRaisesRegex(ValueError, '保留成功候选'):
+            self.smooth(old, labels, speed=1e-6)
+        for side in saved:
+            np.testing.assert_array_equal(old.positions[side], saved[side])
+
+    def test_extra_stop_or_real_hold_is_rejected(self):
+        """内部额外停车与实际保持不能被最小jerk拟合消除."""
+        from dataclasses import replace
+        old, labels = self.fixture()
+        with self.assertRaises(ValueError):
+            self.smooth(replace(old, stops=(0, 400, 800)), labels)
+        source = {s: q.copy() for s, q in old.positions.items()}
+        for q in source.values():
+            q[401] = q[400]
+        with self.assertRaisesRegex(ValueError, '保持区间'):
+            self.smooth(old, labels, source=source)
 
 
 if __name__ == "__main__":

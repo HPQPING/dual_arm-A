@@ -28,8 +28,6 @@ setup(
         'console_scripts': [
             'hardware_feedback = archer_hardware.driver_node:main',
             'hardware_position = archer_hardware.position_node:main',
-            'hardware_feedback_audit = archer_hardware.commissioning:audit_main',
-            'hardware_joint_trial = archer_hardware.commissioning:trial_main',
             'hardware_operator = archer_hardware.operator_client:main',
         ],
     },

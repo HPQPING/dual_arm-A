@@ -230,7 +230,7 @@ def continuous_paired_plan(
     speed_limits: ArrayLike, acceleration_limits: ArrayLike, stops: tuple[int, ...],
     margin: float = 1.2,
 ) -> DualArmPlan:
-    """保留几何路径点，重算共同时间与连续导数，仅在指定阶段边界停车。"""
+    """保留几何路径点，重算共同时间与连续导数，仅在指定阶段边界停车."""
     from .continuous_trajectory import plan_continuous_pair
 
     bounds = [np.asarray(x, dtype=np.float64) for x in (left_limits, right_limits)]
@@ -366,7 +366,7 @@ class DualArmKinematics:
 
 
 def peak_target_speeds(plan: JointPlan) -> FloatArray:
-    """解析计算每段关节峰值速度，同时支持停车点和连续导数。"""
+    """解析计算每段关节峰值速度，同时支持停车点和连续导数."""
     if plan.velocities is not None and plan.accelerations is not None:
         from archer_mujoco.joint_interpolation import coefficients, _extrema
 

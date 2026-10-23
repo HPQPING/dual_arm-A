@@ -77,7 +77,7 @@ def test_error_displacement_bound_contains_perturbed_geometry():
 
 
 def test_per_geometry_bounds_cover_large_errors_without_inflating_fixed_base():
-    """固定底座不因末端误差膨胀；每个活动零件仍覆盖完整0.05rad误差盒。"""
+    """固定底座不因末端误差膨胀；每个活动零件仍覆盖完整0.05rad误差盒."""
     loaded = envelope_model(fixed_base=True)
     mj = import_module('mujoco')
     bounds = geometry_error_displacement_bounds(loaded, .05)
@@ -327,7 +327,7 @@ class TaskGeometryTests(unittest.TestCase):
 
     def test_recovered_start_returns_to_clipped_saved_initial_with_real_geometry(self) -> None:
         """真实工程模型检查三段路径，恢复后出发点不同也须归回裁剪后的原始初值."""
-        from archer_hardware.commissioning import load_limits
+        from archer_hardware.position_plan import load_limits
 
         limits = load_limits(Path(__file__).resolve().parents[1] / 'config/position_control.yaml')
         initial = (0., -1.55, 3.13, -1.55, 0., 1.5)
@@ -381,8 +381,8 @@ class TaskGeometryTests(unittest.TestCase):
             self.assertNotEqual(home[side].goal, approach[side].initial)
 
     def test_contact_candidates_match_all_geometry_bounds(self) -> None:
-        """真实模型上，按碰撞候选计算与对所有零件计算得到相同的完整预检报告。"""
-        from archer_hardware.commissioning import load_limits
+        """真实模型上，按碰撞候选计算与对所有零件计算得到相同的完整预检报告."""
+        from archer_hardware.position_plan import load_limits
         from archer_mujoco.dual_model_loader import load_dual_arm
 
         limits = load_limits(Path(__file__).resolve().parents[1] / 'config/position_control.yaml')
@@ -433,7 +433,7 @@ class TaskGeometryTests(unittest.TestCase):
 
     def test_boundary_error_intersection_keeps_collision_clearance(self) -> None:
         """边界起点允许误差集合取名义范围交集，碰撞膨胀仍覆盖完整误差盒."""
-        from archer_hardware.commissioning import load_limits
+        from archer_hardware.position_plan import load_limits
         limits = load_limits(Path(__file__).resolve().parents[1] / 'config/position_control.yaml')
         initial = (0., -1.5748, 3.13, -1.55, 0., 1.5)
         goal = (.001, *initial[1:])

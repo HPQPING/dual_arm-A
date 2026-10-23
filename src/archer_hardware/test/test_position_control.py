@@ -33,7 +33,7 @@ class PositionPlanTests(unittest.TestCase):
     def test_default_execution_limits_match_authorized_model_envelope(self) -> None:
         """真实默认目标不能被技术范围接受却被已安装模型拒绝."""
         from archer_control.kinematics import ArmKinematics
-        from archer_hardware.commissioning import load_limits
+        from archer_hardware.position_plan import load_limits
 
         bounds = load_limits(Path(__file__).resolve().parents[1] / 'config/position_control.yaml')
         technical = np.deg2rad(np.array([
@@ -56,7 +56,7 @@ class PositionPlanTests(unittest.TestCase):
     def test_default_j2_boundary_preserves_feedback_and_recovers_inside_model(self) -> None:
         """真实工程范围外的读数保留，但目标不得突破已授权软件下界."""
         from archer_control.kinematics import ArmKinematics
-        from archer_hardware.commissioning import load_limits
+        from archer_hardware.position_plan import load_limits
 
         configuration = Path(__file__).resolve().parents[1] / 'config/position_control.yaml'
         limits = load_limits(configuration)['right']
@@ -339,133 +339,8 @@ class ContinuousExecutionTests(unittest.TestCase):
 class PairedStartTests(unittest.TestCase):
     """共享门控不访问设备，准备不完整或取消后不能释放启动."""
 
-    def test_following_wait_keeps_both_targets_and_resumes_without_catchup(self) -> None:
-        """右侧偏差接近上界时双方等待，持续发送确认后可等待超过40ms。"""
-        with patch('archer_hardware.position_plan.time.monotonic') as clock:
-            clock.return_value = 100.
-            gate = PairedTrajectoryStart(reference_step_s=.01, duration_s=1.,
-                                         following_feedback=True)
-            gate.ready('left')
-            gate.ready('right')
-            clock.return_value = 100.201
-            gate.playback('left', 0, tracking_ratio=lambda t: 0.)
-            self.assertEqual(gate.playback('right', 0, tracking_ratio=lambda t: .95)[:2], (0., 0))
-            for step in range(1, 11):
-                clock.return_value = 100.201 + step * .01
-                for side, ratio in (('left', 0.), ('right', .95)):
-                    self.assertEqual(gate.playback(side, 0, tracking_ratio=lambda t: ratio)[:2],
-                                     (0., 0))
-            self.assertTrue(gate.playback_status()['tracking_paused'])
-            clock.return_value = 100.306
-            # 稳定偏差仍可恢复，恢复后的推进增量按反馈比例减小。
-            gate.playback('right', 0, tracking_ratio=lambda t: .835)
-            self.assertFalse(gate.playback_status()['tracking_paused'])
-            clock.return_value = 100.307
-            reference, generation, _ = gate.playback('left', 0, tracking_ratio=lambda t: 0.)
-            self.assertAlmostEqual(reference, .001 * (.95 - .835) / .15)
-            self.assertEqual(generation, 1)
-            self.assertEqual(gate.playback_status()['tracking_waits'], 1)
-            clock.return_value = 100.308
-            self.assertEqual(gate.playback('left', 1, tracking_ratio=lambda t: 0.)[:2],
-                             (reference, generation))
-            # 另一侧旧代次发送确认不能推进新参考点。
-            self.assertEqual(gate.playback('right', 0, tracking_ratio=lambda t: .835)[:2],
-                             (reference, generation))
-
-    def test_stable_bias_inside_boundary_slows_reference_without_latching(self) -> None:
-        """复现本轮右J2约0.00886rad偏差，不再被0.0085rad恢复门槛卡住。"""
-        with patch('archer_hardware.position_plan.time.monotonic') as clock:
-            clock.return_value = 100.
-            gate = PairedTrajectoryStart(reference_step_s=.01, duration_s=1.,
-                                         following_feedback=True)
-            gate.ready('left')
-            gate.ready('right')
-            clock.return_value = 100.201
-            gate.playback('left', 0, tracking_ratio=lambda t: .728)
-            reference, generation, _ = gate.playback('right', 0, tracking_ratio=lambda t: .886)
-            self.assertAlmostEqual(reference, .001 * (.95 - .886) / .15)
-            self.assertEqual(generation, 1)
-            self.assertFalse(gate.playback_status()['tracking_paused'])
-
-    def test_following_wait_still_requires_fresh_feedback_and_delivery(self) -> None:
-        """主动等待不能掩盖另一侧调度停止或真实传输确认消失。"""
-        for missing in ('feedback', 'delivery'):
-            with self.subTest(missing=missing), patch(
-                'archer_hardware.position_plan.time.monotonic',
-            ) as clock:
-                clock.return_value = 100.
-                gate = PairedTrajectoryStart(reference_step_s=.01, duration_s=1.,
-                                             following_feedback=True)
-                gate.ready('left')
-                gate.ready('right')
-                clock.return_value = 100.201
-                gate.playback('left', 0, tracking_ratio=lambda t: .95)
-                gate.playback('right', 0, tracking_ratio=lambda t: .95)
-                for step in range(1, 4):
-                    clock.return_value = 100.201 + step * .01
-                    gate.playback('left', 0 if missing == 'feedback' else None,
-                                  tracking_ratio=lambda t: .95)
-                    if missing == 'delivery':
-                        gate.playback('right', 0, tracking_ratio=lambda t: .95)
-                clock.return_value = 100.25
-                with self.assertRaisesRegex(RuntimeError, '40ms'):
-                    gate.playback('left', None, tracking_ratio=lambda t: .9)
-                self.assertTrue(gate.cancelled)
-
-    def test_following_wait_allows_slow_continuing_progress(self) -> None:
-        """实际仍在接近目标时允许等待超过两秒，恢复不追赶欠账。"""
-        with patch('archer_hardware.position_plan.time.monotonic') as clock:
-            clock.return_value = 100.
-            gate = PairedTrajectoryStart(reference_step_s=.01, duration_s=1.,
-                                         following_feedback=True)
-            gate.ready('left')
-            gate.ready('right')
-            for step in range(301):
-                clock.return_value = 100.201 + step * .01
-                ratio = .99 - step * .0001
-                gate.playback('left', 0, tracking_ratio=lambda t: 0.)
-                gate.playback('right', 0, tracking_ratio=lambda t: ratio)
-            self.assertTrue(gate.playback_status()['tracking_paused'])
-            self.assertFalse(gate.cancelled)
-            clock.return_value += .01
-            gate.playback('left', 0, tracking_ratio=lambda t: 0.)
-            self.assertEqual(gate.playback('right', 0, tracking_ratio=lambda t: .84)[:2],
-                             (0., 0))
-            self.assertFalse(gate.playback_status()['tracking_paused'])
-
-    def test_following_wait_timeout_and_invalid_ratio_cancel(self) -> None:
-        """跟不上不能无限等；超界和非有限比例在下一代目标生成前取消。"""
-        with patch('archer_hardware.position_plan.time.monotonic') as clock:
-            clock.return_value = 100.
-            gate = PairedTrajectoryStart(reference_step_s=.01, duration_s=1.,
-                                         following_feedback=True)
-            gate.ready('left')
-            gate.ready('right')
-            clock.return_value = 100.201
-            gate.playback('left', 0, tracking_ratio=lambda t: .95)
-            gate.playback('right', 0, tracking_ratio=lambda t: .95)
-            with self.assertRaisesRegex(RuntimeError, '10秒'):
-                for step in range(1, 1003):
-                    clock.return_value = 100.201 + step * .01
-                    for side in ('left', 'right'):
-                        gate.playback(side, 0, tracking_ratio=lambda t: .95)
-            self.assertTrue(gate.cancelled)
-        for invalid in (-.1, 1.01, float('nan'), True):
-            with self.subTest(ratio=invalid), patch(
-                'archer_hardware.position_plan.time.monotonic',
-            ) as clock:
-                clock.return_value = 100.
-                gate = PairedTrajectoryStart(reference_step_s=.01, duration_s=1.,
-                                             following_feedback=True)
-                gate.ready('left')
-                gate.ready('right')
-                clock.return_value = 100.201
-                with self.assertRaises(RuntimeError):
-                    gate.playback('left', 0, tracking_ratio=lambda t: invalid)
-                self.assertTrue(gate.cancelled)
-
     def test_stream_clock_advances_without_each_generation_ack(self) -> None:
-        """共同周期推进不等逐点发送确认，两线程同周期获得相同参考。"""
+        """共同周期推进不等逐点发送确认，两线程同周期获得相同参考."""
         with patch('archer_hardware.position_plan.time.monotonic') as clock:
             clock.return_value = 100.
             gate = PairedTrajectoryStart(reference_step_s=.01, duration_s=1.,
@@ -482,7 +357,7 @@ class PairedStartTests(unittest.TestCase):
             self.assertAlmostEqual(gate.playback('right', 0)[0], .008)
 
     def test_stream_clock_lag_is_capped_and_not_repaid(self) -> None:
-        """迟到不超出已检单包步长，下一周期不追赶欠账。"""
+        """迟到不超出已检单包步长，下一周期不追赶欠账."""
         with patch('archer_hardware.position_plan.time.monotonic') as clock:
             clock.return_value = 100.
             gate = PairedTrajectoryStart(reference_step_s=.01, duration_s=1.,
@@ -501,7 +376,7 @@ class PairedStartTests(unittest.TestCase):
             self.assertAlmostEqual(reference, .014)
 
     def test_stream_clock_retains_per_side_transport_timeout(self) -> None:
-        """一侧持续没有新发送确认，即使另一侧正常也取消两侧。"""
+        """一侧持续没有新发送确认，即使另一侧正常也取消两侧."""
         with patch('archer_hardware.position_plan.time.monotonic') as clock:
             clock.return_value = 100.
             gate = PairedTrajectoryStart(reference_step_s=.01, duration_s=1.,
@@ -519,7 +394,7 @@ class PairedStartTests(unittest.TestCase):
             self.assertTrue(gate.cancelled)
 
     def test_stream_clock_end_waits_for_both_final_packets(self) -> None:
-        """只有两侧末包都发出后，终点到位计时才开始。"""
+        """只有两侧末包都发出后，终点到位计时才开始."""
         with patch('archer_hardware.position_plan.time.monotonic') as clock:
             clock.return_value = 100.
             gate = PairedTrajectoryStart(reference_step_s=.01, duration_s=.004,
@@ -536,7 +411,7 @@ class PairedStartTests(unittest.TestCase):
             self.assertAlmostEqual(gate.playback('left', 1)[2], .792)
 
     def test_stream_clock_updates_regularly_with_delayed_sdk(self) -> None:
-        """SDK每12ms确认一次时，参考仍每4ms均匀采样，不按确认切碎时间步。"""
+        """SDK每12ms确认一次时，参考仍每4ms均匀采样，不按确认切碎时间步."""
         with patch('archer_hardware.position_plan.time.monotonic') as clock:
             clock.return_value = 100.
             gate = PairedTrajectoryStart(reference_step_s=.01, duration_s=1.,
@@ -554,7 +429,7 @@ class PairedStartTests(unittest.TestCase):
             np.testing.assert_allclose(np.diff(references), .004, atol=1e-12)
 
     def test_stream_small_packet_budget_does_not_split_regular_samples(self) -> None:
-        """单步上限4.2ms不能造成4ms与0.2ms交替的停走参考时钟。"""
+        """单步上限4.2ms不能造成4ms与0.2ms交替的停走参考时钟."""
         with patch('archer_hardware.position_plan.time.monotonic') as clock:
             clock.return_value = 100.
             gate = PairedTrajectoryStart(reference_step_s=.0042, duration_s=1.,
@@ -575,7 +450,7 @@ class PairedStartTests(unittest.TestCase):
             self.assertAlmostEqual(reference, .024)
 
     def test_stream_clock_keeps_full_rate_for_two_minutes(self) -> None:
-        """长期250Hz周期不能因浮点累计误差丢拍或缩短参考时间。"""
+        """长期250Hz周期不能因浮点累计误差丢拍或缩短参考时间."""
         with patch('archer_hardware.position_plan.time.monotonic') as clock:
             clock.return_value = 100.
             gate = PairedTrajectoryStart(reference_step_s=.0042, duration_s=130.,
@@ -592,71 +467,13 @@ class PairedStartTests(unittest.TestCase):
             self.assertAlmostEqual(reference, 120., places=8)
 
     def test_stream_clock_rejects_invalid_options(self) -> None:
-        """不能将周期流与旧反馈等待混用，也拒绝无效周期。"""
+        """拒绝缺失周期及无效周期，不回退到逐代确认模式."""
         for options in ({'stream_period_s': .004},
                         {'reference_step_s': .01, 'duration_s': 1., 'stream_period_s': .03},
                         {'reference_step_s': .01, 'duration_s': 1., 'stream_period_s': True},
-                        {'reference_step_s': .01, 'duration_s': 1., 'stream_period_s': .004,
-                         'following_feedback': True}):
+                        {'reference_step_s': .01, 'duration_s': 1.}):
             with self.assertRaises(ValueError):
                 PairedTrajectoryStart(**options)
-
-    def test_delivery_clock_waits_for_both_and_discards_lag(self) -> None:
-        """单侧确认或旧代确认不能推进；延迟不能变成下一拍追赶欠账."""
-        with patch('archer_hardware.position_plan.time.monotonic') as clock:
-            clock.return_value = 100.
-            gate = PairedTrajectoryStart(reference_step_s=.0032, duration_s=.1)
-            gate.ready('left')
-            gate.ready('right')
-            clock.return_value = 100.21
-            self.assertEqual(gate.playback('left', 0)[:2], (0., 0))
-            clock.return_value = 100.23
-            reference, generation, age = gate.playback('right', 0)
-            self.assertAlmostEqual(reference, .0032)
-            self.assertEqual(generation, 1)
-            self.assertIsNone(age)
-            self.assertEqual(gate.playback('left', 0)[:2], (reference, generation))
-            gate.playback('left', 1)
-            clock.return_value = 100.231
-            reference, generation, _ = gate.playback('right', 1)
-            self.assertAlmostEqual(reference, .0042)
-            self.assertEqual(generation, 2)
-            gate.cancel()
-            with self.assertRaisesRegex(RuntimeError, '取消'):
-                gate.playback('left', 2)
-
-    def test_delivery_clock_requires_final_transport_before_settle_timer(self) -> None:
-        """终点构造出来还不算已交付；等待到位从两侧末包发送完成后计时."""
-        with patch('archer_hardware.position_plan.time.monotonic') as clock:
-            clock.return_value = 100.
-            gate = PairedTrajectoryStart(reference_step_s=.01, duration_s=.005)
-            gate.ready('left')
-            gate.ready('right')
-            clock.return_value = 100.21
-            gate.playback('left', 0)
-            self.assertEqual(gate.playback('right', 0), (.005, 1, None))
-            clock.return_value = 100.215
-            self.assertIsNone(gate.playback('left', 1)[2])
-            self.assertEqual(gate.playback('right', 1), (.005, 1, 0.))
-            clock.return_value = 101.
-            age = gate.playback('left', 1)[2]
-            assert age is not None
-            self.assertAlmostEqual(age, .785)
-            self.assertEqual(gate.playback_status()['delivered_reference_elapsed_s'], .005)
-
-    def test_delivery_clock_timeout_cannot_be_rescued_by_late_ack(self) -> None:
-        """暂停超过40ms后到来的确认不能恢复已经超时的运行."""
-        with patch('archer_hardware.position_plan.time.monotonic') as clock:
-            clock.return_value = 100.
-            gate = PairedTrajectoryStart(reference_step_s=.0032, duration_s=.1)
-            gate.ready('left')
-            gate.ready('right')
-            clock.return_value = 100.201
-            gate.playback('left', 0)
-            clock.return_value = 100.241
-            with self.assertRaisesRegex(RuntimeError, '40ms'):
-                gate.playback('right', 0)
-            self.assertTrue(gate.cancelled)
 
     def test_delivery_step_contains_full_curve_packet_velocity(self) -> None:
         """从解析峰值选步长，密集比较所有位置变化均留出SDK限速余量."""
@@ -666,10 +483,17 @@ class PairedStartTests(unittest.TestCase):
             (0, 2_000_000_000), ((0.,) * 6, (.02,) * 6),
             ((0.,) * 6,) * 2, ((0.,) * 6,) * 2, limits, .05)
         step = delivery_reference_step({'left': plan, 'right': plan})
+        step250 = delivery_reference_step({'left': plan, 'right': plan}, control_hz=250)
+        self.assertGreaterEqual(step250, step)
+        for invalid in (True, 0, 251):
+            with self.assertRaises(ValueError):
+                delivery_reference_step({'left': plan, 'right': plan}, control_hz=invalid)
         for i in range(1000):
             t = 2. * i / 1000
             delta = max(abs(a-b) for a, b in zip(plan.sample(t), plan.sample(t+step)))
             self.assertLessEqual(delta, .8 * .002 * .1 + 1e-12)
+            delta250 = max(abs(a-b) for a, b in zip(plan.sample(t), plan.sample(t+step250)))
+            self.assertLessEqual(delta250, .8 * .004 * .1 + 1e-12)
         for options in ({'reference_step_s': .0032},
                         {'reference_step_s': .021, 'duration_s': 1.},
                         {'reference_step_s': True, 'duration_s': 1.}):
@@ -968,7 +792,7 @@ class PositionAdapterTests(unittest.TestCase):
             self.assertTrue(gate.cancelled)
 
     def test_startup_tolerance_expires_at_first_segment_boundary(self) -> None:
-        """七毫弧度偏差只允许存在于接近段，进入主体前取消而不发送下一位置。"""
+        """七毫弧度偏差只允许存在于接近段，进入主体前取消而不发送下一位置."""
         self.adapter.limits = replace(self.adapter.limits, feedback_tolerance=.005)
         base = self.continuous_plan()['left']
         boundary = base.times_ns[1] / 1e9
@@ -1001,7 +825,7 @@ class PositionAdapterTests(unittest.TestCase):
             self.assertTrue(gate.cancelled)
 
     def test_completed_hold_does_not_reenter_startup_tolerance(self) -> None:
-        """末点保持后继续tick，不能把时间归零而重新使用起始宽容差。"""
+        """末点保持后继续tick，不能把时间归零而重新使用起始宽容差."""
         self.adapter.limits = replace(self.adapter.limits, feedback_tolerance=.005)
         base = self.continuous_plan()['left']
         self.acquire()
@@ -1727,7 +1551,7 @@ class PositionAdapterTests(unittest.TestCase):
         self.assertEqual(self.send.call_args.args[1], 'brake')
 
     def test_close_clears_task_state_before_next_connection(self) -> None:
-        """清理取消门控与旧起点，同一适配器重新准备不继承上一轮停止状态。"""
+        """清理取消门控与旧起点，同一适配器重新准备不继承上一轮停止状态."""
         self.acquire()
         self.adapter.move_to([.01] * 6, 2.)
         gate = PairedTrajectoryStart()

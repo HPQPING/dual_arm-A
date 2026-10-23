@@ -40,7 +40,7 @@ class SdkCycleSender:
         self.sample_position: Callable[[], tuple[float, ...] | None] | None = None
 
     def encode_position(self, arm: Any, command: Any, encode: Callable[[Any], Any]) -> Any:
-        """在官方周期实际构包时取样，避免反复发送旧缓存后跳到较晚目标。"""
+        """在官方周期实际构包时取样，避免反复发送旧缓存后跳到较晚目标."""
         with self.lock:
             request = self.pending.get('position')
             if (self.closed or self.sample_position is None or request is None
@@ -62,7 +62,7 @@ class SdkCycleSender:
             return message
 
     def position_timing(self) -> tuple[tuple[float, ...], float] | None:
-        """返回上一实际发送位置及其单调时间间隔，不使用规划缓存更新时刻。"""
+        """返回上一实际发送位置及其单调时间间隔，不使用规划缓存更新时刻."""
         with self.lock:
             if self.last_position is None or self.last_position_at is None:
                 return None

@@ -1,19 +1,13 @@
-"""离线验证试动文件、双臂计划预检与时间调整，不连接SDK或驱动机械臂."""
+"""离线验证试动文件、普通双臂计划校验，不连接SDK或驱动机械臂."""
 
 from copy import deepcopy
-import json
-from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Any
 import unittest
-from unittest.mock import patch
-
-import yaml
 
 from sensor_msgs.msg import JointState
 
 from archer_hardware.commissioning import (
-    plan_check_main, plan_retime_main, read_positions, retime_joint_plan, review_joint_plan,
+    read_positions, review_joint_plan,
     target_message, trial_target,
 )
 from archer_hardware.position_plan import PositionLimits
@@ -167,123 +161,3 @@ class JointPlanReviewTests(unittest.TestCase):
             plan['left']['points'][index]['time_from_start'] = stamp
             with self.subTest(index=index, stamp=stamp), self.assertRaises(ValueError):
                 review_joint_plan(plan, self.limits)
-
-    def test_cli_writes_evidence_without_ros_and_preserves_existing_report(self) -> None:
-        """离线输出报告哈希，错误计划报告失败且不覆盖旧文件."""
-        with TemporaryDirectory() as folder:
-            root = Path(folder)
-            plan, limits, output = root / 'plan.yaml', root / 'limits.yaml', root / 'report.json'
-            plan.write_text(yaml.safe_dump(self.plan), encoding='utf-8')
-            parameters: dict[str, Any] = {}
-            for side in ('left', 'right'):
-                bound = self.limits[side]
-                for field in ('lower', 'upper', 'max_velocity', 'max_acceleration'):
-                    parameters[f'{side}_{field}'] = list(getattr(bound, field))
-            parameters['feedback_tolerance'] = 0.0
-            limits.write_text(yaml.safe_dump({
-                'archer_position_driver': {'ros__parameters': parameters},
-            }), encoding='utf-8')
-            args = ['--plan-file', str(plan), '--limits-file', str(limits),
-                    '--output', str(output)]
-            with patch('rclpy.init') as initialize:
-                self.assertEqual(plan_check_main(args), 0)
-                initialize.assert_not_called()
-            report = json.loads(output.read_text(encoding='utf-8'))
-            self.assertEqual(len(report['plan_sha256']), 64)
-            self.assertFalse(report['commands_sent'])
-            saved = output.read_bytes()
-            with self.assertRaises(SystemExit):
-                plan_check_main(args)
-            self.assertEqual(output.read_bytes(), saved)
-            plan.write_text('not_a_plan: true', encoding='utf-8')
-            args[-1] = str(root / 'failed.json')
-            self.assertEqual(plan_check_main(args), 1)
-            self.assertFalse(json.loads((root / 'failed.json').read_text())['passed'])
-
-    def test_retime_uses_tighter_arm_and_preserves_positions(self) -> None:
-        """左右臂使用同一放慢倍数，右臂更严格的速度约束也必须生效."""
-        bounds = dict(self.limits)
-        bounds['right'] = PositionLimits((-1.0,) * 6, (1.0,) * 6, (0.001,) * 6,
-                                         (0.1,) * 6)
-        original = deepcopy(self.plan)
-        output, report = retime_joint_plan(self.plan, bounds)
-        self.assertTrue(review_joint_plan(output, bounds)['passed'])
-        self.assertGreater(report['duration_s'], 4.0)
-        self.assertEqual(self.plan, original)
-        for side in ('left', 'right'):
-            self.assertEqual(output[side]['joint_names'], original[side]['joint_names'])
-            for new, old in zip(output[side]['points'], original[side]['points']):
-                self.assertEqual(new['positions'], old['positions'])
-        self.assertEqual([p['time_from_start'] for p in output['left']['points']],
-                         [p['time_from_start'] for p in output['right']['points']])
-        self.assertAlmostEqual(report['time_scale'], 9.84375)
-
-    def test_retime_acceleration_and_already_slow_plan(self) -> None:
-        """加速度需要按时间平方降低，原本足够慢的计划不加速也不改写时间."""
-        output, report = retime_joint_plan(self.plan, self.limits)
-        self.assertEqual(output, self.plan)
-        self.assertEqual(report['time_scale'], 1.0)
-        bound = PositionLimits((-1.0,) * 6, (1.0,) * 6, (1.0,) * 6, (0.0001,) * 6)
-        output, report = retime_joint_plan(self.plan, {'left': bound, 'right': bound})
-        self.assertTrue(review_joint_plan(output, {'left': bound, 'right': bound})['passed'])
-        self.assertLessEqual(max(report['arms']['left']['peak_acceleration_rad_s2']), 0.0001)
-        self.assertGreater(report['time_scale'], 10.0)
-
-    def test_retime_does_not_fix_invalid_positions_or_grids(self) -> None:
-        """越界角度、错位时间轴和未知插值不能靠放慢绕过."""
-        for kind in ('position', 'grid', 'interpolation'):
-            plan = deepcopy(self.plan)
-            if kind == 'position':
-                plan['left']['points'][1]['positions'][0] = 1.001
-            elif kind == 'grid':
-                plan['right']['points'][1]['time_from_start']['sec'] = 3
-            else:
-                plan['interpolation'] = 'linear'
-            with self.subTest(kind=kind), self.assertRaises(ValueError):
-                retime_joint_plan(plan, self.limits)
-        for margin in (True, 1.0, 2.001, float('nan')):
-            with self.subTest(margin=margin), self.assertRaises(ValueError):
-                retime_joint_plan(self.plan, self.limits, margin)
-
-    def test_retime_rejects_result_longer_than_execution_limit(self) -> None:
-        """极低配置速度需要超过一小时时拒绝生成，不提高配置限制."""
-        bound = PositionLimits((-1.0,) * 6, (1.0,) * 6, (1e-9,) * 6, (0.1,) * 6)
-        with self.assertRaisesRegex(ValueError, '一小时'):
-            retime_joint_plan(self.plan, {'left': bound, 'right': bound})
-
-    def test_retime_cli_hashes_no_ros_and_no_overwrite(self) -> None:
-        """只读源文件、排他生成计划与报告，主入口不初始化ROS或SDK."""
-        from archer_hardware.operator_client import main
-        with TemporaryDirectory() as folder:
-            root = Path(folder)
-            source, config = root / 'source.json', root / 'limits.yaml'
-            output, report = root / 'new.json', root / 'report.json'
-            source.write_text(json.dumps(self.plan), encoding='utf-8')
-            parameters: dict[str, Any] = {'feedback_tolerance': 0.0}
-            for side in ('left', 'right'):
-                for field in ('lower', 'upper', 'max_velocity', 'max_acceleration'):
-                    parameters[f'{side}_{field}'] = list(getattr(self.limits[side], field))
-            config.write_text(yaml.safe_dump({
-                'archer_position_driver': {'ros__parameters': parameters},
-            }), encoding='utf-8')
-            args = ['--plan-file', str(source), '--limits-file', str(config),
-                    '--output', str(output), '--report', str(report)]
-            before = source.read_bytes()
-            with patch('rclpy.init') as initialize, patch(
-                'archer_hardware.hex_adapter.verified_sdk', side_effect=AssertionError('SDK'),
-            ):
-                self.assertEqual(main(['plan-retime'] + args), 0)
-                initialize.assert_not_called()
-            evidence = json.loads(report.read_text(encoding='utf-8'))
-            self.assertTrue(evidence['passed'])
-            self.assertFalse(evidence['commands_sent'])
-            self.assertEqual(len(evidence['output_sha256']), 64)
-            self.assertEqual(source.read_bytes(), before)
-            saved = output.read_bytes(), report.read_bytes()
-            with self.assertRaises(SystemExit):
-                plan_retime_main(args)
-            self.assertEqual((output.read_bytes(), report.read_bytes()), saved)
-            args[5] = str(source)
-            with self.assertRaises(SystemExit):
-                plan_retime_main(args)
-            self.assertEqual(source.read_bytes(), before)

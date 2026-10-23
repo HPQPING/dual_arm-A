@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 
 def trajectory_fingerprint(task: Mapping[str, ContinuousPositionTrajectory]) -> str:
-    """绑定轨迹系数、时间轴、端点、范围和限位，用于本次启动内复用检查。"""
+    """绑定轨迹系数、时间轴、端点、范围和限位，用于本次启动内复用检查."""
     if set(task) != {'left', 'right'}:
         raise ValueError('主体轨迹必须同时包含两臂')
     digest = hashlib.sha256(b'file_task_geometry_v1')
@@ -322,7 +322,7 @@ def _joint_error(value: float) -> float:
 def geometry_error_displacement_bounds(
     loaded: LoadedDualArm, tolerance: float,
 ) -> dict[str, dict[int, float]]:
-    """分别覆盖每个碰撞零件的位移，仅累加真正影响该零件的上游转动关节。"""
+    """分别覆盖每个碰撞零件的位移，仅累加真正影响该零件的上游转动关节."""
     from importlib import import_module
 
     delta = _joint_error(tolerance)
@@ -384,13 +384,13 @@ def geometry_error_displacement_bounds(
 def joint_error_displacement_bounds(
     loaded: LoadedDualArm, tolerance: float,
 ) -> dict[str, float]:
-    """返回各侧所有零件位移上界的最大值，供已有报告和检查调用。"""
+    """返回各侧所有零件位移上界的最大值，供已有报告和检查调用."""
     return {side: max(bounds.values()) for side, bounds in
             geometry_error_displacement_bounds(loaded, tolerance).items()}
 
 
 class EnvelopeData(Protocol):
-    """当前姿态下的碰撞零件中心及世界关节轴。"""
+    """当前姿态下的碰撞零件中心及世界关节轴."""
 
     geom_xpos: NDArray[np.float64]
     geom_xmat: NDArray[np.float64]
@@ -402,7 +402,7 @@ def _pose_geometry_error_bounds(
     data: EnvelopeData, radii: Mapping[int, float], joints: Mapping[int, tuple[int, ...]],
     tolerance: float, *, direction: NDArray[np.float64] | None = None,
 ) -> dict[int, float]:
-    """按根到末端的关节顺序，覆盖零件整体位移或指定方向的位移。"""
+    """按根到末端的关节顺序，覆盖零件整体位移或指定方向的位移."""
     delta = _joint_error(tolerance)
     normal = None
     if direction is not None:

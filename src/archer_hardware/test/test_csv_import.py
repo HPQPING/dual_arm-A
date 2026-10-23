@@ -175,11 +175,12 @@ class CsvImportTests(unittest.TestCase):
             prepare_samples(samples, self.limits)
 
     def test_explicit_smooth_cruise_and_planning_jerk(self) -> None:
-        """新时间律必须显式选择路径模式，输出可复核的加加速度统计。"""
+        """新时间律必须显式选择路径模式，输出可复核的加加速度统计."""
         samples, _ = import_samples(state_csv(), self.limits)
-        for options in ({'smooth_cruise': True}, {'planning_jerk': 2.}):
-            with self.assertRaisesRegex(ValueError, '路径重定时'):
-                prepare_samples(samples, self.limits, **options)
+        with self.assertRaisesRegex(ValueError, '路径重定时'):
+            prepare_samples(samples, self.limits, smooth_cruise=True)
+        with self.assertRaisesRegex(ValueError, '路径重定时'):
+            prepare_samples(samples, self.limits, planning_jerk=2.)
         before = json.dumps(samples, sort_keys=True)
         try:
             from scipy.interpolate import BSpline
@@ -206,7 +207,30 @@ class CsvImportTests(unittest.TestCase):
         for side in ('left', 'right'):
             self.assertEqual([p['positions'] for p in candidate[side]['points']],
                              [p['positions'] for p in final[side]['points']])
-            self.assertLessEqual(max(polished['jerk_metrics'][side]['peak_jerk_rad_s3']), 2. + 1e-6)
+            peak_jerk = max(polished['jerk_metrics'][side]['peak_jerk_rad_s3'])
+            self.assertLessEqual(peak_jerk, 2. + 1e-6)
+
+    def test_transit_profile_is_explicit_and_rejects_large_shape_change(self) -> None:
+        """只有显式选择才能优化；稀疏曲线段形改变过大时拒绝，不改原始数据."""
+        samples, _ = import_samples(state_csv(
+            times=tuple(i * .05 for i in range(41)),
+            positions=tuple(i * .005 for i in range(41))), self.limits)
+        with self.assertRaisesRegex(ValueError, '接近归位'):
+            prepare_samples(samples, self.limits, transit_profile=True)
+        try:
+            from scipy.interpolate import BSpline
+            self.assertTrue(callable(BSpline))
+        except (ImportError, ValueError):
+            self.skipTest('需要兼容的SciPy离线转换环境')
+        for s in ('left', 'right'):
+            for point in samples[s]['points']:
+                point['source_stage'] = 'APPROACH'
+        samples['reference_events'] = []
+        before = json.dumps(samples, sort_keys=True)
+        with self.assertRaisesRegex(ValueError, '形状变化'):
+            prepare_samples(samples, self.limits, path_retime=True, smooth_cruise=True,
+                            planning_jerk=2., continuous_jerk=True, transit_profile=True)
+        self.assertEqual(before, json.dumps(samples, sort_keys=True))
 
     def test_cli_replaces_latest_conversion_without_ros_or_sdk(self) -> None:
         """默认独立目录同名替换，只读原记录，转换失败保留上次成功文件."""
@@ -312,6 +336,25 @@ class CsvImportTests(unittest.TestCase):
                 self.assertEqual(sorted(p.name for p in root.iterdir()),
                                  ['state.json', 'state_report.json'] if existed else [])
 
+    def test_arc_smoothing_requires_explicit_blend_pipeline(self) -> None:
+        """圆弧内部平滑不能从普通导入或未衔接候选隐式启用."""
+        samples, _ = import_samples(state_csv(), self.limits)
+        with self.assertRaisesRegex(ValueError, '局部边界融合'):
+            prepare_samples(samples, self.limits, arc_smooth=True)
+        with self.assertRaises(ValueError):
+            prepare_samples(samples, self.limits, arc_smooth=1)
+
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TransitTimingOptionTests(unittest.TestCase):
+    """新后处理必须显式选择完整链路，不能修改旧默认转换."""
+
+    def test_timing_requires_arc_pipeline(self) -> None:
+        """缺少前置步骤时在拟合和文件写入前拒绝."""
+        limits = PositionLimits((-1.,) * 6, (1.,) * 6, (.5,) * 6, (.3,) * 6)
+        samples, _ = import_samples(state_csv(), {'left': limits, 'right': limits})
+        with self.assertRaisesRegex(ValueError, '时间优化'):
+            prepare_samples(samples, {'left': limits, 'right': limits}, transit_timing=True)

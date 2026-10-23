@@ -1046,10 +1046,12 @@ class PositionNodeTests(unittest.TestCase):
                                  for kind, _ in self.backend(node, side).calls))
 
     def file_preflight(self, text, limits, excursion, starts, cancelled, *, saved_initial=None,
-                       hold_start=None, joint_error_rad=0., startup_joint_error_rad=0.):
+                       hold_start=None, joint_error_rad=0., startup_joint_error_rad=0.,
+                       control_hz=500):
         """合成三段数学路径，替代磁盘和几何耗时步骤，始终不访问设备."""
         from archer_hardware.task_geometry import assemble_task_cycle, prepare_approach
         from archer_hardware.task_geometry import prepare_return
+        self.assertIn(control_hz, (250, 500))
 
         task = {side: ContinuousPositionTrajectory.prepare(
             (0, 500000000), ((.1,) * 6, (.105,) * 6),

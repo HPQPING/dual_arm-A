@@ -18,9 +18,10 @@ import shutil
 from tempfile import mkdtemp
 from typing import Any
 
+import numpy as np
 import yaml
 
-from .commissioning import load_limits
+from .position_plan import load_limits
 from .position_plan import PositionLimits
 
 
@@ -260,6 +261,14 @@ def main(args: list[str] | None = None) -> int:
                         help='配合--path-retime约束规划加加速度rad/s³，不是厂商允许值')
     parser.add_argument('--continuous-jerk', action='store_true',
                         help='空间重定时后统一普通节点导数；需--path-retime和--planning-jerk')
+    parser.add_argument('--transit-profile', action='store_true',
+                        help='仅优化接近归位，保留圆弧；需平滑匀速、导数平滑及jerk约束')
+    parser.add_argument('--boundary-blend', action='store_true',
+                        help='仅画圆入口出口局部融合；需--transit-profile，无夹爪事件')
+    parser.add_argument('--arc-smooth', action='store_true',
+                        help='仅平滑两个融合窗口之间的圆弧内部；需--boundary-blend')
+    parser.add_argument('--transit-timing', action='store_true',
+                        help='仅压缩已平滑接近归位的内部时轴；需--arc-smooth')
     options = parser.parse_args(args)
     if options.smooth and not options.prepare:
         parser.error('--smooth需要同时使用--prepare')
@@ -269,6 +278,14 @@ def main(args: list[str] | None = None) -> int:
         parser.error('--smooth-cruise和--planning-jerk需要--path-retime')
     if options.continuous_jerk and (not options.path_retime or options.planning_jerk is None):
         parser.error('--continuous-jerk需要--path-retime和--planning-jerk')
+    if options.transit_profile and not (options.smooth_cruise and options.continuous_jerk):
+        parser.error('--transit-profile需要--smooth-cruise和--continuous-jerk')
+    if options.boundary_blend and not options.transit_profile:
+        parser.error('--boundary-blend需要--transit-profile')
+    if options.arc_smooth and not options.boundary_blend:
+        parser.error('--arc-smooth需要--boundary-blend')
+    if options.transit_timing and not options.arc_smooth:
+        parser.error('--transit-timing需要--arc-smooth')
     root = options.run_dir.expanduser().resolve()
     existing = [name for name in ('state.csv', 'tracking.csv') if (root / name).is_file()]
     selected = options.csv_name or (existing[0] if len(existing) == 1 else None)
@@ -321,7 +338,11 @@ def main(args: list[str] | None = None) -> int:
                                                 execution_hz=frequency,
                                                 smooth_cruise=options.smooth_cruise,
                                                 planning_jerk=options.planning_jerk,
-                                                continuous_jerk=options.continuous_jerk)
+                                                continuous_jerk=options.continuous_jerk,
+                                                transit_profile=options.transit_profile,
+                                                boundary_blend=options.boundary_blend,
+                                                arc_smooth=options.arc_smooth,
+                                                transit_timing=options.transit_timing)
             report.update(timing)
     except (OSError, ValueError, TypeError, KeyError, UnicodeError,
             csv.Error, yaml.YAMLError) as error:
@@ -355,10 +376,16 @@ def prepare_samples(
     path_retime: bool = False, execution_hz: int = 250,
     smooth_cruise: bool = False, planning_jerk: float | None = None,
     continuous_jerk: bool = False,
+    transit_profile: bool = False,
+    boundary_blend: bool = False,
+    arc_smooth: bool = False,
+    transit_timing: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """准备受限双臂轨迹；空间模式允许有界节点拟合，阶段事件仍仅作为参考。"""
+    """准备受限双臂轨迹；空间模式允许有界节点拟合，阶段事件仍仅作为参考."""
     from archer_control.continuous_trajectory import (
         RecordedTimeMap, retime_recorded_pair, smooth_recorded_pair, retime_spatial_pair,
+        replace_transit_blocks, trajectory_jerk_metrics, _extrema, blend_circle_boundaries,
+        smooth_circle_interior,
     )
     if type(smooth_cruise) is not bool or (
         (smooth_cruise or planning_jerk is not None) and not path_retime
@@ -368,6 +395,16 @@ def prepare_samples(
         continuous_jerk and (not path_retime or planning_jerk is None)
     ):
         raise ValueError('普通节点导数平滑需要路径重定时和规划加加速度')
+    if type(transit_profile) is not bool or (
+        transit_profile and not (path_retime and smooth_cruise and continuous_jerk)
+    ):
+        raise ValueError('接近归位优化需要平滑匀速路径和普通节点导数平滑')
+    if type(boundary_blend) is not bool or (boundary_blend and not transit_profile):
+        raise ValueError('画圆边界融合需要接近归位优化')
+    if type(arc_smooth) is not bool or (arc_smooth and not boundary_blend):
+        raise ValueError('圆弧内部平滑需要已经启用局部边界融合')
+    if type(transit_timing) is not bool or (transit_timing and not arc_smooth):
+        raise ValueError('接近归位时间优化需要已平滑圆弧和融合窗口')
 
     if (samples.get('version') != 3 or samples.get('kind') != 'recorded_joint_samples'
             or samples.get('interpolation') != 'unassigned'):
@@ -401,6 +438,8 @@ def prepare_samples(
             if labels[i] != labels[i - 1]:
                 stops.update((i - 1, i))
     events = samples['reference_events']
+    if boundary_blend and events:
+        raise ValueError('画圆边界融合不处理夹爪或其他参考事件')
     origin = samples['source_time_origin_ns']
     for event in events:
         relative = event['source_time_ns'] - origin
@@ -462,6 +501,107 @@ def prepare_samples(
             'prepared_times_ns': [int(round(float(t) * 1e9)) for t in plan.times],
             'stop_indices': list(plan.stops),
         })
+    if transit_profile:
+        transit_speed = [[min(v, .25) for v in limits[s].max_velocity] for s in ('left', 'right')]
+        transit_accel = [[min(a, .20) for a in limits[s].max_acceleration]
+                         for s in ('left', 'right')]
+        replacement, _ = retime_spatial_pair(
+            source_times, positions['left'], positions['right'],
+            [limits[s].lower for s in ('left', 'right')],
+            [limits[s].upper for s in ('left', 'right')], transit_speed, transit_accel,
+            stops=tuple(sorted(stops)), margin=margin, ramp_fraction=.15, max_jerk=planning_jerk)
+        replacement, _ = smooth_recorded_pair(
+            replacement, [limits[s].lower for s in ('left', 'right')],
+            [limits[s].upper for s in ('left', 'right')], transit_speed, transit_accel,
+            margin=margin, max_jerk=planning_jerk, max_shape_change=.00005)
+        plan, selected = replace_transit_blocks(plan, replacement, stages)
+        measured.update(transit_profile=selected,
+                        transit_velocity_limits_rad_s=transit_speed,
+                        transit_acceleration_limits_rad_s2=transit_accel,
+                        unchanged_phase_policy='preserve_arc_and_boundary_polynomials')
+        measured['planning_velocity_fraction_scope'] = 'baseline_and_arc_only'
+        measured['smoothing_max_segment_change_rad'] = {
+            s: measured['smoothing_max_segment_change_rad'][s]
+            + max(b['max_segment_change_rad'][s] for b in selected) for s in ('left', 'right')}
+        ordinary = np.ones(len(plan.times) - 2, dtype=bool)
+        ordinary[np.asarray(plan.stops[1:-1], dtype=int) - 1] = False
+        gaps = np.diff(plan.times)
+        measured['smoothing_jerk_jump_after_rad_s3'] = {}
+        for s, polys in plan.polynomials.items():
+            end = (6. * polys[:-1, :, 3] + 24. * polys[:-1, :, 4]
+                   + 60. * polys[:-1, :, 5]) / gaps[:-1, None]**3
+            start = 6. * polys[1:, :, 3] / gaps[1:, None]**3
+            measured['smoothing_jerk_jump_after_rad_s3'][s] = float(
+                np.max(abs(end[ordinary] - start[ordinary]), initial=0.))
+        measured['jerk_metrics'] = trajectory_jerk_metrics(plan)
+        measured.update(duration_s=float(plan.times[-1]),
+                        effective_time_scale=float(plan.times[-1] / (source_times[-1] / 1e9)),
+                        prepared_times_ns=[int(round(float(t) * 1e9)) for t in plan.times])
+        measured['spatial_blocks'] = [
+            {**block, 'duration_s': float(plan.times[block['last']] - plan.times[block['first']])}
+            for block in measured['spatial_blocks']]
+    if boundary_blend:
+        if planning_jerk is None:
+            raise ValueError('局部融合缺少明确规划jerk限值')
+        plan, windows = blend_circle_boundaries(
+            plan, stages, {s: np.asarray(q) for s, q in positions.items()},
+            [limits[s].lower for s in ('left', 'right')],
+            [limits[s].upper for s in ('left', 'right')],
+            [[min(v, .25) for v in limits[s].max_velocity] for s in ('left', 'right')],
+            [[min(a, .20) for a in limits[s].max_acceleration] for s in ('left', 'right')],
+            max_jerk=planning_jerk)
+        measured['boundary_blend'] = {'policy': 'circle_local_v1', 'windows': windows}
+        measured['smoothing_metadata_scope'] = 'baseline_before_local_boundary_blend'
+        measured['spatial_blocks_scope'] = 'retimed_baseline_before_local_boundary_blend'
+        measured['stop_indices'] = list(plan.stops)
+        measured['unchanged_phase_policy'] = 'preserve_all_segments_outside_blend_windows'
+        measured['max_sample_position_change_rad'] = {
+            s: float(np.max(abs(plan.positions[s] - positions[s]))) for s in positions}
+        measured['jerk_metrics'] = trajectory_jerk_metrics(plan)
+        # 先前的普通节点jerk报告不适用于已移除停车点的局部融合，避免沿用旧数值。
+        measured.pop('smoothing_jerk_jump_after_rad_s3', None)
+    if arc_smooth:
+        if planning_jerk is None:
+            raise ValueError('圆弧平滑缺少明确规划jerk限值')
+        fraction = .8 * execution_hz / 500.
+        plan, details = smooth_circle_interior(
+            plan, stages, {s: np.asarray(q) for s, q in positions.items()},
+            [limits[s].lower for s in ('left', 'right')],
+            [limits[s].upper for s in ('left', 'right')],
+            [[v * fraction for v in limits[s].max_velocity] for s in ('left', 'right')],
+            [limits[s].max_acceleration for s in ('left', 'right')], max_jerk=planning_jerk)
+        measured['arc_smoothing'] = details
+        measured['unchanged_phase_policy'] = 'preserve_both_blend_windows_and_all_transit_segments'
+        measured['max_sample_position_change_rad'] = {
+            s: float(np.max(abs(plan.positions[s] - positions[s]))) for s in positions}
+    if transit_timing:
+        from archer_control.transit_timing import optimize_transit_timing
+
+        if planning_jerk is None:
+            raise ValueError('接近归位时间优化需要明确的规划jerk限制')
+        plan, details = optimize_transit_timing(
+            plan, stages, [limits[s].lower for s in ('left', 'right')],
+            [limits[s].upper for s in ('left', 'right')],
+            [[min(v, .38) for v in limits[s].max_velocity] for s in ('left', 'right')],
+            [[min(a, .25) for a in limits[s].max_acceleration] for s in ('left', 'right')],
+            max_jerk=planning_jerk, source={s: np.asarray(q) for s, q in positions.items()})
+        measured.update(
+            transit_timing=details, duration_s=float(plan.times[-1]),
+            effective_time_scale=float(plan.times[-1] / (source_times[-1] / 1e9)),
+            prepared_times_ns=[int(round(float(t) * 1e9)) for t in plan.times],
+            unchanged_phase_policy='preserve_arc_and_both_blend_windows',
+            spatial_blocks_scope='baseline_before_transit_time_warp',
+            max_sample_position_change_rad={
+                s: float(np.max(abs(plan.positions[s] - positions[s]))) for s in positions})
+    if transit_profile:
+        # 多个离线处理串联时只汇总最终曲线，避免反复解析已经被后处理替换的中间段。
+        measured['jerk_metrics'] = trajectory_jerk_metrics(plan)
+        measured['arms'] = {
+            s: {field: np.max(np.array([
+                np.max(abs(_extrema(c, float(h), order)), axis=1)
+                for c, h in zip(plan.polynomials[s], np.diff(plan.times))]), axis=0).tolist()
+                for field, order in (('peak_velocity_rad_s', 1), ('peak_acceleration_rad_s2', 2))}
+            for s in ('left', 'right')}
     payload = plan.payload()
     prepared_ns = tuple(p['time_from_start']['sec'] * 10 ** 9
                         + p['time_from_start']['nanosec'] for p in payload['left']['points'])

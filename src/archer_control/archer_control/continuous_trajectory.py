@@ -563,7 +563,7 @@ def smooth_recorded_pair(
     max_jerk: float | None = None,
     max_shape_change: float | None = None,
 ) -> tuple[ContinuousPair, dict[str, Any]]:
-    """离线用五次样条重算节点导数，保留位置和停点；执行器不依赖SciPy。"""
+    """离线用五次样条重算节点导数，保留位置和停点；执行器不依赖SciPy."""
     try:
         from scipy.interpolate import make_interp_spline
     except (ImportError, ValueError) as error:
@@ -592,7 +592,7 @@ def smooth_recorded_pair(
             for j in (int(i), int(i) + 1)}) for side in ('left', 'right')}
 
     def jerk_jump(polys: FloatArray, times: FloatArray, boundaries: list[int]) -> float:
-        """比较普通节点两侧三阶时间导数；阶段停止允许重新起步。"""
+        """比较普通节点两侧三阶时间导数；阶段停止允许重新起步."""
         gaps = np.diff(times)
         end = (6. * polys[:-1, :, 3] + 24. * polys[:-1, :, 4]
                + 60. * polys[:-1, :, 5]) / gaps[:-1, None] ** 3
@@ -679,8 +679,352 @@ def smooth_recorded_pair(
                           polynomials, tuple(stops)), report
 
 
+def replace_transit_blocks(
+    baseline: ContinuousPair, transit: ContinuousPair, stages: dict[str, list[str]],
+) -> tuple[ContinuousPair, list[dict[str, Any]]]:
+    """只替换标签一致的接近归位停车区间，圆弧及跨阶段桥接逐段保留."""
+    count = len(baseline.times)
+    if (baseline.stops != transit.stops or len(transit.times) != count
+            or set(stages) != {'left', 'right'}
+            or any(len(stages[s]) != count or not np.array_equal(
+                baseline.positions[s], transit.positions[s]) for s in stages)):
+        raise ValueError('阶段替换需要相同停车索引、节点位置和完整双臂标签')
+    base_ns = np.rint(baseline.times * 1e9).astype(np.int64)
+    next_ns = np.rint(transit.times * 1e9).astype(np.int64)
+    gaps = np.diff(base_ns)
+    velocities = {s: x.copy() for s, x in baseline.velocities.items()}
+    accelerations = {s: x.copy() for s, x in baseline.accelerations.items()}
+    polynomials = {s: x.copy() for s, x in baseline.polynomials.items()}
+    selected = []
+    for first, last in zip(baseline.stops, baseline.stops[1:]):
+        labels = {label for s in stages for label in stages[s][first:last + 1]}
+        if len(labels) != 1 or not labels <= {'APPROACH', 'RETURN_HOME'}:
+            continue
+        for plan in (baseline, transit):
+            if any(np.any(plan.velocities[s][[first, last]])
+                   or np.any(plan.accelerations[s][[first, last]]) for s in stages):
+                raise ValueError('接近归位替换必须在零速零加速度边界拼接')
+        if next_ns[last] - next_ns[first] >= base_ns[last] - base_ns[first]:
+            continue
+        shape_change = {s: max(float(np.max(abs(_extrema(a - b, 1., 0))))
+                               for a, b in zip(transit.polynomials[s][first:last],
+                                               baseline.polynomials[s][first:last]))
+                        for s in stages}
+        if any(value > .00005 for value in shape_change.values()):
+            raise ValueError('接近归位的段内形状变化超过0.00005rad，保留旧候选')
+        gaps[first:last] = np.diff(next_ns[first:last + 1])
+        for s in stages:
+            velocities[s][first:last + 1] = transit.velocities[s][first:last + 1]
+            accelerations[s][first:last + 1] = transit.accelerations[s][first:last + 1]
+            polynomials[s][first:last] = transit.polynomials[s][first:last]
+        selected.append({'stage': next(iter(labels)), 'first': first, 'last': last,
+                         'before_s': (base_ns[last] - base_ns[first]) / 1e9,
+                         'after_s': (next_ns[last] - next_ns[first]) / 1e9,
+                         'max_segment_change_rad': shape_change})
+    if not selected or np.any(gaps <= 0):
+        raise ValueError('没有可改善的完整接近归位区间，保留旧候选')
+    times = np.r_[0, np.cumsum(gaps)] / 1e9
+    for array in (times, *velocities.values(), *accelerations.values(), *polynomials.values()):
+        array.setflags(write=False)
+    return ContinuousPair(times, baseline.positions, velocities, accelerations,
+                          polynomials, baseline.stops), selected
+
+
+def circle_blend_windows(
+    times: ArrayLike, stages: dict[str, list[str]], stops: tuple[int, ...],
+) -> list[dict[str, Any]]:
+    """仅定位画圆入口、出口；不把抓取动作或任何额外停车当作可融合边界."""
+    t = np.asarray(times, dtype=float)
+    if (t.ndim != 1 or len(t) < 4 or not np.all(np.isfinite(t))
+            or np.any(np.diff(t) <= 0.) or set(stages) != {'left', 'right'}
+            or stages['left'] != stages['right'] or len(stages['left']) != len(t)):
+        raise ValueError('画圆融合需要完整一致的双臂阶段和递增时间轴')
+    labels = stages['left']
+    transitions = [i for i in range(1, len(t)) if labels[i] != labels[i - 1]]
+    if [(labels[i - 1], labels[i]) for i in transitions] != [
+        ('APPROACH', 'ARC'), ('ARC', 'RETURN_HOME')
+    ]:
+        raise ValueError('局部融合仅支持接近、完整圆弧、归位的三阶段画圆记录')
+    result = []
+    for i, width, floor in zip(transitions, (.8, .3), (False, True)):
+        first = int(np.searchsorted(t, t[i - 1] - width, side='right' if floor else 'left'))
+        first -= int(floor)
+        last = int(np.searchsorted(t, t[i] + width))
+        if (first <= 0 or last >= len(t) - 1 or not first < i - 1 < i < last
+                or last - first < 3 or t[last] - t[first] > 3.
+                or {s for s in stops if first < s < last} != {i - 1, i}):
+            raise ValueError('画圆衔接窗口不足、过长或包含其他停车点，保留原候选')
+        result.append(dict(transition=i, first=first, last=last,
+                           stages=[labels[i - 1], labels[i]], removed_stops=[i - 1, i]))
+    if result[0]['last'] >= result[1]['first']:
+        raise ValueError('两个融合窗口不得重叠或覆盖整个圆弧')
+    return result
+
+
+def blend_circle_boundaries(
+    plan: ContinuousPair, stages: dict[str, list[str]], source: dict[str, FloatArray],
+    lower: ArrayLike, upper: ArrayLike, max_velocity: ArrayLike,
+    max_acceleration: ArrayLike, *, max_jerk: float,
+) -> tuple[ContinuousPair, list[dict[str, Any]]]:
+    """有界局部七次引导与五次重构；两臂共时钟，窗口外逐段保留，不缩短时间."""
+    from scipy.interpolate import make_interp_spline
+
+    windows = circle_blend_windows(plan.times, stages, plan.stops)
+    bounds = [np.asarray(x, dtype=float) for x in
+              (lower, upper, max_velocity, max_acceleration)]
+    if (any(x.shape != (2, 6) or not np.all(np.isfinite(x)) for x in bounds)
+            or np.any(bounds[0] >= bounds[1]) or np.any(bounds[2] <= 0.)
+            or np.any(bounds[3] <= 0.) or isinstance(max_jerk, bool)
+            or not math.isfinite(max_jerk) or max_jerk <= 0.
+            or set(source) != {'left', 'right'}
+            or any(np.asarray(source[s]).shape != plan.positions[s].shape
+                   or not np.all(np.isfinite(source[s])) for s in source)):
+        raise ValueError('局部融合需要有效双臂原始采样与位置、速度、加速度、jerk限值')
+    q = {s: a.copy() for s, a in plan.positions.items()}
+    v = {s: a.copy() for s, a in plan.velocities.items()}
+    a = {s: x.copy() for s, x in plan.accelerations.items()}
+    polys = {s: x.copy() for s, x in plan.polynomials.items()}
+    matrix = np.array([[1, 1, 1, 1], [4, 5, 6, 7],
+                       [12, 20, 30, 42], [24, 60, 120, 210]], dtype=float)
+
+    def jerk(c: FloatArray, h: float, end: bool) -> FloatArray:
+        return (6. * c[:, 3] + (24. * c[:, 4] + 60. * c[:, 5] if end else 0.)) / h**3
+
+    reports = []
+    for window in windows:
+        first, last, i = (window[k] for k in ('first', 'last', 'transition'))
+        if any(all(np.array_equal(source[s][k], source[s][k + 1]) for s in source)
+               for k in range(first, last)):
+            raise ValueError('实际保持区间不得融合或删除停车点')
+        x = plan.times[first:last + 1] - plan.times[first]
+        h, duration = np.diff(x), float(x[-1])
+        proposals = {}
+        for s in source:
+            if (np.any(v[s][[i - 1, i]]) or np.any(a[s][[i - 1, i]])):
+                raise ValueError('只允许从原零速、零加速度阶段边界构造融合')
+            j0 = jerk(polys[s][first], float(h[0]), False)
+            j1 = jerk(polys[s][last - 1], float(h[-1]), True)
+            c = np.zeros((8, 6))
+            c[:4] = [q[s][first], v[s][first] * duration,
+                     a[s][first] * duration**2 / 2., j0 * duration**3 / 6.]
+            rhs = np.array([
+                q[s][last] - c[:4].sum(axis=0),
+                v[s][last] * duration - c[1] - 2. * c[2] - 3. * c[3],
+                a[s][last] * duration**2 - 2. * c[2] - 6. * c[3],
+                j1 * duration**3 - 6. * c[3]])
+            c[4:] = np.linalg.solve(matrix, rhs)
+            target = np.polynomial.polynomial.polyval(x / duration, c).T
+            target[[0, -1]] = q[s][[first, last]]
+            spline = make_interp_spline(
+                x, target, k=5,
+                bc_type=([(1, v[s][first]), (2, a[s][first])],
+                         [(1, v[s][last]), (2, a[s][last])]))
+            nv, na = spline(x, 1), spline(x, 2)
+            nv[[0, -1]], na[[0, -1]] = v[s][[first, last]], a[s][[first, last]]
+            proposals[s] = target, nv, na
+        accepted = None
+        # 局部折衷强度同用于左右臂；不足以符合原路径误差上限时拒绝，不扩大容差。
+        for strength in (1., .8, .6, .4, .2):
+            candidate, measured = {}, {}
+            valid = True
+            for axis, s in enumerate(('left', 'right')):
+                old = (q[s][first:last + 1], v[s][first:last + 1], a[s][first:last + 1])
+                nq, nv, na = [b + strength * (p - b) for b, p in zip(old, proposals[s])]
+                nc = np.array([coefficients(nq[k], nq[k + 1], nv[k], nv[k + 1],
+                                            na[k], na[k + 1], float(g))
+                               for k, g in enumerate(h)])
+                deviation = float(np.max(abs(nq - source[s][first:last + 1])))
+                change = max(float(np.max(abs(_extrema(c - b, 1., 0))))
+                             for c, b in zip(nc, polys[s][first:last]))
+                peaks = [np.stack([_extrema(c, float(g), order) for c, g in zip(nc, h)])
+                         for order in (0, 1, 2, 3)]
+                jumps = []
+                for pc in (polys[s][first:last], nc):
+                    starts = np.array([jerk(c, float(g), False) for c, g in zip(pc, h)])
+                    ends = np.array([jerk(c, float(g), True) for c, g in zip(pc, h)])
+                    outer0 = jerk(polys[s][first - 1],
+                                  float(plan.times[first] - plan.times[first - 1]), True)
+                    outer1 = jerk(polys[s][last],
+                                  float(plan.times[last + 1] - plan.times[last]), False)
+                    jumps.append(float(np.max(abs(np.vstack((starts[0] - outer0,
+                                                             starts[1:] - ends[:-1],
+                                                             outer1 - ends[-1]))))))
+                valid &= (deviation <= .0005 and change <= .0005
+                          and np.all(peaks[0] >= bounds[0][axis, :, None])
+                          and np.all(peaks[0] <= bounds[1][axis, :, None])
+                          and np.all(abs(peaks[1]) <= bounds[2][axis, :, None])
+                          and np.all(abs(peaks[2]) <= bounds[3][axis, :, None])
+                          and np.all(abs(peaks[3]) <= max_jerk)
+                          and jumps[1] < jumps[0])
+                candidate[s] = nq, nv, na, nc
+                measured[s] = dict(max_sample_change_rad=deviation,
+                                   max_segment_change_rad=change,
+                                   jerk_jump_before_after_rad_s3=jumps)
+            if valid:
+                accepted = candidate
+                reports.append({**window, 'strength': strength,
+                                'duration_s': duration, 'arms': measured})
+                break
+        if accepted is None:
+            raise ValueError('局部衔接无法满足原路径与导数约束，保留成功候选')
+        for s, (nq, nv, na, nc) in accepted.items():
+            q[s][first:last + 1], v[s][first:last + 1] = nq, nv
+            a[s][first:last + 1], polys[s][first:last] = na, nc
+    removed = {i for r in reports for i in r['removed_stops']}
+    for array in (*q.values(), *v.values(), *a.values(), *polys.values()):
+        array.setflags(write=False)
+    return ContinuousPair(plan.times, q, v, a, polys,
+                          tuple(i for i in plan.stops if i not in removed)), reports
+
+
+def _roughness(polys: FloatArray, gaps: FloatArray) -> dict[str, float]:
+    """对五次执行段精确积分jerk与snap平方，避免以拟合器曲线代替最终执行曲线."""
+    aa = 6. * polys[:, :, 3] / gaps[:, None]**3
+    bb = 24. * polys[:, :, 4] / gaps[:, None]**3
+    cc = 60. * polys[:, :, 5] / gaps[:, None]**3
+    vertex = np.divide(-bb, 2. * cc, out=np.zeros_like(bb), where=cc != 0.)
+    middle = np.where((vertex > 0.) & (vertex < 1.), aa + vertex * (bb + vertex * cc), 0.)
+    z, w = np.polynomial.legendre.leggauss(3)
+    z, w = (z + 1.) / 2., w / 2.
+    jerk_energy = np.sum(gaps[:, None] * sum(
+        weight * (aa + bb * u + cc * u**2)**2 for u, weight in zip(z, w)))
+    snap_energy = np.sum(gaps[:, None] * sum(
+        weight * ((bb + 2. * cc * u) / gaps[:, None])**2 for u, weight in zip(z, w)))
+    return dict(
+        jerk_peak_rad_s3=float(np.max(abs(np.stack((aa, aa + bb + cc, middle))))),
+        jerk_energy_rad2_s5=float(jerk_energy), snap_energy_rad2_s7=float(snap_energy),
+        snap_peak_rad_s4=float(np.max(abs(np.stack((bb, bb + 2. * cc)) / gaps[None, :, None]))),
+        internal_jerk_jump_rad_s3=float(np.max(abs(aa[1:] - (aa + bb + cc)[:-1]))))
+
+
+def smooth_circle_interior(
+    plan: ContinuousPair, stages: dict[str, list[str]], source: dict[str, FloatArray],
+    lower: ArrayLike, upper: ArrayLike, max_velocity: ArrayLike,
+    max_acceleration: ArrayLike, *, max_jerk: float,
+) -> tuple[ContinuousPair, dict[str, Any]]:
+    """圆弧内部做端点q/v/a/j约束的最小jerk拟合；保留两处成功衔接及原时间轴."""
+    try:
+        from scipy.interpolate import BSpline
+        from scipy.linalg import null_space
+    except (ImportError, ValueError) as error:
+        raise ValueError('圆弧内部平滑需要兼容的SciPy转换环境') from error
+    bounds = [np.asarray(x, dtype=float) for x in
+              (lower, upper, max_velocity, max_acceleration)]
+    if (any(x.shape != (2, 6) or not np.all(np.isfinite(x)) for x in bounds)
+            or np.any(bounds[0] >= bounds[1]) or np.any(bounds[2] <= 0.)
+            or np.any(bounds[3] <= 0.) or isinstance(max_jerk, bool)
+            or not math.isfinite(max_jerk) or max_jerk <= 0.
+            or plan.stops != (0, len(plan.times) - 1)
+            or set(source) != {'left', 'right'}
+            or any(np.asarray(source[s]).shape != plan.positions[s].shape
+                   or not np.all(np.isfinite(source[s])) for s in source)):
+        raise ValueError('圆弧平滑需要有效约束、原始采样和已经融合的画圆轨迹')
+    required = {0, len(plan.times) - 1}
+    for labels in stages.values():
+        required.update(k for i in range(1, len(labels)) if labels[i] != labels[i - 1]
+                        for k in (i - 1, i))
+    windows = circle_blend_windows(plan.times, stages, tuple(sorted(required)))
+    first, last = windows[0]['last'], windows[1]['first']
+    if last - first < 40 or any(
+        all(np.array_equal(source[s][k], source[s][k + 1]) for s in source)
+        for k in range(first, last)
+    ):
+        raise ValueError('圆弧内部样本不足或含保持区间，不生成平滑候选')
+    gaps = np.diff(plan.times[first:last + 1])
+    duration = float(plan.times[last] - plan.times[first])
+    u = (plan.times[first:last + 1] - plan.times[first]) / duration
+    values = [np.concatenate([field[s][first:last + 1] for s in ('left', 'right')], axis=1)
+              for field in (plan.positions, plan.velocities, plan.accelerations)]
+    q, v, a = values
+    original = np.concatenate([source[s][first:last + 1] for s in ('left', 'right')], axis=1)
+    old = np.concatenate([plan.polynomials[s][first:last] for s in ('left', 'right')], axis=1)
+    before = _roughness(old, gaps)
+    j0 = 6. * old[0, :, 3] / gaps[0]**3
+    j1 = (6. * old[-1, :, 3] + 24. * old[-1, :, 4] + 60. * old[-1, :, 5]) / gaps[-1]**3
+    boundary = np.array([q[0], v[0] * duration, a[0] * duration**2, j0 * duration**3,
+                         q[-1], v[-1] * duration, a[-1] * duration**2, j1 * duration**3])
+    weights = np.r_[np.diff(u)[0], np.diff(u)[:-1] + np.diff(u)[1:], np.diff(u)[-1]] / 2.
+    target = q * np.sqrt(weights[:, None])
+    for controls in (32, 48, 64):
+        if controls > len(q):
+            continue
+        knots = np.r_[np.zeros(6), np.linspace(0., 1., controls - 4)[1:-1], np.ones(6)]
+        basis = BSpline(knots, np.eye(controls), 5)
+        constraint = np.array([basis(x, order) for x in (0., 1.) for order in range(4)])
+        norm = np.linalg.norm(constraint, axis=1)
+        fixed = constraint / norm[:, None]
+        c0 = np.linalg.lstsq(fixed, boundary / norm[:, None], rcond=None)[0]
+        free = null_space(fixed)
+        spans = np.unique(knots)
+        lo, hi = spans[:-1], spans[1:]
+        z, w = np.polynomial.legendre.leggauss(3)
+        grid = ((lo[:, None] + hi[:, None]) / 2. + (hi - lo)[:, None] * z / 2.).ravel()
+        quadrature = ((hi - lo)[:, None] * w / 2.).ravel()
+        fit = basis(u) * np.sqrt(weights[:, None])
+        rough = basis(grid, 3) * np.sqrt(quadrature[:, None])
+        # 归一化时间上的正则项；求解完整12轴，不独立更改双臂进度或删除节点。
+        penalty = 1e-12
+        design = np.vstack((fit, math.sqrt(penalty) * rough))
+        rhs = np.vstack((target, np.zeros((len(grid), 12))))
+        c = c0 + free @ np.linalg.lstsq(design @ free, rhs - design @ c0, rcond=None)[0]
+        spline = BSpline(knots, c, 5)
+        nq, nv, na = spline(u), spline(u, 1) / duration, spline(u, 2) / duration**2
+        nq[[0, -1]], nv[[0, -1]], na[[0, -1]] = q[[0, -1]], v[[0, -1]], a[[0, -1]]
+        if float(np.max(abs(nq - original))) > .0005:
+            continue
+        candidate, arms, valid = {}, {}, True
+        for axis, s in enumerate(('left', 'right')):
+            section = slice(axis * 6, (axis + 1) * 6)
+            pc = np.stack([coefficients(nq[k, section], nq[k + 1, section],
+                                        nv[k, section], nv[k + 1, section],
+                                        na[k, section], na[k + 1, section], float(h))
+                           for k, h in enumerate(gaps)])
+            change = max(float(np.max(abs(_extrema(c - b, 1., 0))))
+                         for c, b in zip(pc, plan.polynomials[s][first:last]))
+            extrema = [np.stack([_extrema(c, float(h), order) for c, h in zip(pc, gaps)])
+                       for order in (0, 1, 2, 3)]
+            valid &= (change <= .0001 and np.all(extrema[0] >= bounds[0][axis, :, None])
+                      and np.all(extrema[0] <= bounds[1][axis, :, None])
+                      and np.all(abs(extrema[1]) <= bounds[2][axis, :, None])
+                      and np.all(abs(extrema[2]) <= bounds[3][axis, :, None])
+                      and np.all(abs(extrema[3]) <= max_jerk))
+            candidate[s] = pc
+            arms[s] = dict(max_segment_change_rad=change,
+                           max_sample_change_rad=float(np.max(abs(nq[:, section]
+                                                                  - original[:, section]))))
+        pc = np.concatenate([candidate[s] for s in ('left', 'right')], axis=1)
+        after = _roughness(pc, gaps)
+        edge_error = max(float(np.max(abs(6. * pc[0, :, 3] / gaps[0]**3 - j0))), float(
+            np.max(abs((6. * pc[-1, :, 3] + 24. * pc[-1, :, 4] + 60. * pc[-1, :, 5])
+                       / gaps[-1]**3 - j1))))
+        valid &= (after['jerk_energy_rad2_s5'] < .995 * before['jerk_energy_rad2_s5']
+                  and after['snap_energy_rad2_s7'] < .95 * before['snap_energy_rad2_s7']
+                  and after['jerk_peak_rad_s3'] <= 1.05 * before['jerk_peak_rad_s3'] + 1e-8
+                  and after['internal_jerk_jump_rad_s3'] <= max(
+                      1e-5, 1.05 * before['internal_jerk_jump_rad_s3']) and edge_error <= 1e-5)
+        if not valid:
+            continue
+        fields = [{s: array.copy() for s, array in field.items()} for field in
+                  (plan.positions, plan.velocities, plan.accelerations, plan.polynomials)]
+        for axis, s in enumerate(('left', 'right')):
+            section = slice(axis * 6, (axis + 1) * 6)
+            for field, new in zip(fields[:3], (nq, nv, na)):
+                field[s][first:last + 1] = new[:, section]
+            fields[3][s][first:last] = candidate[s]
+        for field in fields:
+            for array in field.values():
+                array.setflags(write=False)
+        return ContinuousPair(plan.times, *fields, plan.stops), dict(
+            policy='bounded_minimum_jerk_bspline', first=first, last=last,
+            controls=controls, penalty=penalty, time_axis_preserved=True,
+            boundary_qva_preserved=True, edge_jerk_change_rad_s3=edge_error,
+            source_node_limit_rad=.0005, segment_change_limit_rad=.0001,
+            arms=arms, before=before, after=after)
+    raise ValueError('圆弧平滑未同时改善曲线起伏并满足原路径和导数约束，保留成功候选')
+
+
 def _path_progress(u: FloatArray, ramp_fraction: float | None) -> tuple[FloatArray, ...]:
-    """共同标量进度；可选五次速度起落加匀速段，不分别定时左右臂。"""
+    """共同标量进度；可选五次速度起落加匀速段，不分别定时左右臂."""
     if ramp_fraction is None:
         return (u**3 * (10. + u * (-15. + 6. * u)),
                 30. * u**2 * (1. - u)**2, 60. * u * (1. - u) * (1. - 2. * u))
@@ -698,7 +1042,7 @@ def _path_progress(u: FloatArray, ramp_fraction: float | None) -> tuple[FloatArr
 
 
 def trajectory_jerk_metrics(plan: ContinuousPair) -> dict[str, dict[str, list[float]]]:
-    """解析计算最终五次段的加加速度峰值和连接跳变，不作为厂商允许值。"""
+    """解析计算最终五次段的加加速度峰值和连接跳变，不作为厂商允许值."""
     result = {}
     for side, polynomials in plan.polynomials.items():
         peak = np.zeros(6)
@@ -724,7 +1068,7 @@ def retime_spatial_pair(
     ramp_fraction: float | None = None,
     max_jerk: float | None = None,
 ) -> tuple[ContinuousPair, dict[str, Any]]:
-    """按共同关节弧长拟合有界路径，再分阶段定时；不连接设备或改写源记录。"""
+    """按共同关节弧长拟合有界路径，再分阶段定时；不连接设备或改写源记录."""
     try:
         from scipy.interpolate import BSpline
     except (ImportError, ValueError) as error:

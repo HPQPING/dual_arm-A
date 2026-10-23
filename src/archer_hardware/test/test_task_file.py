@@ -86,8 +86,16 @@ class TaskFileTests(unittest.TestCase):
             self.assertIs(result[name], False)
         self.assertEqual(before, {p.name: p.read_bytes() for p in self.root.iterdir()})
 
+    def test_circle_blend_metadata_cannot_bypass_grasp_stops(self) -> None:
+        """抓取记录不能伪造画圆融合声明来删除必要停车."""
+        report = self.read('prepared_path_report.json')
+        report['boundary_blend'] = {'policy': 'circle_local_v1', 'windows': []}
+        self.write('prepared_path_report.json', report)
+        with self.assertRaisesRegex(ValueError, '仅支持'):
+            self.review()
+
     def test_spatial_mode_is_explicit_and_bounds_verified(self) -> None:
-        """空间模式成功仍不授予执行许可，误差声明超出硬上限则拒绝。"""
+        """空间模式成功仍不授予执行许可，误差声明超出硬上限则拒绝."""
         try:
             from scipy.interpolate import BSpline
             self.assertTrue(callable(BSpline))
@@ -106,7 +114,7 @@ class TaskFileTests(unittest.TestCase):
             self.review()
 
     def test_spatial_metadata_cannot_hide_boundary_changes(self) -> None:
-        """即使伪造空间模式声明，阶段边界仍必须保留原采样。"""
+        """即使伪造空间模式声明，阶段边界仍必须保留原采样."""
         report = self.read('prepared_path_report.json')
         report.update(position_filter='bounded_spatial_spline',
                       position_smoothing_tolerance_rad=.0005,
@@ -419,7 +427,7 @@ class TaskFileTests(unittest.TestCase):
                 self.assertEqual(expected.tobytes(), actual.tobytes())
 
     def test_core_precheck_reuses_snapshot_but_uses_latest_start(self) -> None:
-        """主体先检查；之后不重读文件，但接近与归位使用新的实测起点。"""
+        """主体先检查；之后不重读文件，但接近与归位使用新的实测起点."""
         from archer_hardware.position_node import prepare_file_core_message
         from archer_hardware.task_file import read_snapshot
         from archer_hardware.task_geometry import trajectory_fingerprint

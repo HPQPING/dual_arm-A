@@ -30,11 +30,20 @@ class OperatorResultTests(unittest.TestCase):
 
     def test_plan_review_dispatch_never_initializes_ros(self) -> None:
         """离线子命令转交现有联调模块，不创建操作客户端或连接."""
-        with patch('archer_hardware.commissioning.plan_check_main', return_value=0) as review:
+        with patch('archer_hardware.task_file.main', return_value=0) as review:
             with patch('rclpy.init') as initialize:
-                self.assertEqual(main(['plan-check', '--help']), 0)
+                self.assertEqual(main(['task-review', '--help']), 0)
             review.assert_called_once_with(['--help'])
             initialize.assert_not_called()
+
+    def test_retired_plan_commands_fail_before_ros(self) -> None:
+        """旧工具命令不再开放，拒绝时不能建立ROS或设备连接."""
+        for command in ('plan-check', 'plan-retime'):
+            with self.subTest(command=command), patch('rclpy.init') as initialize:
+                with self.assertRaises(SystemExit) as error:
+                    main([command])
+                self.assertEqual(error.exception.code, 2)
+                initialize.assert_not_called()
 
     def test_commissioning_subcommands_do_not_start_operator(self) -> None:
         """集中入口转发原有工具，不自动启动控制客户端或 ROS 上下文."""

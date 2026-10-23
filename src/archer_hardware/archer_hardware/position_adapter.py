@@ -109,7 +109,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
                             super()._start_device_periodic_task(device_id)
 
             def _project_start_control_periodic(self) -> None:
-                """显式准备后才启动官方控制周期；接收反馈不依赖此周期。"""
+                """显式准备后才启动官方控制周期；接收反馈不依赖此周期."""
                 with owner._control_period_lock:
                     if owner.state != 'REQUESTING':
                         raise RuntimeError('只有显式准备控制时才能启动SDK控制周期')
@@ -308,7 +308,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
         return event
 
     def _stream_position_sample(self) -> tuple[float, ...] | None:
-        """完整文件在SDK构包时按共同时钟采样，同时复核实际反馈误差。"""
+        """完整文件在SDK构包时按共同时钟采样，同时复核实际反馈误差."""
         move, gate, side = self._move, self._trajectory_gate, self._trajectory_side
         if (self.state != 'RUNNING' or not isinstance(move, ContinuousPositionTrajectory)
                 or not move.preserve_path or gate is None or side is None
@@ -614,23 +614,8 @@ class HexPositionAdapter(HexFeedbackAdapter):
                 assert self._trajectory_gate is not None and self._trajectory_side is not None
                 acknowledged = (self._delivery_generation if self._delivery_event is not None
                                 and self._delivery_event.is_set() else None)
-                tracking_ratio = None
-                if self._trajectory_gate.following_feedback:
-                    move = self._move
-                    if (not isinstance(move, ContinuousPositionTrajectory)
-                            or not move.joint_error_rad):
-                        raise RuntimeError('实际跟踪门控需要已检完整路径误差界限')
-
-                    def ratio_at(reference: float) -> float:
-                        # 锁内取得共用参考时间，避免另一臂推进后仍用上一代目标作比较。
-                        target = move.sample(reference)
-                        tolerance = min(move.tracking_error_at(reference), self.tracking_tolerance)
-                        return max(abs(a - b) for a, b in zip(frame.positions, target)) / tolerance
-
-                    tracking_ratio = ratio_at
-
                 elapsed, playback_generation, terminal_age = self._trajectory_gate.playback(
-                    self._trajectory_side, acknowledged, tracking_ratio=tracking_ratio)
+                    self._trajectory_side, acknowledged)
             self._target = self._move.sample(elapsed)
             tracking_elapsed = elapsed
             if elapsed >= self._move.duration and terminal_age is not None:

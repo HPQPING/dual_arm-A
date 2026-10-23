@@ -77,7 +77,7 @@ class SdkPositionTests(unittest.TestCase):
                             for p in targets))
 
     def test_actual_send_gap_uses_elapsed_time_without_raising_speed_limit(self) -> None:
-        """12ms发送间隔允许正常路径位移，但超出原速度上限仍拒绝。"""
+        """12ms发送间隔允许正常路径位移，但超出原速度上限仍拒绝."""
         self.left._project_position_timing = lambda: ((0.,) * 6, .012)
         self.assertEqual(self.left.validate_joint_positions([.001] * 6, .004), [.001] * 6)
         with self.assertRaisesRegex(ValueError, '裁剪'):
@@ -85,14 +85,14 @@ class SdkPositionTests(unittest.TestCase):
         self.assertEqual(self.left.get_last_positions(), [0.] * 6)
 
     def test_actual_sent_origin_overrides_unsent_encoding_history(self) -> None:
-        """未实际发送的编码结果不能成为下一包限速的起点。"""
+        """未实际发送的编码结果不能成为下一包限速的起点."""
         self.left.validate_joint_positions([.0001] * 6, .004)
         self.left._project_position_timing = lambda: ((0.,) * 6, .004)
         with self.assertRaisesRegex(ValueError, '裁剪'):
             self.left.validate_joint_positions([.00045] * 6, .004)
 
     def test_actual_send_gap_cannot_disable_timeout(self) -> None:
-        """长时间失联不能通过扩大dt继续发送位置指令。"""
+        """长时间失联不能通过扩大dt继续发送位置指令."""
         for gap in (.041, -1., float('nan'), True):
             self.left._project_position_timing = lambda gap=gap: ((0.,) * 6, gap)
             with self.subTest(gap=gap), self.assertRaisesRegex(RuntimeError, '40ms|时钟'):

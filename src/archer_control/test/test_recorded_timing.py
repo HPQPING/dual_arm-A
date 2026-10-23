@@ -361,6 +361,29 @@ class SpatialRecordedTimingTests(unittest.TestCase):
                 smooth_recorded_pair(original, self.low, self.high, self.speed, self.accel,
                                      **options)
 
+    def test_transit_replacement_keeps_arc_exactly(self):
+        """只缩短接近停车区间，圆弧系数、节点导数及每段纳秒时长完全保留。"""
+        from dataclasses import replace
+        from archer_control.continuous_trajectory import replace_transit_blocks
+
+        baseline, _ = self.prepare(ramp_fraction=.25, max_jerk=2.)
+        transit = replace(baseline, times=baseline.times * .8,
+                          velocities={s: v / .8 for s, v in baseline.velocities.items()},
+                          accelerations={s: a / .8**2 for s, a in baseline.accelerations.items()})
+        labels = {s: ['APPROACH'] * 41 + ['ARC'] * 39 for s in ('left', 'right')}
+        result, blocks = replace_transit_blocks(baseline, transit, labels)
+        self.assertEqual([b['stage'] for b in blocks], ['APPROACH'])
+        for s in labels:
+            np.testing.assert_array_equal(result.positions[s], baseline.positions[s])
+            np.testing.assert_array_equal(result.velocities[s][40:], baseline.velocities[s][40:])
+            np.testing.assert_array_equal(result.polynomials[s][40:], baseline.polynomials[s][40:])
+        np.testing.assert_array_equal(np.diff(np.rint(result.times[40:] * 1e9)),
+                                      np.diff(np.rint(baseline.times[40:] * 1e9)))
+        with self.assertRaisesRegex(ValueError, '没有可改善'):
+            replace_transit_blocks(baseline, baseline, labels)
+        with self.assertRaises(ValueError):
+            replace_transit_blocks(baseline, transit, {'left': labels['left']})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -257,20 +257,17 @@ def main(args: list[str] | None = None) -> int:
         from .csv_import import main as csv_import_main
         return csv_import_main(arguments[1:])
     # 联调工具只在显式选择时载入；不创建操作客户端或控制服务请求。
-    if arguments and arguments[0] in ('audit', 'trial', 'plan-check', 'plan-retime'):
-        from .commissioning import audit_main, plan_check_main, plan_retime_main, trial_main
-        entry = {'audit': audit_main, 'trial': trial_main, 'plan-check': plan_check_main,
-                 'plan-retime': plan_retime_main}[
-            arguments[0]
-        ]
+    if arguments and arguments[0] in ('audit', 'trial'):
+        from .commissioning import audit_main, trial_main
+        entry = {'audit': audit_main, 'trial': trial_main}[arguments[0]]
         return entry(arguments[1:])
     parser = argparse.ArgumentParser(
         description='统一硬件操作；默认 status，不自动连接或使能',
-        epilog='离线计划检查：hardware_operator plan-check --help；另有audit/trial子命令',
+        epilog='离线轨迹核对：hardware_operator task-review --help；另有audit/trial子命令',
     )
     parser.add_argument(
         'command', choices=COMMANDS + (
-            'audit', 'trial', 'plan-check', 'plan-retime', 'csv-import', 'task-review',
+            'audit', 'trial', 'csv-import', 'task-review',
         ),
         nargs='?', default='status',
     )
@@ -284,9 +281,9 @@ def main(args: list[str] | None = None) -> int:
     if options.timeout is None:
         options.timeout = 120. if options.command == 'task-run' else 30.
     if options.command in (
-        'audit', 'trial', 'plan-check', 'plan-retime', 'csv-import', 'task-review',
+        'audit', 'trial', 'csv-import', 'task-review',
     ):
-        parser.error('audit/trial/plan-check/plan-retime/csv-import/task-review 子命令必须放在参数最前面')
+        parser.error('audit/trial/csv-import/task-review 子命令必须放在参数最前面')
     positive(options.timeout, 'timeout')
     task_request: dict[str, Any] | None = None
     if options.command == 'task-run':
