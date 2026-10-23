@@ -14,7 +14,11 @@ def test_horner_matches_power_sum(order):
     rng = np.random.default_rng(147)
     for duration in (.001, .004, .1, 3., 120.):
         for _ in range(20):
-            c = coefficients(*(rng.normal(size=(6, 6))), duration)
+            endpoints = rng.normal(size=(6, 6))
+            c = coefficients(
+                endpoints[0], endpoints[1], endpoints[2],
+                endpoints[3], endpoints[4], endpoints[5], duration,
+            )
             for u in (0., .001, .25, .5, .999, 1.):
                 reference = sum(
                     c[:, power] * math.factorial(power) / math.factorial(power - order)

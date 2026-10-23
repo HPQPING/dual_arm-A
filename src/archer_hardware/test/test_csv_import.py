@@ -6,7 +6,7 @@ import json
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
+from typing import Any, cast
 import unittest
 from unittest.mock import patch
 
@@ -247,9 +247,11 @@ class CsvImportTests(unittest.TestCase):
             for side in ('left', 'right'):
                 for field in ('lower', 'upper', 'max_velocity', 'max_acceleration'):
                     params[f'{side}_{field}'] = list(getattr(self.bound, field))
-            config.write_text(yaml.safe_dump({
+            config_text = yaml.safe_dump({
                 'archer_position_driver': {'ros__parameters': params},
-            }))
+            })
+            assert isinstance(config_text, str)
+            config.write_text(config_text)
             before = source.read_bytes(), summary.read_bytes()
             args = ['csv-import', '--run-dir', str(root), '--limits-file', str(config)]
             with patch('rclpy.init') as initialize, patch(
@@ -288,9 +290,11 @@ class CsvImportTests(unittest.TestCase):
             self.assertTrue(custom.is_file())
             self.assertTrue(custom.with_name('trajectory_report.json').is_file())
             params['left_max_velocity'] = [1e-8] * 6
-            config.write_text(yaml.safe_dump({
+            config_text = yaml.safe_dump({
                 'archer_position_driver': {'ros__parameters': params},
-            }))
+            })
+            assert isinstance(config_text, str)
+            config.write_text(config_text)
             previous = ((converted / 'state.json').read_bytes(),
                         (converted / 'state_report.json').read_bytes())
             self.assertEqual(main(args + ['--prepare']), 1)
@@ -342,11 +346,8 @@ class CsvImportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '局部边界融合'):
             prepare_samples(samples, self.limits, arc_smooth=True)
         with self.assertRaises(ValueError):
-            prepare_samples(samples, self.limits, arc_smooth=1)
-
-
-if __name__ == '__main__':
-    unittest.main()
+            # 负面测试刻意绕过静态签名，验证运行时仍拒绝整数冒充布尔。
+            prepare_samples(samples, self.limits, arc_smooth=cast(Any, 1))
 
 
 class TransitTimingOptionTests(unittest.TestCase):
@@ -358,3 +359,17 @@ class TransitTimingOptionTests(unittest.TestCase):
         samples, _ = import_samples(state_csv(), {'left': limits, 'right': limits})
         with self.assertRaisesRegex(ValueError, '时间优化'):
             prepare_samples(samples, {'left': limits, 'right': limits}, transit_timing=True)
+
+    def test_return_profile_requires_explicit_transit_pipeline(self) -> None:
+        """新归位不得在普通CSV转换中隐式启用，错误类型仍拒绝."""
+        limits = PositionLimits((-1.,)*6, (1.,)*6, (.5,)*6, (.3,)*6)
+        samples, _ = import_samples(state_csv(), {'left': limits, 'right': limits})
+        with self.assertRaisesRegex(ValueError, '同步归位'):
+            prepare_samples(samples, {'left': limits, 'right': limits}, return_profile=True)
+        with self.assertRaisesRegex(ValueError, '同步归位'):
+            prepare_samples(samples, {'left': limits, 'right': limits},
+                            return_profile=cast(Any, 1))
+
+
+if __name__ == '__main__':
+    unittest.main()

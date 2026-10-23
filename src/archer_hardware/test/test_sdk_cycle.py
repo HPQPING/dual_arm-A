@@ -176,7 +176,9 @@ class NativeCycleTests(unittest.TestCase):
 
         def start():
             observed.append(self.adapter.state)
-            self.assertIn('initialize', self.adapter._native.pending)
+            native = self.adapter._native
+            assert native is not None
+            self.assertIn('initialize', native.pending)
 
         self.api._project_start_control_periodic = start
         self.adapter.request_control()
@@ -431,6 +433,43 @@ class NativeCycleTests(unittest.TestCase):
                 await self.finish(task)
         asyncio.run(run())
 
+    def test_actual_delivery_uses_packet_snapshot_during_encoding_update(self) -> None:
+        """发送await期间同一缓存被再次编码，历史和确认仍属于已经交给传输的包。"""
+        async def run() -> None:
+            from archer_hardware.sdk_cycle import PositionSample
+
+            with patch.object(self.sdk, '_send_down_message', self.capture):
+                task = await self.acquire()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            native = self.adapter._native
+            assert native is not None
+            first, second = (.0001,) * 6, (.0002,) * 6
+            acknowledgments = []
+            self.adapter._target = first
+            targets = self.arm._construct_custom_motor_msg(
+                self.adapter._command_types.POSITION, list(first))
+            self.adapter._send(self.arm._construct_custom_joint_command_msg(targets), 'position')
+            native.sample_position = lambda: PositionSample(
+                first, lambda: acknowledgments.append('first'))
+            message = self.arm._construct_joint_command_msg(self.arm._target_command)
+
+            async def reencode_during_transport(api: Any, packet: Any) -> None:
+                await self.capture(api, packet)
+                native.sample_position = lambda: PositionSample(
+                    second, lambda: acknowledgments.append('second'))
+                self.arm._construct_joint_command_msg(self.arm._target_command)
+
+            try:
+                with patch.object(self.sdk, '_send_down_message', reencode_during_transport):
+                    await self.api._send_down_message(message)
+                self.assertEqual(native.last_position, first)
+                self.assertEqual(native.pending['position'].target, second)
+                self.assertEqual(acknowledgments, ['first'])
+            finally:
+                await self.finish(task)
+        asyncio.run(run())
+
     def test_sdk_sampling_prevents_stale_cache_then_jump(self) -> None:
         """缓存每12ms才更新时，SDK每4ms仍按路径取样；过期后不能自行续跑."""
         async def run() -> None:
@@ -474,7 +513,8 @@ class NativeCycleTests(unittest.TestCase):
                         send_clock.return_value = clock.return_value
                         self.adapter._feedback = replace(
                             self.frame(), positions=native.last_position)
-                        gate.playback('left', generation)
+                        # 工作线程可能只看见下一代缓存事件；发送健康必须由实际SDK发送确认。
+                        gate.playback('left', None)
                         _, generation, _ = gate.playback('right', generation)
                         if tick % 3 == 0:
                             publish_old_cache()

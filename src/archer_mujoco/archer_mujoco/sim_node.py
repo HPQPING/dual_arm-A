@@ -123,8 +123,10 @@ def prepare_continuous_plan(
     bounds: FloatArray, speeds: FloatArray,
 ) -> ParsedPlan:
     """保留全部节点导数，解析核对段内位置和速度，不重新改成逐点停车。"""
-    times, positions = [0.], [start.copy()]
-    velocities, accelerations = [np.zeros(6)], [np.zeros(6)]
+    times = [0.]
+    positions: list[FloatArray] = [start.copy()]
+    velocities: list[FloatArray] = [np.zeros(6, dtype=np.float64)]
+    accelerations: list[FloatArray] = [np.zeros(6, dtype=np.float64)]
     for index, point in enumerate(points):
         if (any(len(values) != 6 for values in
                 (point.positions, point.velocities, point.accelerations)) or point.effort):

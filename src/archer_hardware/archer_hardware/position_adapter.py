@@ -15,7 +15,7 @@ from typing import Any, Iterable, cast
 from .hex_adapter import (
     HexFeedbackAdapter, JointFeedback, managed_sdk_class, report_only, verified_sdk,
 )
-from .sdk_cycle import SdkCycleSender
+from .sdk_cycle import PositionSample, SdkCycleSender
 from .sdk_position import isolated_arm_class
 from .position_plan import (
     ContinuousPositionTrajectory, JointPositionMove, JointPositionTrajectory,
@@ -307,14 +307,14 @@ class HexPositionAdapter(HexFeedbackAdapter):
             raise RuntimeError('BRAKE 未在50ms内确认底层发送，仍将继续关闭连接')
         return event
 
-    def _stream_position_sample(self) -> tuple[float, ...] | None:
+    def _stream_position_sample(self) -> PositionSample | None:
         """完整文件在SDK构包时按共同时钟采样，同时复核实际反馈误差."""
         move, gate, side = self._move, self._trajectory_gate, self._trajectory_side
         if (self.state != 'RUNNING' or not isinstance(move, ContinuousPositionTrajectory)
                 or not move.preserve_path or gate is None or side is None
                 or gate.playback_status()['stream_period_s'] is None):
             return None
-        elapsed, _, _ = gate.playback(side, None)
+        elapsed, generation, _ = gate.playback(side, None)
         target = move.sample(elapsed)
         frame = self._feedback
         if frame is None or not 0. <= (
@@ -326,7 +326,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
                      if move.joint_error_rad else self.tracking_tolerance)
         if max(abs(a - b) for a, b in zip(frame.positions, target)) > tolerance:
             raise RuntimeError('SDK周期取样目标与实际反馈偏差超限')
-        return target
+        return PositionSample(target, lambda: gate.confirm_delivery(side, generation))
 
     def request_control(self) -> None:
         """在新鲜、静止反馈和无故障状态下显式申请控制权."""

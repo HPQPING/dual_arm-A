@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 import shutil
 from tempfile import mkdtemp
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import yaml
@@ -269,6 +269,8 @@ def main(args: list[str] | None = None) -> int:
                         help='仅平滑两个融合窗口之间的圆弧内部；需--boundary-blend')
     parser.add_argument('--transit-timing', action='store_true',
                         help='仅压缩已平滑接近归位的内部时轴；需--arc-smooth')
+    parser.add_argument('--return-profile', action='store_true',
+                        help='只在画圆出口融合之后重新规划同步归位；需--transit-timing')
     options = parser.parse_args(args)
     if options.smooth and not options.prepare:
         parser.error('--smooth需要同时使用--prepare')
@@ -286,6 +288,8 @@ def main(args: list[str] | None = None) -> int:
         parser.error('--arc-smooth需要--boundary-blend')
     if options.transit_timing and not options.arc_smooth:
         parser.error('--transit-timing需要--arc-smooth')
+    if options.return_profile and not options.transit_timing:
+        parser.error('--return-profile需要--transit-timing')
     root = options.run_dir.expanduser().resolve()
     existing = [name for name in ('state.csv', 'tracking.csv') if (root / name).is_file()]
     selected = options.csv_name or (existing[0] if len(existing) == 1 else None)
@@ -330,7 +334,8 @@ def main(args: list[str] | None = None) -> int:
         if options.prepare:
             frequency = 250
             if options.path_retime:
-                frequency = yaml.safe_load(limits_bytes)['archer_position_driver'][
+                configuration = cast(dict[str, Any], yaml.safe_load(limits_bytes))
+                frequency = configuration['archer_position_driver'][
                     'ros__parameters'].get('control_hz', 250)
             candidate, timing = prepare_samples(candidate, limits, margin=options.margin,
                                                 smooth=options.smooth,
@@ -342,7 +347,8 @@ def main(args: list[str] | None = None) -> int:
                                                 transit_profile=options.transit_profile,
                                                 boundary_blend=options.boundary_blend,
                                                 arc_smooth=options.arc_smooth,
-                                                transit_timing=options.transit_timing)
+                                                transit_timing=options.transit_timing,
+                                                return_profile=options.return_profile)
             report.update(timing)
     except (OSError, ValueError, TypeError, KeyError, UnicodeError,
             csv.Error, yaml.YAMLError) as error:
@@ -380,6 +386,7 @@ def prepare_samples(
     boundary_blend: bool = False,
     arc_smooth: bool = False,
     transit_timing: bool = False,
+    return_profile: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """准备受限双臂轨迹；空间模式允许有界节点拟合，阶段事件仍仅作为参考."""
     from archer_control.continuous_trajectory import (
@@ -405,6 +412,8 @@ def prepare_samples(
         raise ValueError('圆弧内部平滑需要已经启用局部边界融合')
     if type(transit_timing) is not bool or (transit_timing and not arc_smooth):
         raise ValueError('接近归位时间优化需要已平滑圆弧和融合窗口')
+    if type(return_profile) is not bool or (return_profile and not transit_timing):
+        raise ValueError('同步归位优化需要已经完成的接近归位时间处理')
 
     if (samples.get('version') != 3 or samples.get('kind') != 'recorded_joint_samples'
             or samples.get('interpolation') != 'unassigned'):
@@ -593,6 +602,26 @@ def prepare_samples(
             spatial_blocks_scope='baseline_before_transit_time_warp',
             max_sample_position_change_rad={
                 s: float(np.max(abs(plan.positions[s] - positions[s]))) for s in positions})
+    if return_profile:
+        from archer_control.transit_timing import replan_circle_return
+
+        if planning_jerk is None:
+            raise ValueError('同步归位优化需要明确的jerk限制')
+        plan, details = replan_circle_return(
+            plan, stages, [limits[s].lower for s in ('left', 'right')],
+            [limits[s].upper for s in ('left', 'right')],
+            [[min(v, .32) for v in limits[s].max_velocity] for s in ('left', 'right')],
+            [[min(a, .18) for a in limits[s].max_acceleration] for s in ('left', 'right')],
+            max_jerk=min(planning_jerk, .8),
+            source={s: np.asarray(q) for s, q in positions.items()})
+        measured.update(return_profile=details, duration_s=float(plan.times[-1]),
+                        prepared_times_ns=[int(round(float(t)*1e9)) for t in plan.times],
+                        effective_time_scale=float(plan.times[-1]/(source_times[-1]/1e9)),
+                        unchanged_phase_policy='preserve_approach_arc_and_both_blend_windows',
+                        transit_timing_scope='baseline_before_return_profile',
+                        max_sample_position_change_rad={
+                            s: float(np.max(abs(plan.positions[s]-positions[s])))
+                            for s in positions})
     if transit_profile:
         # 多个离线处理串联时只汇总最终曲线，避免反复解析已经被后处理替换的中间段。
         measured['jerk_metrics'] = trajectory_jerk_metrics(plan)

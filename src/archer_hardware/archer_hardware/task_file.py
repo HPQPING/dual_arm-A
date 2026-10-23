@@ -91,6 +91,61 @@ def check_task_stages(stages: object, task: str) -> None:
             raise ValueError('任务主要阶段缺失或顺序错误：' + name) from error
 
 
+def _return_profile_range(
+    report: Mapping[str, Any], task: str, plans: Mapping[str, ContinuousPositionTrajectory],
+    stages: dict[str, list[str]], tolerance: float,
+) -> tuple[int, int] | None:
+    """仅给画圆出口融合之后的显式同步归位开放固定节点偏差，独立检查导数."""
+    profile = report.get('return_profile')
+    if profile is None:
+        return None
+    if (task != 'split_circle' or tolerance != .0005 or not isinstance(profile, dict)
+            or profile.get('policy') != 'circle_return_joint_profile_v1'
+            or profile.get('source_node_tolerance_rad') != .004
+            or not isinstance(report.get('boundary_blend'), dict)
+            or report.get('reference_events') != []):
+        raise ValueError('同步归位声明只支持已融合的无事件画圆，不扩大其他阶段误差')
+    required = {0, len(plans['left'].times_ns)-1}
+    for labels in stages.values():
+        required.update(k for i in range(1, len(labels)) if labels[i] != labels[i-1]
+                        for k in (i-1, i))
+    seconds = [t/1e9 for t in plans['left'].times_ns]
+    windows = circle_blend_windows(seconds, stages, tuple(sorted(required)))
+    first, last = windows[1]['last'], len(plans['left'].times_ns)-1
+    actual_duration = (plans['left'].times_ns[last]-plans['left'].times_ns[first])/1e9
+    if (type(profile.get('first')) is not int or profile['first'] != first
+            or type(profile.get('last')) is not int or profile['last'] != last
+            or last-first < 32 or type(profile.get('correction_s')) not in (int, float)
+            or profile.get('correction_s') not in (1., 1.5, 2.)
+            or type(profile.get('after_s')) not in (int, float)
+            or not math.isclose(profile['after_s'], actual_duration, rel_tol=0., abs_tol=1e-9)):
+        raise ValueError('同步归位范围或时间与实际画圆出口不一致')
+    import numpy as np
+    from archer_control.transit_timing import _jerk_bounds
+    from archer_mujoco.joint_interpolation import _extrema
+
+    for side, plan in plans.items():
+        gaps = np.diff(np.asarray(plan.times_ns[first:], dtype=np.int64))/1e9
+        polys = np.stack(plan.polynomials[first:])
+        if np.max(abs(_jerk_bounds(polys, gaps))) > .8 + 1e-10:
+            raise ValueError(side + '同步归位jerk超限')
+        for order, cap, configured in ((1, .32, plan.limits.max_velocity),
+                                       (2, .18, plan.limits.max_acceleration)):
+            peaks = np.array([np.max(abs(_extrema(c, float(h), order)), axis=1)
+                              for c, h in zip(polys, gaps)])
+            if np.any(peaks > np.minimum(cap, configured)*(1.+1e-10)):
+                raise ValueError(side + '同步归位速度或加速度超限')
+        starts = 6.*polys[:, :, 3]/gaps[:, None]**3
+        ends = (6.*polys[:, :, 3]+24.*polys[:, :, 4]+60.*polys[:, :, 5])/gaps[:, None]**3
+        previous = plan.polynomials[first-1]
+        h = (plan.times_ns[first]-plan.times_ns[first-1])/1e9
+        previous_jerk = (6.*previous[:, 3]+24.*previous[:, 4]+60.*previous[:, 5])/h**3
+        if max(float(np.max(abs(starts[1:]-ends[:-1]))),
+               float(np.max(abs(starts[0]-previous_jerk)))) > 1e-5:
+            raise ValueError(side + '同步归位jerk衔接跳变超限')
+    return first, last
+
+
 def load_reviewed_task(
     run_dir: Path, limits_file: Path, prepared_file: Path, report_file: Path, *,
     max_excursion: float,
@@ -155,6 +210,7 @@ def load_reviewed_task(
                 or not math.isfinite(value) or not 0. < value <= .0005):
             raise ValueError('空间路径拟合的节点误差上限无效')
         tolerance = float(value)
+    return_range = _return_profile_range(report, task, plans, stage_report, tolerance)
     changes = {}
     source_times: list[int] = []
     for side in ('left', 'right'):
@@ -171,7 +227,8 @@ def load_reviewed_task(
             difference = max(abs(a - b) for a, b in
                              zip(prepared['positions'], original['positions']))
             maximum = max(maximum, difference)
-            if difference > tolerance + (1e-12 if tolerance else 0.):
+            allowed = .004 if return_range is not None and i > return_range[0] else tolerance
+            if difference > allowed + (1e-12 if allowed else 0.):
                 raise ValueError(side + '原始实际关节角被改写')
             if tolerance and i in payload['stop_indices'] and difference != 0.:
                 raise ValueError(side + '阶段停车边界不得进行位置拟合修改')
@@ -237,6 +294,7 @@ def load_reviewed_task(
         'duration_s': duration, 'max_excursion_rad': excursion, 'sha256': hashes,
         'position_smoothing_tolerance_rad': tolerance,
         'verified_max_sample_position_change_rad': changes,
+        'return_profile_range': list(return_range) if return_range is not None else None,
         'execution_ready': False, 'commands_sent': False,
         'geometry_preflight_passed': False, 'actual_start_verified': False,
         'gripper_execution_verified': False,

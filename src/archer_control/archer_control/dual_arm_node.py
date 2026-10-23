@@ -412,6 +412,7 @@ class DualArmTask(Node):
             self.minimum,
             self.margin,
             cancelled=self.cancel_event.is_set,
+            speed_limits=self.speeds,
         )
         if self.cancel_event.is_set():
             raise ValueError("规划已取消")

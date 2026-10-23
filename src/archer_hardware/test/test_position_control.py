@@ -356,6 +356,35 @@ class PairedStartTests(unittest.TestCase):
             self.assertAlmostEqual(gate.playback('left', None)[0], .008)
             self.assertAlmostEqual(gate.playback('right', 0)[0], .008)
 
+    def test_stream_clock_jitter_does_not_double_sdk_packet_step(self) -> None:
+        """工作线程跨格与SDK回调相位抖动不能把约4ms的目标增量放大为8ms。"""
+        with patch('archer_hardware.position_plan.time.monotonic') as clock:
+            clock.return_value = 100.
+            gate = PairedTrajectoryStart(reference_step_s=.004487, duration_s=10.,
+                                         stream_period_s=.004)
+            gate.ready('left')
+            gate.ready('right')
+            previous_time, previous_reference, generation = 100.2, 0., 0
+            for tick in range(1, 1001):
+                packet_time = 100.2 + tick * .004 + (.00001 if tick % 2 == 0 else -.00001)
+                # 项目线程与SDK构包共用参考时钟，项目线程可能先跨过时间格。
+                for offset in (.003, .0005):
+                    clock.return_value = packet_time - offset
+                    gate.playback('left', None)
+                clock.return_value = packet_time
+                reference, generation, _ = gate.playback('right', None)
+                gate.confirm_delivery('left', generation)
+                gate.confirm_delivery('right', generation)
+                interval = packet_time - previous_time
+                delta = reference - previous_reference
+                self.assertGreater(delta, 0.)
+                self.assertLessEqual(delta, interval + 1e-12)
+                # 以候选峰值附近的线性路径核对厂商名义4ms包间速度。
+                packet_speed = .3566 * delta / max(.004, interval)
+                self.assertLessEqual(packet_speed, .5)
+                previous_time, previous_reference = packet_time, reference
+            self.assertAlmostEqual(previous_reference, previous_time - 100.2, places=9)
+
     def test_stream_clock_lag_is_capped_and_not_repaid(self) -> None:
         """迟到不超出已检单包步长，下一周期不追赶欠账."""
         with patch('archer_hardware.position_plan.time.monotonic') as clock:
@@ -369,8 +398,10 @@ class PairedStartTests(unittest.TestCase):
             gate.playback('right', 0)
             self.assertAlmostEqual(reference, .01)
             clock.return_value = 100.221
-            gate.playback('left', generation)
-            gate.playback('right', generation)
+            gate.confirm_delivery('left', generation)
+            gate.confirm_delivery('right', generation)
+            gate.playback('left', None)
+            gate.playback('right', None)
             clock.return_value = 100.224
             reference, _, _ = gate.playback('left', generation)
             self.assertAlmostEqual(reference, .014)
@@ -401,32 +432,38 @@ class PairedStartTests(unittest.TestCase):
                                          stream_period_s=.004)
             gate.ready('left')
             gate.ready('right')
-            clock.return_value = 100.204
+            # 明确越过终点，避免100.204减100.2的二进制舍入略小于4ms。
+            clock.return_value = 100.204 + 1e-9
             self.assertEqual(gate.playback('left', 0), (.004, 1, None))
             gate.playback('right', 0)
             clock.return_value = 100.208
             self.assertIsNone(gate.playback('left', 1)[2])
             self.assertEqual(gate.playback('right', 1), (.004, 1, 0.))
             clock.return_value = 101.
-            self.assertAlmostEqual(gate.playback('left', 1)[2], .792)
+            age = gate.playback('left', 1)[2]
+            assert age is not None
+            self.assertAlmostEqual(age, .792)
 
-    def test_stream_clock_updates_regularly_with_delayed_sdk(self) -> None:
-        """SDK每12ms确认一次时，参考仍每4ms均匀采样，不按确认切碎时间步."""
+    def test_worker_calls_cannot_accumulate_more_than_packet_budget(self) -> None:
+        """多个worker推进不能使下一实际包跨过多次单包预算。"""
         with patch('archer_hardware.position_plan.time.monotonic') as clock:
             clock.return_value = 100.
-            gate = PairedTrajectoryStart(reference_step_s=.01, duration_s=1.,
+            gate = PairedTrajectoryStart(reference_step_s=.004487, duration_s=1.,
                                          stream_period_s=.004)
             gate.ready('left')
             gate.ready('right')
-            generation, acknowledged, references = 0, 0, []
-            for tick in range(1, 31):
-                clock.return_value = 100.2 + tick * .004
-                if tick % 3 == 0:
-                    acknowledged = generation
-                reference, generation, _ = gate.playback('left', acknowledged)
-                gate.playback('right', acknowledged)
-                references.append(reference)
-            np.testing.assert_allclose(np.diff(references), .004, atol=1e-12)
+            previous = 0.
+            for packet in range(1, 15):
+                for substep in range(1, 9):
+                    clock.return_value = 100.2 + (packet - 1) * .008 + substep * .001
+                    reference, generation, _ = gate.playback('left', None)
+                    gate.playback('right', None)
+                self.assertLessEqual(reference - previous, .004487 + 1e-12)
+                self.assertLessEqual(.3566 * (reference - previous) / .004, .5)
+                gate.confirm_delivery('left', generation)
+                gate.confirm_delivery('right', generation)
+                previous = reference
+            self.assertGreater(previous, .06)
 
     def test_stream_small_packet_budget_does_not_split_regular_samples(self) -> None:
         """单步上限4.2ms不能造成4ms与0.2ms交替的停走参考时钟."""
@@ -436,15 +473,20 @@ class PairedStartTests(unittest.TestCase):
                                          stream_period_s=.004)
             gate.ready('left')
             gate.ready('right')
+            generation = 0
             for tick in range(1, 5):
                 clock.return_value = 100.2 + tick * .004
                 reference, generation, _ = gate.playback('left', None)
                 gate.playback('right', None)
+                gate.confirm_delivery('left', generation)
+                gate.confirm_delivery('right', generation)
             self.assertAlmostEqual(reference, .016)
             self.assertEqual(generation, 4)
             clock.return_value = 100.22
-            gate.playback('left', generation)
-            gate.playback('right', generation)
+            _, generation, _ = gate.playback('left', None)
+            gate.playback('right', None)
+            gate.confirm_delivery('left', generation)
+            gate.confirm_delivery('right', generation)
             clock.return_value = 100.224
             reference, _, _ = gate.playback('left', generation)
             self.assertAlmostEqual(reference, .024)
@@ -463,6 +505,8 @@ class PairedStartTests(unittest.TestCase):
                 reference, current, _ = gate.playback('left', generation)
                 gate.playback('right', generation)
                 self.assertAlmostEqual(reference - previous, .004, places=9)
+                gate.confirm_delivery('left', current)
+                gate.confirm_delivery('right', current)
                 generation, previous = current, reference
             self.assertAlmostEqual(reference, 120., places=8)
 

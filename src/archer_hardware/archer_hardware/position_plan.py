@@ -114,7 +114,14 @@ def load_limits(path: Path, *, content: bytes | None = None) -> dict[str, Positi
     """读取已有位置配置作比较，不启用其中连接或控制开关."""
     text = path.read_text(encoding='utf-8') if content is None else content.decode('utf-8')
     data = yaml.safe_load(text)
-    parameters = data['archer_position_driver']['ros__parameters']
+    if not isinstance(data, dict):
+        raise ValueError('位置配置必须为YAML字典')
+    driver = data.get('archer_position_driver')
+    if not isinstance(driver, dict):
+        raise ValueError('位置配置缺少archer_position_driver字典')
+    parameters = driver.get('ros__parameters')
+    if not isinstance(parameters, dict):
+        raise ValueError('位置配置缺少ros__parameters字典')
     return {
         side: PositionLimits(
             tuple(parameters[f'{side}_lower']), tuple(parameters[f'{side}_upper']),
@@ -550,7 +557,6 @@ class PairedTrajectoryStart:
         self._stream_seen = {'left': -1, 'right': -1}
         self._stream_sent_reference = {'left': 0., 'right': 0.}
         self._stream_references = {0: 0.}
-        self._stream_tick = 0
         self._delivery_seen: dict[str, float] = {}
 
     def ready(self, side: str) -> None:
@@ -575,7 +581,7 @@ class PairedTrajectoryStart:
     def playback(
         self, side: str, delivered_generation: int | None,
     ) -> tuple[float, int, float | None]:
-        """按共同周期推进；发送确认只用于失联检查和末包计时."""
+        """按共同单调时钟连续推进；发送确认只用于失联检查和末包计时."""
         now = time.monotonic()
         with self._lock:
             if (not self.delivery_paced or side not in ('left', 'right')
@@ -583,17 +589,39 @@ class PairedTrajectoryStart:
                 raise RuntimeError('共用参考时钟未启动或已经取消')
             return self._stream_playback(side, delivered_generation, now)
 
+    def confirm_delivery(self, side: str, generation: int) -> None:
+        """SDK底层发送完成后确认该包的取样代次，不依赖已被覆盖的缓存事件。"""
+        with self._lock:
+            if self._cancelled:
+                return
+            if (side not in ('left', 'right') or type(generation) is not int
+                    or not 0 <= generation <= self._generation):
+                raise ValueError('SDK实际发送确认侧别或代次无效')
+            if generation < self._stream_seen[side]:
+                return
+            self._stream_seen[side] = generation
+            self._delivery_seen[side] = time.monotonic()
+            self._stream_sent_reference[side] = self._stream_references[generation]
+            self._delivered_reference = min(self._stream_sent_reference.values())
+            if (self._reference >= self._duration and self._end_delivered_at is None
+                    and all(g == self._generation for g in self._stream_seen.values())):
+                self._end_delivered_at = self._delivery_seen[side]
+
     def _stream_playback(
         self, side: str, delivered_generation: int | None, now: float,
     ) -> tuple[float, int, float | None]:
-        """锁内推进共同周期；发送确认只监视失联及末包，不逐点阻塞进度."""
+        """锁内按实际经过时间取样；不量化时间格，不逐点等待反馈."""
         assert self._stream_period is not None and self._advanced_at is not None
         assert self._step is not None
         if self._end_delivered_at is None and (
                 now - self._advanced_at > .04
                 or any(now - seen > .04 for seen in self._delivery_seen.values())):
             self._cancelled = True
-            raise RuntimeError('双臂周期更新或实际发送确认超过40ms，取消后续目标')
+            ages = ', '.join(f'{s}={(now - t) * 1000:.1f}ms'
+                             for s, t in self._delivery_seen.items())
+            raise RuntimeError('双臂周期更新或实际发送确认超过40ms，取消后续目标；'
+                               f'参考更新间隔={(now - self._advanced_at) * 1000:.1f}ms；'
+                               f'发送确认年龄：{ages}')
         if delivered_generation is not None:
             if (type(delivered_generation) is not int or delivered_generation < 0
                     or delivered_generation > self._generation):
@@ -609,22 +637,17 @@ class PairedTrajectoryStart:
                 self._end_delivered_at = now
         else:
             assert self._start is not None
-            # 从共同起点计算整数周期，避免长期累加浮点周期后把准时一拍
-            # 错判成早到，随后又丢弃一拍时间，造成持续减速及零增量采样。
-            tick = math.floor((now - self._start + 1e-9) / self._stream_period)
-            periods = tick - self._stream_tick
-            if periods > 0:
-                # 两线程落在同一周期时只推进一次。偶发迟到最多推进已检步长，
-                # 作废剩余欠账，不能在下一拍集中补发积压目标。
-                # 按共同时间轴采样；发送确认只用于失联和末包判断。
-                # 不把未用满的一小段发送预算切成额外的微小目标或停顿。
-                # SDK另按实际包间隔检查速度，不以漏过缓存的数量拉慢路径。
+            # 使用同一单调时钟的连续经过时间，不把构包时刻量化到4ms时间格。
+            # 两个SDK回调稍微跨格时，整数拍可能使一包跨过两格、下一包不动。
+            # 单次调用与两次实际发送之间的累计推进都受已检单包预算约束。
+            # worker仍按成功版取样；多次worker/SDK调用不能重复消费同一包预算。
+            elapsed = max(0., now - self._advanced_at)
+            if elapsed > 0.:
                 next_reference = min(
-                    self._duration, self._reference + min(
-                        self._step, periods * self._stream_period),
+                    self._duration, self._reference + min(self._step, elapsed),
+                    min(self._stream_sent_reference.values()) + self._step,
                 )
-                self._stream_tick = tick
-                self._advanced_at = self._start + tick * self._stream_period
+                self._advanced_at = now
                 if next_reference > self._reference:
                     self._reference = next_reference
                     self._generation += 1
@@ -638,11 +661,14 @@ class PairedTrajectoryStart:
     def playback_status(self) -> dict[str, object]:
         """状态只报告软件发送确认，不宣称控制器确认或机械臂实际到位."""
         with self._lock:
+            now = time.monotonic()
             return {'enabled': self.delivery_paced, 'reference_elapsed_s': self._reference,
                     'delivered_reference_elapsed_s': self._delivered_reference,
                     'reference_step_cap_s': self._step, 'generation': self._generation,
                     'end_transport_delivered': self._end_delivered_at is not None,
                     'stream_period_s': self._stream_period,
+                    'transport_ack_age_s': {s: max(0., now - t)
+                                            for s, t in self._delivery_seen.items()},
                     'cancelled': self._cancelled}
 
     def start_time(self) -> float | None:

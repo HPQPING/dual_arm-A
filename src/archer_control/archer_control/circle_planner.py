@@ -10,7 +10,7 @@ from numpy.typing import ArrayLike
 
 from .dual_arm_trajectory import DualArmKinematics, DualArmPlan, plan_paired_joints
 from .kinematics import ArmKinematics
-from .trajectory import DEFAULT_SPEED_LIMITS, FloatArray, validate_joints
+from .trajectory import DEFAULT_SPEED_LIMITS, FloatArray, joint_vector, validate_joints
 
 
 # 工程采用值：8 mm 放在模型的 link_6 → flange，不再作为夹爪安装偏移。
@@ -29,6 +29,7 @@ class CircleResult:
     right_rotation: FloatArray
     # plan.positions[0] 是起始关节反馈，[1] 是第一个圆弧目标点。
     arc_first_index: int = 1
+    branch_selection: dict[str, object] | None = None
 
 
 def inward_rotation(side: str, tilt_radians: float) -> FloatArray:
@@ -72,7 +73,7 @@ def semicircle_points(
     return paths[0], paths[1]
 
 
-def _solve_arc(
+def _solve_arc_candidates(
     model: ArmKinematics,
     world_from_base: FloatArray,
     start: FloatArray,
@@ -81,7 +82,9 @@ def _solve_arc(
     rng: np.random.Generator,
     attempts: int,
     cancelled: Callable[[], bool],
-) -> FloatArray:
+    speeds: FloatArray,
+    collect_all: bool,
+) -> list[FloatArray]:
     inverse = np.linalg.inv(world_from_base)
     target = np.eye(4, dtype=np.float64)
     target[:3, :3] = rotation
@@ -98,10 +101,14 @@ def _solve_arc(
     if not candidates:
         raise ValueError("No start-point IK solution found for " + model.names[0].split("_")[0])
     candidates.sort(
-        key=lambda q: float(np.max(np.abs(q - start) / np.asarray(DEFAULT_SPEED_LIMITS)))
+        key=lambda q: float(np.max(np.abs(q - start) / speeds))
     )
     last_error = ""
+    distinct: list[FloatArray] = []
+    paths: list[FloatArray] = []
     for seed in candidates:
+        if any(float(np.max(np.abs(seed - q))) < 0.001 for q in distinct):
+            continue
         joints = [seed.copy()]
         for index, position in enumerate(points[1:], start=1):
             if cancelled():
@@ -116,8 +123,54 @@ def _solve_arc(
                 break
             joints.append(result.joints.copy())
         if len(joints) == len(points):
-            return np.asarray(joints, dtype=np.float64)
+            distinct.append(seed)
+            paths.append(np.asarray(joints, dtype=np.float64))
+            if not collect_all:
+                break
+    if paths:
+        return paths
     raise ValueError("No continuous arc branch: " + last_error)
+
+
+def _cycle_cost(
+    left: FloatArray, right: FloatArray, starts: tuple[FloatArray, FloatArray],
+    speeds: FloatArray, minimum: float, margin: float,
+) -> tuple[FloatArray, float]:
+    """按共同限速估计接近/圆弧/归位代价；不是连续执行时长或碰撞证明。"""
+    paths = [np.vstack((start, arc, start)) for start, arc in zip(starts, (left, right))]
+    increments = [np.abs(np.diff(path, axis=0)) / speeds for path in paths]
+    lead = np.maximum(np.max(increments[0], axis=1), np.max(increments[1], axis=1))
+    durations = np.maximum(minimum, 1.875 * margin * lead)
+    phases = np.array([durations[0], np.sum(durations[1:-1]), durations[-1]])
+    return phases, float(sum(np.sum(d) for d in increments))
+
+
+def _select_arc_pair(
+    left: list[FloatArray], right: list[FloatArray],
+    starts: tuple[FloatArray, FloatArray], speeds: FloatArray,
+    minimum: float, margin: float, cancelled: Callable[[], bool],
+) -> tuple[FloatArray, FloatArray, dict[str, object]]:
+    """比较完整双臂方案；不以更差的接近/圆弧/归位估算换取总分下降。"""
+    baseline, travel = _cycle_cost(left[0], right[0], starts, speeds, minimum, margin)
+    best = (float(np.sum(baseline)), travel)
+    chosen, chosen_phases = (0, 0), baseline
+    for i, lpath in enumerate(left):
+        for j, rpath in enumerate(right):
+            if cancelled():
+                raise ValueError("Planning cancelled")
+            phases, distance = _cycle_cost(lpath, rpath, starts, speeds, minimum, margin)
+            if np.any(phases > baseline + 1e-9):
+                continue
+            score = (float(np.sum(phases)), distance)
+            meaningful = (best[0] - score[0] > 0.001
+                          or abs(best[0] - score[0]) <= 1e-9 and best[1] - distance > 0.001)
+            if score < best and meaningful:
+                best, chosen, chosen_phases = score, (i, j), phases
+    return left[chosen[0]], right[chosen[1]], {
+        "policy": "paired_cycle_nonworsening_v1", "feasible_branches": [len(left), len(right)],
+        "selected": list(chosen), "baseline_phase_cost_s": baseline.tolist(),
+        "selected_phase_cost_s": chosen_phases.tolist(), "cost_is_execution_duration": False,
+    }
 
 
 def plan_circle(
@@ -133,11 +186,14 @@ def plan_circle(
     ik_attempts: int = 32,
     random_seed: int = 7,
     cancelled: Callable[[], bool] | None = None,
+    *, return_aware: bool = True, speed_limits: ArrayLike = DEFAULT_SPEED_LIMITS,
 ) -> CircleResult:
     """
     规划相同分段时长：先在关节空间接近起点，再跟踪两个离散半圆.
 
-    使用同时约束位置和姿态的 IK。起点采用可复现的多初值搜索，但不保证 找到所有可行解分支。碰撞预检由独立模块执行。 每个插值段的起点和终点目标速度均为零。
+    保留位置和姿态要求，去重多初值IK分支并比较配对完整周期代价。
+    接近、圆弧与归位估算均不得比旧分支更差；未发现收益则保留旧分支。
+    借鉴MTC多解/完整任务代价选择，未集成MoveIt。碰撞预检由调用方执行。
     """
     if (
         isinstance(ik_attempts, bool)
@@ -147,6 +203,13 @@ def plan_circle(
         raise ValueError("ik_attempts must be 1..64")
     if isinstance(random_seed, bool) or not isinstance(random_seed, int) or random_seed < 0:
         raise ValueError("random_seed must be a nonnegative integer")
+    if not isinstance(return_aware, bool):
+        raise ValueError("return_aware must be boolean")
+    speeds = joint_vector(speed_limits, "speed_limits")
+    if (speeds.shape != (6,) or not np.all(np.isfinite(speeds)) or np.any(speeds <= 0)
+            or not np.isfinite(minimum_duration) or minimum_duration <= 0
+            or not np.isfinite(time_margin) or time_margin < 1):
+        raise ValueError("Invalid speed limits, minimum duration or time margin")
     left = validate_joints(left_start, model.left.limits)
     right = validate_joints(right_start, model.right.limits)
     left_points, right_points = semicircle_points(center, radius, arc_samples)
@@ -154,7 +217,7 @@ def plan_circle(
     right_rotation = inward_rotation("right", inward_tilt)
     check_cancel = cancelled if cancelled is not None else lambda: False
     rng = np.random.default_rng(random_seed)
-    left_joints = _solve_arc(
+    left_candidates = _solve_arc_candidates(
         model.left,
         model.world_from_left,
         left,
@@ -163,8 +226,10 @@ def plan_circle(
         rng,
         ik_attempts,
         check_cancel,
+        speeds,
+        return_aware,
     )
-    right_joints = _solve_arc(
+    right_candidates = _solve_arc_candidates(
         model.right,
         model.world_from_right,
         right,
@@ -173,17 +238,24 @@ def plan_circle(
         rng,
         ik_attempts,
         check_cancel,
+        speeds,
+        return_aware,
+    )
+    left_joints, right_joints, selection = _select_arc_pair(
+        left_candidates, right_candidates, (left, right), speeds,
+        minimum_duration, time_margin, check_cancel,
     )
     plan = plan_paired_joints(
         left,
         right,
         left_joints,
         right_joints,
-        DEFAULT_SPEED_LIMITS,
-        DEFAULT_SPEED_LIMITS,
+        speeds,
+        speeds,
         model.left.limits,
         model.right.limits,
         minimum_duration,
         time_margin,
     )
-    return CircleResult(plan, left_points, right_points, left_rotation, right_rotation)
+    return CircleResult(plan, left_points, right_points, left_rotation, right_rotation,
+                        branch_selection=selection)

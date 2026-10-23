@@ -9,6 +9,14 @@ import time
 from typing import Any, Callable
 
 
+@dataclass(frozen=True)
+class PositionSample:
+    """绑定本次连续取样目标与该包实际发送后的确认，不表示控制器收包。"""
+
+    target: tuple[float, ...]
+    acknowledge: Callable[[], None]
+
+
 @dataclass
 class PendingCommand:
     """保存本代命令的预期编码和实际发送完成事件."""
@@ -18,6 +26,7 @@ class PendingCommand:
     deadline: float
     delivered: Event
     target: tuple[float, ...] | None = None
+    acknowledge: Callable[[], None] | None = None
 
 
 class SdkCycleSender:
@@ -37,7 +46,7 @@ class SdkCycleSender:
         self.closed = False
         self.last_position: tuple[float, ...] | None = None
         self.last_position_at: float | None = None
-        self.sample_position: Callable[[], tuple[float, ...] | None] | None = None
+        self.sample_position: Callable[[], PositionSample | None] | None = None
 
     def encode_position(self, arm: Any, command: Any, encode: Callable[[Any], Any]) -> Any:
         """在官方周期实际构包时取样，避免反复发送旧缓存后跳到较晚目标."""
@@ -50,15 +59,16 @@ class SdkCycleSender:
                 raise RuntimeError('SDK 构包时目标代次已失效')
             if time.perf_counter() > request.deadline:
                 raise RuntimeError('SDK 目标超过40ms未更新，禁止周期取样复活旧任务')
-            target = self.sample_position()
-            if target is None:
+            sample = self.sample_position()
+            if sample is None:
                 return encode(command)
             sampled = deepcopy(command)
-            sampled.position_command = list(target)
+            sampled.position_command = list(sample.target)
             message = encode(sampled)
             self.check(message, 'position')
             request.encoded = message.arm_command.SerializeToString()
-            request.target = target
+            request.target = sample.target
+            request.acknowledge = sample.acknowledge
             return message
 
     def position_timing(self) -> tuple[tuple[float, ...], float] | None:
@@ -186,6 +196,8 @@ class SdkCycleSender:
                     return
                 self.check(message, kind)
                 captured = request
+                sent_target = captured.target
+                acknowledge = captured.acknowledge
             # 只有这一处调用官方传输；没有第二套项目周期发送器。
             sent_at = time.perf_counter()
             await base._send_down_message(api, message)
@@ -195,8 +207,10 @@ class SdkCycleSender:
                         and not self.closed):
                     # 实际发送已完成，即使缓存已更新，也须登记这份包的原始目标。
                     # 不读可能已被后来构造操作更新的SDK历史，更不复活取消代次。
-                    self.last_position = captured.target
+                    self.last_position = sent_target
                     self.last_position_at = sent_at
+                    if acknowledge is not None:
+                        acknowledge()
                 if self.pending.get(kind) is captured:
                     if kind in ('initialize', 'calibrate', 'clear_api_timeout'):
                         self.pending.pop(kind)

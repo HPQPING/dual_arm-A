@@ -34,9 +34,11 @@ class TaskFileTests(unittest.TestCase):
             for field, value in (('lower', -1.), ('upper', 1.),
                                  ('max_velocity', .05), ('max_acceleration', .1)):
                 params[f'{side}_{field}'] = [value] * 6
-        self.config.write_text(yaml.safe_dump({
+        config_text = yaml.safe_dump({
             'archer_position_driver': {'ros__parameters': params},
-        }))
+        })
+        assert isinstance(config_text, str)
+        self.config.write_text(config_text)
         labels = ['APPROACH', 'ALIGN_JOINT6', 'INSERT', 'CLOSE_DEMO', 'LIFT',
                   'RELEASE', 'RETREAT', 'RETURN_HOME', 'COMPLETED']
         stream = io.StringIO(newline='')
@@ -93,6 +95,50 @@ class TaskFileTests(unittest.TestCase):
         self.write('prepared_path_report.json', report)
         with self.assertRaisesRegex(ValueError, '仅支持'):
             self.review()
+
+    def test_return_profile_cannot_expand_grasp_or_ordinary_mode_tolerance(self) -> None:
+        """抓取或普通转换不能伪造归位声明来放宽节点误差检查."""
+        report = self.read('prepared_path_report.json')
+        report['return_profile'] = {'policy': 'circle_return_joint_profile_v1',
+                                    'source_node_tolerance_rad': .004}
+        self.write('prepared_path_report.json', report)
+        with self.assertRaisesRegex(ValueError, '同步归位声明'):
+            self.review()
+
+    def test_return_profile_range_and_jerk_are_independently_verified(self) -> None:
+        """声明不能移动到画圆段、扩大容差或掩盖实际五次段jerk超限."""
+        from dataclasses import replace
+        import numpy as np
+        from archer_control.continuous_trajectory import circle_blend_windows
+        from archer_hardware.position_plan import ContinuousPositionTrajectory
+        from archer_hardware.task_file import _return_profile_range
+
+        times = tuple(i*50_000_000 for i in range(260))
+        labels = ['APPROACH']*80 + ['ARC']*80 + ['RETURN_HOME']*100
+        stages = {s: list(labels) for s in ('left', 'right')}
+        windows = circle_blend_windows(np.array(times)/1e9, stages, (0, 79, 80, 159, 160, 259))
+        first, last = windows[1]['last'], len(times)-1
+        plans = {s: ContinuousPositionTrajectory(
+            times, tuple(np.zeros((6, 6)) for _ in times[1:]), (0.,)*6, (0.,)*6,
+            ((0., 0.),)*6, limit) for s, limit in self.file_limits().items()}
+        metadata = {'policy': 'circle_return_joint_profile_v1', 'first': first, 'last': last,
+                    'source_node_tolerance_rad': .004, 'correction_s': 2.,
+                    'after_s': (times[-1]-times[first])/1e9}
+        report = {'return_profile': metadata, 'boundary_blend': {}, 'reference_events': []}
+        self.assertEqual(_return_profile_range(report, 'split_circle', plans, stages, .0005),
+                         (first, last))
+        for key, bad in (('first', first-1), ('last', last-1),
+                         ('source_node_tolerance_rad', .005), ('correction_s', True),
+                         ('after_s', metadata['after_s']+1.)):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                _return_profile_range({**report, 'return_profile': {**metadata, key: bad}},
+                                      'split_circle', plans, stages, .0005)
+        invalid = list(plans['left'].polynomials)
+        invalid[-1] = invalid[-1].copy()
+        invalid[-1][:, 3] = .01
+        invalid_plans = {**plans, 'left': replace(plans['left'], polynomials=tuple(invalid))}
+        with self.assertRaisesRegex(ValueError, 'jerk超限'):
+            _return_profile_range(report, 'split_circle', invalid_plans, stages, .0005)
 
     def test_spatial_mode_is_explicit_and_bounds_verified(self) -> None:
         """空间模式成功仍不授予执行许可，误差声明超出硬上限则拒绝."""
@@ -448,6 +494,7 @@ class TaskFileTests(unittest.TestCase):
             result = prepare_file_task_message(text, self.file_limits(), .05, starts,
                                                Event(), saved_initial=starts, prepared_core=core)
             self.assertEqual(read.call_count, 5)
+            assert result.details is not None and result.continuous is not None
             self.assertEqual(result.details['return_targets'],
                              {s: list(q) for s, q in starts.items()})
             for side, plan in result.continuous.items():
