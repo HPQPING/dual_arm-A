@@ -515,7 +515,8 @@ class NativeCycleTests(unittest.TestCase):
                             self.frame(), positions=native.last_position)
                         # 工作线程可能只看见下一代缓存事件；发送健康必须由实际SDK发送确认。
                         gate.playback('left', None)
-                        _, generation, _ = gate.playback('right', generation)
+                        _, generation, _ = gate.playback('right', None)
+                        gate.confirm_delivery('right', generation)
                         if tick % 3 == 0:
                             publish_old_cache()
                         message = self.arm._construct_joint_command_msg(self.arm._target_command)
