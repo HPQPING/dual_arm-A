@@ -1,4 +1,4 @@
-"""完整圆柱的简化抓取演示：指令 2.0 表示虚拟附着，不验证真实夹持力."""
+"""协同演示：到位开口 5.5、等待 5 秒、进给和退开 1 cm；归位前闭合 5.65."""
 
 from __future__ import annotations
 
@@ -25,6 +25,14 @@ from .simple_grasp_planner import (
     prepare_simple_motion,
 )
 from .trajectory import FloatArray, joint_vector
+from .grasp_record_format import (
+    GRASP_WAIT_S,
+    GRIPPER_ACTION_S,
+    GRIPPER_CLOSED_COMMAND,
+    GRIPPER_OPEN_COMMAND,
+    INSERTION_DISTANCE_M,
+    SIMPLE_GRASP_RULE_VERSION,
+)
 from archer_mujoco.grasp_model_loader import GraspModel, physics
 from archer_mujoco.grasp_scene import GraspConfig
 
@@ -93,20 +101,30 @@ class SimpleGraspDemo(DualGraspDemo):
         self.simulation_initial_applied = {side: q.tolist() for side, q in applied.items()}
         super().__init__(left_urdf, right_urdf, config, applied["left"], applied["right"])
         geometry = cast(DemoGeometry, self.loaded.model)
-        # 此模式不让简化指腹与工件求解接触，避免把指令 2.0 误当成真实夹紧。
+        # 此模式不让简化指腹与工件求解接触；电机开口值不代表夹持力验证。
         for index in self.loaded.finger_geoms:
             geometry.geom_contype[index] = 0
             geometry.geom_conaffinity[index] = 0
         geometry.geom_conaffinity[self.loaded.object_geom] = 1
+        # GP80 仍是静态外形；隐藏指腹只保存演示状态，不作为真实毫米标定。
+        self.loaded.set_grippers(GRIPPER_CLOSED_COMMAND)
+        for indices in self.loaded.finger_positions.values():
+            self.loaded.data.qpos[indices] = 0.04
+        physics.mj_forward(self.loaded.model, self.loaded.data)
+        self.initial_qpos = self.loaded.data.qpos.copy()
+        self.initial_ctrl = self.loaded.data.ctrl.copy()
+        self.reset()
         self.get_mode_notice()
 
     def get_mode_notice(self) -> None:
-        print("简化演示：完整 65 cm 圆柱，夹爪目标 2.0，工件虚拟附着；不是摩擦抓取验证。")
+        print("简化演示：初始 5.65，到位开口 5.5、等待 5 s、+Y 进给及 -Y 退开各 1 cm。")
+        print("完整 65 cm、50 g 圆柱虚拟附着；5.5 是用户指定开口，不代表实测毫米标定或夹持确认。")
 
     def reset(self) -> None:
         super().reset()
         self.attached = False
-        self.gripper_command = 0.0
+        self.gripper_command = GRIPPER_CLOSED_COMMAND
+        self.grasp_wait_elapsed = 0.0
         self.attachment_center = np.zeros(3, dtype=np.float64)
         self.attachment_tcp_midpoint = np.zeros(3, dtype=np.float64)
         self.attachment_relative = np.zeros(3, dtype=np.float64)
@@ -115,6 +133,8 @@ class SimpleGraspDemo(DualGraspDemo):
         self.alignment_tcp: tuple[FloatArray, FloatArray] | None = None
         self.insertion_start_tcp: tuple[FloatArray, FloatArray] | None = None
         self.insertion_displacements: dict[str, list[float]] = {}
+        self.retreat_start_tcp: tuple[FloatArray, FloatArray] | None = None
+        self.retreat_displacements: dict[str, list[float]] = {}
         self.plane_alignment_errors: dict[str, dict[str, float]] = {}
         self.arrival_joint6: dict[str, dict[str, float]] = {}
 
@@ -129,11 +149,13 @@ class SimpleGraspDemo(DualGraspDemo):
                     raise ValueError(side + " 尚未静止")
                 if (
                     float(
-                        np.max(np.abs(self.loaded.data.qpos[self.loaded.finger_positions[side]]))
+                        np.max(np.abs(
+                            self.loaded.data.qpos[self.loaded.finger_positions[side]] - 0.04
+                        ))
                     )
                     > 0.001
                 ):
-                    raise ValueError(side + " 夹爪尚未完全张开")
+                    raise ValueError(side + " 夹爪尚未回到初始闭合状态")
             self.enter("PLANNING")
             motion = prepare_simple_motion(
                 self.kinematics,
@@ -252,31 +274,32 @@ class SimpleGraspDemo(DualGraspDemo):
         now = float(data.time)
         elapsed = now - self.stage_started
         active = self.state
-        paired, sample_time, command = motion.approach, 0.0, 0.0
+        paired, sample_time, command = motion.approach, 0.0, GRIPPER_CLOSED_COMMAND
         if active in ("APPROACH", "APPROACH_SETTLE"):
             sample_time = elapsed if active == "APPROACH" else paired.duration
-        elif active in ("ALIGN_JOINT6", "ALIGN_SETTLE", "OPEN_BEFORE_INSERT"):
+        elif active in ("ALIGN_JOINT6", "ALIGN_SETTLE", "OPEN_FOR_GRASP", "GRASP_WAIT"):
             paired = motion.alignment
             sample_time = elapsed if active == "ALIGN_JOINT6" else paired.duration
-        elif active in ("INSERT", "INSERT_SETTLE", "CLOSE_DEMO"):
+            if active == "OPEN_FOR_GRASP":
+                u = min(1.0, elapsed / GRIPPER_ACTION_S)
+                fraction = 6.0 * u**5 - 15.0 * u**4 + 10.0 * u**3
+                command = GRIPPER_CLOSED_COMMAND + (
+                    GRIPPER_OPEN_COMMAND - GRIPPER_CLOSED_COMMAND
+                ) * fraction
+            elif active == "GRASP_WAIT":
+                command = GRIPPER_OPEN_COMMAND
+        elif active in ("INSERT", "INSERT_SETTLE"):
             paired = motion.insertion
             sample_time = elapsed if active == "INSERT" else paired.duration
-            if active == "CLOSE_DEMO":
-                u = min(1.0, elapsed)
-                command = 2.0 * (6.0 * u**5 - 15.0 * u**4 + 10.0 * u**3)
-        elif active in ("LIFT", "MOVE", "RETURN", "LOWER", "PLACE_SETTLE", "RELEASE", "OPEN_WAIT"):
+            command = GRIPPER_OPEN_COMMAND
+        elif active in ("LIFT", "MOVE", "RETURN", "LOWER", "PLACE_SETTLE"):
             paired = motion.cooperative.paired
             sample_time = (
                 now - self.motion_started
                 if active in ("LIFT", "MOVE", "RETURN", "LOWER")
                 else paired.duration
             )
-            command = 2.0
-            if active == "RELEASE":
-                u = min(1.0, elapsed)
-                command = 2.0 * (1.0 - (6.0 * u**5 - 15.0 * u**4 + 10.0 * u**3))
-            elif active == "OPEN_WAIT":
-                command = 0.0
+            command = GRIPPER_OPEN_COMMAND
             if active in ("LIFT", "MOVE", "RETURN", "LOWER"):
                 leg = min(
                     3,
@@ -289,9 +312,15 @@ class SimpleGraspDemo(DualGraspDemo):
                 label = ("LIFT", "MOVE", "RETURN", "LOWER")[leg]
                 if label != self.state:
                     self.enter(label)
-        elif active in ("RETREAT", "RETREAT_SETTLE"):
+        elif active in ("RETREAT", "RETREAT_SETTLE", "CLOSE_BEFORE_HOME"):
             paired = motion.retreat
             sample_time = elapsed if active == "RETREAT" else paired.duration
+            command = GRIPPER_OPEN_COMMAND
+            if active == "CLOSE_BEFORE_HOME":
+                u = min(1.0, elapsed / GRIPPER_ACTION_S)
+                command += (GRIPPER_CLOSED_COMMAND - GRIPPER_OPEN_COMMAND) * (
+                    6.0 * u**5 - 15.0 * u**4 + 10.0 * u**3
+                )
         elif active in ("RETURN_HOME", "HOME_SETTLE"):
             paired = motion.home
             sample_time = elapsed if active == "RETURN_HOME" else paired.duration
@@ -340,32 +369,33 @@ class SimpleGraspDemo(DualGraspDemo):
             self.enter("ALIGN_SETTLE")
         elif self.state == "ALIGN_SETTLE":
             self.wait_stable(
-                self.converged(motion.alignment) and self.joint6_arrived(), "OPEN_BEFORE_INSERT"
+                self.converged(motion.alignment) and self.joint6_arrived(), "OPEN_FOR_GRASP"
             )
-            if self.state == "OPEN_BEFORE_INSERT":
+            if self.state == "OPEN_FOR_GRASP":
                 self.record_plane("after_XOY_error_rad", 2)
-        elif self.state == "OPEN_BEFORE_INSERT" and elapsed >= 0.5:
+        elif self.state == "OPEN_FOR_GRASP" and elapsed >= GRIPPER_ACTION_S:
+            self.enter("GRASP_WAIT")
+        elif self.state == "GRASP_WAIT" and elapsed >= GRASP_WAIT_S:
+            self.grasp_wait_elapsed = elapsed
             self.insertion_start_tcp = self.tcp_points()
             self.enter("INSERT")
         elif self.state == "INSERT" and elapsed >= motion.insertion.duration:
             self.enter("INSERT_SETTLE")
         elif self.state == "INSERT_SETTLE":
             self.wait_stable(
-                self.converged(motion.insertion) and self.joint6_arrived(), "CLOSE_DEMO"
+                self.converged(motion.insertion) and self.joint6_arrived(), "LIFT"
             )
-            if self.state == "CLOSE_DEMO" and self.insertion_start_tcp is not None:
+            if self.state == "LIFT" and self.insertion_start_tcp is not None:
                 for side, start, end in zip(
                     ("left", "right"), self.insertion_start_tcp, self.tcp_points()
                 ):
                     displacement = end - start
                     self.insertion_displacements[side] = displacement.tolist()
-                    if np.linalg.norm(displacement - [0.0, 0.01, 0.0]) > 0.0005:
+                    if np.linalg.norm(displacement - [0.0, INSERTION_DISTANCE_M, 0.0]) > 0.0005:
                         self.fail(side + " 实际 +Y 进给与 1 cm 目标偏差超过 0.5 mm")
                         return
-        elif self.state == "CLOSE_DEMO" and elapsed >= 1.0:
-            self.attach()
-            self.motion_started = float(data.time)
-            self.enter("LIFT")
+                self.attach()
+                self.motion_started = float(data.time)
         elif self.state in ("LIFT", "MOVE", "RETURN", "LOWER"):
             expected = sample_object(motion.cooperative, float(data.time) - self.motion_started)
             self.maximum_object_error = max(
@@ -383,22 +413,26 @@ class SimpleGraspDemo(DualGraspDemo):
                 self.enter("PLACE_SETTLE")
         elif self.state == "PLACE_SETTLE":
             self.wait_stable(
-                self.converged(motion.cooperative.paired) and self.grounded(), "RELEASE"
+                self.converged(motion.cooperative.paired) and self.grounded(), "RETREAT"
             )
-            if self.state == "RELEASE":
+            if self.state == "RETREAT":
                 self.attached = False
-        elif self.state == "RELEASE" and elapsed >= 1.0:
-            self.enter("OPEN_WAIT")
-        elif self.state == "OPEN_WAIT":
-            opened = all(
-                np.max(np.abs(data.qpos[indices])) < 0.001
-                for indices in self.loaded.finger_positions.values()
-            )
-            self.wait_stable(bool(opened) and self.grounded(), "RETREAT")
+                self.retreat_start_tcp = self.tcp_points()
         elif self.state == "RETREAT" and elapsed >= motion.retreat.duration:
             self.enter("RETREAT_SETTLE")
         elif self.state == "RETREAT_SETTLE":
-            self.wait_stable(self.converged(motion.retreat), "RETURN_HOME")
+            self.wait_stable(self.converged(motion.retreat), "CLOSE_BEFORE_HOME")
+            if self.state == "CLOSE_BEFORE_HOME" and self.retreat_start_tcp is not None:
+                for side, start, end in zip(
+                    ("left", "right"), self.retreat_start_tcp, self.tcp_points()
+                ):
+                    displacement = end - start
+                    self.retreat_displacements[side] = displacement.tolist()
+                    if np.linalg.norm(displacement - [0.0, -INSERTION_DISTANCE_M, 0.0]) > 0.0005:
+                        self.fail(side + " 实际 -Y 退开与 1 cm 目标偏差超过 0.5 mm")
+                        return
+        elif self.state == "CLOSE_BEFORE_HOME" and elapsed >= GRIPPER_ACTION_S:
+            self.enter("RETURN_HOME")
         elif self.state == "RETURN_HOME" and elapsed >= motion.home.duration:
             self.enter("HOME_SETTLE")
         elif self.state == "HOME_SETTLE":
@@ -422,10 +456,23 @@ class SimpleGraspDemo(DualGraspDemo):
             {
                 "mode": "simple_demo",
                 "attachment_method": "virtual_translation_follow",
-                "gripper_closed_command": 2.0,
+                "gripper_closed_command": GRIPPER_CLOSED_COMMAND,
+                "gripper_open_command": GRIPPER_OPEN_COMMAND,
+                "simple_grasp_rule": {
+                    "version": SIMPLE_GRASP_RULE_VERSION,
+                    "closed_command": GRIPPER_CLOSED_COMMAND,
+                    "open_command": GRIPPER_OPEN_COMMAND,
+                    "wait_s": GRASP_WAIT_S,
+                    "actual_wait_s": self.grasp_wait_elapsed,
+                    "insertion_world_m": [0.0, INSERTION_DISTANCE_M, 0.0],
+                    "retreat_world_m": [0.0, -INSERTION_DISTANCE_M, 0.0],
+                    "grasp_confirmation": "assumed_for_demo",
+                    "opening_mapping": "user_defined_command_not_mm_calibration",
+                },
                 "gripper_command": self.gripper_command,
                 "attached": self.attached,
                 "actual_insertion_displacements_world_m": self.insertion_displacements,
+                "actual_retreat_displacements_world_m": self.retreat_displacements,
                 "gripper_plane": "真实 GP80 网格的工具 YZ 平面，法向为工具 X",
                 "gripper_visual": "original_GP80_static_mesh",
                 "initial_position_source": "任务开始时读取当前 MuJoCo data.qpos",

@@ -19,6 +19,10 @@ if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_pytest_test(archer_bringup_regression test/test_circle_launch.py
     ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1)
+  ament_add_pytest_test(archer_real_launch_regression test/test_real_launch.py
+    ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1)
+  ament_add_pytest_test(archer_grasp_real_launch_regression test/test_grasp_real_launch.py
+    ENV PYTEST_DISABLE_PLUGIN_AUTOLOAD=1)
   if(_archer_pytest_autoload STREQUAL "")
     unset(ENV{PYTEST_DISABLE_PLUGIN_AUTOLOAD})
   else()

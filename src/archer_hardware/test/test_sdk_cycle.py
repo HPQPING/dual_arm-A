@@ -330,10 +330,77 @@ class NativeCycleTests(unittest.TestCase):
                     gate.cancel()
                     await asyncio.sleep(.015)
                     self.assertEqual(self.kinds().count('position'), count)
-                    self.assertEqual(self.adapter.state, 'FAULT')
+                    self.assertEqual(self.adapter.state, 'STOPPED')
+                    self.assertEqual(self.adapter._native_error, '')
                     self.assertIn('brake', self.kinds())
                 finally:
                     await self.finish(task)
+        asyncio.run(run())
+
+    def test_peer_cancel_during_native_sampling_returns_brake_without_fault(self) -> None:
+        """复现已复制POSITION后对侧取消：当前包及随后旧副本均只允许BRAKE。"""
+        async def run() -> None:
+            with patch.object(self.sdk, '_send_down_message', self.capture):
+                task = await self.acquire()
+                await self.finish_task_only(task)
+                plan = ContinuousPositionTrajectory.prepare(
+                    (0, 1000000000), ((0.,)*6, (.01,)*6), ((0.,)*6,)*2,
+                    ((0.,)*6,)*2, self.limits, .2)
+                self.adapter._move = replace(plan, preserve_path=True, joint_error_rad=.05)
+                self.adapter.state = 'RUNNING'
+                self.adapter._trajectory_side = 'left'
+                self.adapter._feedback = self.frame()
+                with patch('archer_hardware.position_plan.time.monotonic') as clock:
+                    clock.return_value = 100.
+                    gate = PairedTrajectoryStart(reference_step_s=.004, duration_s=1.,
+                                                 stream_period_s=.004)
+                    gate.ready('left')
+                    gate.ready('right')
+                    clock.return_value = 100.204
+                    self.adapter._trajectory_gate = gate
+                    copied = self.arm._target_command
+                    count = self.kinds().count('position')
+                    gate.cancel()
+                    try:
+                        message = self.arm._construct_joint_command_msg(copied)
+                    except RuntimeError as error:
+                        self.fail('正常取消不应成为SDK构包异常：' + str(error))
+                    await self.api._send_down_message(message)
+                    message = self.arm._construct_joint_command_msg(copied)
+                    await self.api._send_down_message(message)
+                self.assertEqual(self.adapter.state, 'STOPPED')
+                self.assertEqual(self.adapter._native_error, '')
+                self.assertEqual(self.kinds().count('position'), count)
+                self.assertIn('brake', self.kinds())
+                assert self.adapter._native is not None
+                self.adapter._native.close()
+        asyncio.run(run())
+
+    async def finish_task_only(self, task: asyncio.Task) -> None:
+        """暂停真实SDK循环，保留准入缓存以确定性测试编码/发送之间的取消窗口。"""
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    def test_cancel_after_encoding_discards_position_without_secondary_fault(self) -> None:
+        """编码完成之后才取消，最终发送边界也应按正常取消收尾。"""
+        async def run() -> None:
+            with patch.object(self.sdk, '_send_down_message', self.capture):
+                task = await self.acquire()
+                await self.finish_task_only(task)
+                message = self.arm._construct_joint_command_msg(self.arm._target_command)
+                gate = PairedTrajectoryStart()
+                self.adapter._trajectory_gate = gate
+                count = self.kinds().count('position')
+                gate.cancel()
+                await self.api._send_down_message(message)
+                self.assertEqual(self.adapter.state, 'STOPPED')
+                self.assertEqual(self.adapter._native_error, '')
+                self.assertEqual(self.kinds().count('position'), count)
+                brake = self.arm._construct_joint_command_msg(self.arm._target_command)
+                await self.api._send_down_message(brake)
+                self.assertIn('brake', self.kinds())
+                assert self.adapter._native is not None
+                self.adapter._native.close()
         asyncio.run(run())
 
     def test_close_waits_for_brake_queued_by_sdk_encoding_fault(self) -> None:

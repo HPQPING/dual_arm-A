@@ -13,7 +13,7 @@ from unittest.mock import patch
 import yaml
 
 from archer_hardware.commissioning import review_joint_plan
-from archer_hardware.csv_import import import_samples, prepare_samples, replace_conversion_pair
+from archer_hardware.circle_import import import_samples, prepare_samples, replace_conversion_pair
 from archer_hardware.operator_client import main
 from archer_hardware.position_plan import PositionLimits
 
@@ -253,7 +253,7 @@ class CsvImportTests(unittest.TestCase):
             assert isinstance(config_text, str)
             config.write_text(config_text)
             before = source.read_bytes(), summary.read_bytes()
-            args = ['csv-import', '--run-dir', str(root), '--limits-file', str(config)]
+            args = ['circle-import', '--run-dir', str(root), '--limits-file', str(config)]
             with patch('rclpy.init') as initialize, patch(
                 'archer_hardware.hex_adapter.verified_sdk', side_effect=AssertionError('SDK'),
             ):
@@ -328,7 +328,7 @@ class CsvImportTests(unittest.TestCase):
                         raise OSError('模拟报告替换失败')
                     real_replace(source, target)
 
-                with patch('archer_hardware.csv_import.os.replace', side_effect=fail_report):
+                with patch('archer_hardware.circle_import.os.replace', side_effect=fail_report):
                     with self.assertRaises(OSError):
                         replace_conversion_pair(output, b'new trajectory', report, b'new report')
                 if existed:
@@ -373,3 +373,62 @@ class TransitTimingOptionTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def file_path_inputs(tmp_path: Path, name: str = 'state.csv') -> tuple[Path, Path]:
+    """为单文件入口创建有空格的原始目录及独立测试配置。"""
+    root = tmp_path / 'archer_results' / 'task with spaces'
+    root.mkdir(parents=True)
+    source = root / name
+    source.write_bytes(state_csv() if name == 'state.csv' else tracking_csv())
+    (root / 'summary.json').write_text(json.dumps({'state': 'COMPLETED'}), encoding='utf8')
+    config = tmp_path / 'config' / 'circle_real.yaml'
+    config.parent.mkdir()
+    params: dict[str, Any] = {'feedback_tolerance': 0.}
+    for side in ('left', 'right'):
+        for field, values in (('lower', [-1.] * 6), ('upper', [1.] * 6),
+                              ('max_velocity', [.05] * 6), ('max_acceleration', [.1] * 6)):
+            params[side + '_' + field] = values
+    config_text = yaml.safe_dump({'archer_position_driver': {'ros__parameters': params}})
+    assert isinstance(config_text, str)
+    config.write_text(config_text, encoding='utf8')
+    return source, config
+
+
+def test_single_csv_path_default_outputs_and_printed_addresses(tmp_path: Path, capsys) -> None:
+    """只给CSV后自动使用同目录摘要、安装配置及同名转换目录。"""
+    source, config = file_path_inputs(tmp_path)
+    with patch('ament_index_python.packages.get_package_share_directory',
+               return_value=str(config.parent.parent)), patch('rclpy.init') as initialize:
+        assert main(['circle-import', '--input', str(source), '--prepare']) == 0
+        initialize.assert_not_called()
+    output = tmp_path / 'archer_results_trans' / source.parent.name / 'state.json'
+    assert json.loads(output.read_text())['version'] == 2
+    assert output.with_name('state_report.json').is_file()
+    assert str(output) in capsys.readouterr().out
+    assert source.is_file()
+
+
+def test_circle_profile_reuses_existing_prepare_chain(tmp_path: Path) -> None:
+    """预设只展开已有参数，不引入新的规划器或启动设备。"""
+    source, config = file_path_inputs(tmp_path, 'tracking.csv')
+    samples, _ = import_samples(source.read_bytes(), {
+        s: PositionLimits((-1.,) * 6, (1.,) * 6, (.05,) * 6, (.1,) * 6)
+        for s in ('left', 'right')})
+    with patch('archer_hardware.circle_import.prepare_samples',
+               return_value=(samples, {'preparation_succeeded': True})) as prepare:
+        assert main(['circle-import', '--input', str(source), '--limits-file', str(config),
+                     '--profile', 'circle']) == 0
+    for name in ('path_retime', 'smooth_cruise', 'continuous_jerk', 'transit_profile',
+                 'boundary_blend', 'arc_smooth', 'transit_timing', 'return_profile'):
+        assert prepare.call_args.kwargs[name] is True
+    assert prepare.call_args.kwargs['planning_jerk'] == 2.
+
+
+def test_single_file_custom_output_directory(tmp_path: Path) -> None:
+    """显式另存仍沿用CSV主文件名，与默认输出遵循同一规则。"""
+    source, config = file_path_inputs(tmp_path)
+    destination = tmp_path / 'another output'
+    assert main(['circle-import', '--input', str(source), '--limits-file', str(config),
+                 '--output-dir', str(destination)]) == 0
+    assert sorted(p.name for p in destination.iterdir()) == ['state.json', 'state_report.json']

@@ -1,4 +1,4 @@
-"""离线导入仿真CSV，按需保留采样或准备连续限速轨迹，不发送设备指令."""
+"""画圆CSV转换与公共采样准备，不发送设备指令."""
 
 from __future__ import annotations
 
@@ -241,8 +241,13 @@ def replace_conversion_pair(
 def main(args: list[str] | None = None) -> int:
     """从成功任务CSV生成最新同名转换；成功替换，失败保留旧结果，不连接设备."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--run-dir', type=Path, required=True)
-    parser.add_argument('--limits-file', type=Path, required=True)
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument('--input', type=Path, help='原始tracking.csv或state.csv完整路径')
+    inputs.add_argument('--run-dir', type=Path, help='兼容原任务目录输入')
+    parser.add_argument('--limits-file', type=Path,
+                        help='默认使用功能包内config/circle_real.yaml')
+    parser.add_argument('--profile', choices=('circle',),
+                        help='复用完整画圆平滑、时间分配和归位准备参数')
     parser.add_argument('--csv-name', choices=('state.csv', 'tracking.csv'))
     parser.add_argument('--output-dir', type=Path,
                         help='转换文件目录；默认工作空间/archer_results_trans/原任务目录名')
@@ -272,6 +277,18 @@ def main(args: list[str] | None = None) -> int:
     parser.add_argument('--return-profile', action='store_true',
                         help='只在画圆出口融合之后重新规划同步归位；需--transit-timing')
     options = parser.parse_args(args)
+    if options.limits_file is None:
+        from ament_index_python.packages import get_package_share_directory
+        options.limits_file = (Path(get_package_share_directory('archer_hardware'))
+                               / 'config/circle_real.yaml')
+    options.limits_file = options.limits_file.expanduser().resolve()
+    if options.profile == 'circle':
+        for field in ('prepare', 'path_retime', 'smooth_cruise', 'continuous_jerk',
+                      'transit_profile', 'boundary_blend', 'arc_smooth', 'transit_timing',
+                      'return_profile'):
+            setattr(options, field, True)
+        if options.planning_jerk is None:
+            options.planning_jerk = 2.
     if options.smooth and not options.prepare:
         parser.error('--smooth需要同时使用--prepare')
     if options.path_retime and (not options.prepare or options.smooth):
@@ -290,11 +307,22 @@ def main(args: list[str] | None = None) -> int:
         parser.error('--transit-timing需要--arc-smooth')
     if options.return_profile and not options.transit_timing:
         parser.error('--return-profile需要--transit-timing')
-    root = options.run_dir.expanduser().resolve()
+    if options.input is not None:
+        source_path = options.input.expanduser().resolve()
+        if source_path.name not in ('tracking.csv', 'state.csv') or not source_path.is_file():
+            parser.error('--input需要存在的tracking.csv或state.csv文件')
+        if options.csv_name is not None and options.csv_name != source_path.name:
+            parser.error('--csv-name与--input文件名不一致')
+        options.csv_name = source_path.name
+        root = source_path.parent
+    else:
+        root = options.run_dir.expanduser().resolve()
     existing = [name for name in ('state.csv', 'tracking.csv') if (root / name).is_file()]
     selected = options.csv_name or (existing[0] if len(existing) == 1 else None)
     if selected is None:
         parser.error('任务目录必须恰有一种可识别CSV，否则请显式指定--csv-name')
+    if options.profile == 'circle' and selected != 'tracking.csv':
+        parser.error('--profile circle仅适用于画圆tracking.csv')
     stem = Path(selected).stem
     workspace = (root.parent.parent if root.parent.name == 'archer_results'
                  else Path.home() / 'archer_ws')
@@ -304,6 +332,7 @@ def main(args: list[str] | None = None) -> int:
     report_path = (options.report.expanduser() if options.report else
                    output.with_name(output.stem + '_report.json'))
     source, summary = root / selected, root / 'summary.json'
+    output, report_path = output.resolve(), report_path.resolve()
     paths = (source, summary, options.limits_file, output, report_path)
     if len({p.resolve() for p in paths}) != len(paths):
         parser.error('输入、配置、候选和报告不能使用相同文件路径')
@@ -321,6 +350,7 @@ def main(args: list[str] | None = None) -> int:
         source_bytes, limits_bytes = source.read_bytes(), options.limits_file.read_bytes()
         report.update({
             'source_csv': str(source.resolve()),
+            'limits_file': str(options.limits_file.expanduser().resolve()),
             'csv_sha256': hashlib.sha256(source_bytes).hexdigest(),
             'summary_sha256': hashlib.sha256(summary_bytes).hexdigest(),
             'limits_sha256': hashlib.sha256(limits_bytes).hexdigest(),
@@ -371,6 +401,8 @@ def main(args: list[str] | None = None) -> int:
     except (OSError, ValueError) as error:
         print(f'写入失败：{error}；未发送动作')
         return 1
+    print(f'轨迹文件：{output}')
+    print(f'转换报告：{report_path}')
     action = '已准备连续候选' if options.prepare else '已导入采样候选'
     print(f"{action if report['import_succeeded'] else '导入或准备失败'}：{report_path}；未发送动作")
     return 0 if report['import_succeeded'] else 1

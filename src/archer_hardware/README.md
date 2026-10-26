@@ -32,7 +32,7 @@ archer_hardware/
 │   ├── position_node.py        # ROS目标暂存、显式执行与故障联停
 │   ├── operator_client.py      # 显式操作入口，无专用键盘监听
 │   ├── commissioning.py        # 反馈报告、试动预览与普通双臂计划校验
-│   ├── csv_import.py           # 成功任务CSV转为待检查的候选路径
+│   ├── circle_import.py           # 成功任务CSV转为待检查的候选路径
 │   ├── task_file.py            # 原始记录、准备报告及连续文件核对
 │   ├── task_geometry.py        # 接近归位拼接及模型间隙检查
 │   ├── sdk_position.py        # 每臂独立SDK配置、历史与位置编码
@@ -50,7 +50,7 @@ source /opt/ros/humble/setup.bash
 source ~/archer_ws/install/setup.bash
 ros2 run archer_hardware hardware_operator --help
 ros2 run archer_hardware hardware_operator status --timeout 5
-ros2 run archer_hardware hardware_operator csv-import --help
+ros2 run archer_hardware hardware_operator circle-import --help
 ros2 run archer_hardware hardware_operator task-review --help
 ```
 
@@ -120,7 +120,7 @@ J4[-1.575,1.57]、J5[-1.55,1.55]、J6[-2.96,2.96]。
 ## 统一工具入口
 
 面向用户的入口为hardware_operator。只读统计用`hardware_operator audit`，试动预览用
-`hardware_operator trial`，转换用`hardware_operator csv-import`，连续文件核对用
+`hardware_operator trial`，转换用`hardware_operator circle-import`，连续文件核对用
 `hardware_operator task-review`；可分别加`--help`查看参数。
 不再安装hardware_feedback_audit、hardware_joint_trial两个重复别名。
 旧plan-check/plan-retime命令已退役；普通双臂接口所需quintic_stop结构校验保留为内部核心，
@@ -139,7 +139,7 @@ CSV读取已支持在同一入口增加 `--prepare`：保留全部实际关节�
 
 ```bash
 source ~/archer_ws/install/setup.bash
-ros2 run archer_hardware hardware_operator csv-import \
+ros2 run archer_hardware hardware_operator circle-import \
   --run-dir ~/archer_ws/archer_results/某次已完成任务目录 \
   --limits-file ~/archer_ws/src/archer_hardware/config/position_control.yaml \
   --prepare
@@ -175,7 +175,7 @@ ros2 run archer_hardware hardware_operator csv-import \
 
 ## 完整任务文件只读核对
 
-先使用已有 `csv-import --prepare` 生成连续候选，再使用 `task-review` 核对同一轮记录：
+先使用已有 `circle-import --prepare` 生成连续候选，再使用 `task-review` 核对同一轮记录：
 
 ```bash
 ros2 run archer_hardware hardware_operator task-review \
@@ -469,7 +469,7 @@ SDK底层发送完成直接确认该包的取样代次，缓存更新或事件�
 报告中的checked_cross_arm_clearance_m和checked_table_clearance_m保留为宽阶段检索上限，
 实际拒绝门槛由per_contact_pose_bound策略按各接触零件及当前姿态计算。
 
-CSV平滑转换可在`hardware_operator csv-import --prepare`后增加`--smooth`。
+CSV平滑转换可在`hardware_operator circle-import --prepare`后增加`--smooth`。
 平滑按阶段拟合五次样条，保留全部位置采样、阶段停点和真实静止区间，重算普通节点的速度与加速度；
 不再强制每个普通节点的加速度都为零。段内角度、速度及加速度仍使用解析峰值检查，
 角度过冲拒绝生成，导数超限则统一延长时间；不会提高配置上限，也不会连接设备。
@@ -478,7 +478,7 @@ CSV平滑转换可在`hardware_operator csv-import --prepare`后增加`--smooth`
 
 此选项需要与NumPy兼容的SciPy；仅转换进程需要，播放生成的JSON不需要SciPy。
 当前Ubuntu已在`~/.cache/archer_spline_runtime`隔离安装兼容版本，不改写系统依赖。
-转换时使用`PYTHONPATH="$HOME/.cache/archer_spline_runtime:$PYTHONPATH" ros2 run archer_hardware hardware_operator csv-import`，
+转换时使用`PYTHONPATH="$HOME/.cache/archer_spline_runtime:$PYTHONPATH" ros2 run archer_hardware hardware_operator circle-import`，
 再附原来的`--run-dir`、`--limits-file`、`--prepare --smooth`与`--output-dir`参数。
 不加`--smooth`保持原转换行为；试验候选先使用独立输出目录，避免覆盖已跑通版本。
 
@@ -497,7 +497,7 @@ SDK位置校验以最后实际发送的位置为起点，按实际包间隔调�
 参考实现思路：ros-controls/ros2_controllers的共同时间采样；现有五次插值保持不变。
 Ruckig和TOPPRA分别作为加加速度约束及路径时间参数化的候选，当前未引入新依赖。
 
-连续仿真记录可使用`csv-import --prepare --path-retime`进行空间路径重定时。
+连续仿真记录可使用`circle-import --prepare --path-retime`进行空间路径重定时。
 该模式不与`--smooth`叠加：两臂拼成同一个12维关节路径，累计共同弧长，
 用有界最小二乘样条去除反馈的细小波动，再用五次进度分配阶段内时间。
 每个采样点每关节的拟合变化不得超过0.0005rad；原CSV、采样数量、阶段停车位置不变。
@@ -560,7 +560,7 @@ Ruckig和TOPPRA分别作为加加速度约束及路径时间参数化的候选�
 
 `--return-profile`默认关闭，必须与`--transit-timing`及其完整前置链路一起使用。
 生产实现为`archer_control/transit_timing.py`的`replan_circle_return`，
-转换器为`archer_hardware/csv_import.py`，加载复核为`archer_hardware/task_file.py`。
+转换器为`archer_hardware/circle_import.py`，加载复核为`archer_hardware/task_file.py`。
 只处理画圆出口融合窗口之后的归位内部；接近、圆弧、两个融合窗口的状态和段时长保持原值。
 两臂十二关节共享五次平滑进度，局部七次修正匹配出口及末端q/v/a/j，
 执行文件仍使用既有五次段格式。归位目标不变，不修改SDK发送、停止逻辑或实际反馈保护。

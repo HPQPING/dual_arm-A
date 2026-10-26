@@ -36,6 +36,21 @@ class OperatorResultTests(unittest.TestCase):
             review.assert_called_once_with(['--help'])
             initialize.assert_not_called()
 
+    def test_circle_import_dispatch_never_initializes_ros(self) -> None:
+        """画圆转换转交新模块，不创建ROS节点或连接设备。"""
+        with patch('archer_hardware.circle_import.main', return_value=0) as convert:
+            with patch('rclpy.init') as initialize:
+                self.assertEqual(main(['circle-import', '--help']), 0)
+            convert.assert_called_once_with(['--help'])
+            initialize.assert_not_called()
+
+    def test_retired_csv_import_command_fails_before_ros(self) -> None:
+        """旧名称已由circle-import替换，错误用法不能触发硬件操作。"""
+        with patch('rclpy.init') as initialize:
+            with self.assertRaises(SystemExit):
+                main(['csv-import'])
+            initialize.assert_not_called()
+
     def test_retired_plan_commands_fail_before_ros(self) -> None:
         """旧工具命令不再开放，拒绝时不能建立ROS或设备连接."""
         for command in ('plan-check', 'plan-retime'):

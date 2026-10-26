@@ -330,6 +330,9 @@ class PositionNodeTests(unittest.TestCase):
                 f'allow_continuous_trajectory:={str(allow_continuous_trajectory).lower()}', '-p',
                 f'allow_task_file_trajectory:={str(allow_task_file_trajectory).lower()}']
         args.extend(['-p', f'task_joint_error_rad:={task_joint_error_rad}'])
+        # 即使替身接入发生回归，测试也不能尝试真实控制器的默认地址。
+        args.extend(['-p', 'left_url:=ws://127.0.0.1:1',
+                     '-p', 'right_url:=ws://127.0.0.1:2'])
         if configured:
             for side in ('left', 'right'):
                 args.extend(['-p', f'{side}_limits_confirmed:=true'])
@@ -345,6 +348,9 @@ class PositionNodeTests(unittest.TestCase):
         ):
             node = PositionControlNode()
         self.nodes.append(node)
+        if configured:
+            for worker in node.workers.values():
+                self.assertIs(getattr(worker.factory, 'func', None), FakeBackend)
         self.executor = SingleThreadedExecutor()
         self.executor.add_node(node)
         self.observer = Node('position_test_observer')

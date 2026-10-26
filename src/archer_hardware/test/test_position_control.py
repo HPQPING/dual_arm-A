@@ -11,6 +11,7 @@ from typing import Any
 import unittest
 from unittest.mock import patch
 
+
 import numpy as np
 
 from archer_hardware.hex_adapter import HexFeedbackAdapter, JointFeedback
@@ -20,6 +21,26 @@ from archer_hardware.position_plan import (
     limit_preparation_complete, limit_preparation_goal, prepare_continuous_pair,
     delivery_reference_step,
 )
+
+
+def test_expected_cancellation_does_not_hide_unstarted_or_preparation_timeout():
+    """正常取消单独分类；未启动和首次准备超时仍是实际错误。"""
+    from archer_hardware.position_plan import PairedTrajectoryStart, TrajectoryCancelled
+
+    with patch('archer_hardware.position_plan.time.monotonic') as clock:
+        clock.return_value = 100.
+        gate = PairedTrajectoryStart(reference_step_s=.004, duration_s=1., stream_period_s=.004)
+        with unittest.TestCase().assertRaisesRegex(RuntimeError, '尚未启动') as caught:
+            gate.playback('left', None)
+        assert type(caught.exception) is RuntimeError
+        gate.cancel()
+        with unittest.TestCase().assertRaises(TrajectoryCancelled):
+            gate.playback('left', None)
+        expired = PairedTrajectoryStart()
+        clock.return_value = 1000.
+        with unittest.TestCase().assertRaisesRegex(RuntimeError, '准备超时') as caught:
+            expired.start_time()
+        assert type(caught.exception) is RuntimeError
 
 
 def fixture_limits() -> PositionLimits:
@@ -1713,9 +1734,8 @@ class PositionAdapterTests(unittest.TestCase):
                                     ((0.0,) * 6, (0.01,) * 6), 'left', gate)
         gate.cancel()
         self.send.reset_mock()
-        with self.assertRaisesRegex(RuntimeError, '双臂轨迹已取消'):
-            self.adapter.tick()
-        self.assertEqual(self.adapter.state, 'FAULT')
+        self.adapter.tick()
+        self.assertEqual(self.adapter.state, 'STOPPED')
         self.assertEqual([c.args[1] for c in self.send.call_args_list], ['brake'])
 
     def test_armed_late_start_is_cancelled(self) -> None:

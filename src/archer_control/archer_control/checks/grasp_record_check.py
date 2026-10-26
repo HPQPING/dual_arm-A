@@ -12,7 +12,11 @@ from pathlib import Path
 import numpy as np
 from numpy.typing import NDArray
 
-from ..grasp_record_format import EVENT_FIELDS, SIDES, STATE_FIELDS
+from ..grasp_record_format import (
+    EVENT_FIELDS, SIDES, STATE_FIELDS, GRASP_WAIT_S, GRIPPER_CLOSED_COMMAND,
+    GRIPPER_OPEN_COMMAND, INSERTION_DISTANCE_M, SIMPLE_GRASP_RULE_VERSION,
+    SIMPLE_GRASP_STAGES,
+)
 
 
 FloatArray = NDArray[np.float64]
@@ -31,6 +35,9 @@ ZERO_STAGES = frozenset(
         "OPEN_WAIT",
         "RETREAT",
         "RETREAT_SETTLE",
+        "OPEN_FOR_GRASP",
+        "GRASP_WAIT",
+        "CLOSE_BEFORE_HOME",
     )
 )
 REQUIRED_STAGES = (
@@ -122,6 +129,29 @@ def load_run(directory: str | Path) -> GraspRun:
         raise ValueError(
             "该记录不是完整成功的简化抓取任务；请查看 summary.json 中的失败或中断原因"
         )
+    rule = summary.get("simple_grasp_rule")
+    current_rule = rule is not None
+    insertion_distance = INSERTION_DISTANCE_M
+    required_stages = SIMPLE_GRASP_STAGES if current_rule else REQUIRED_STAGES
+    carried_command = GRIPPER_OPEN_COMMAND if current_rule else 2.0
+    home_command = GRIPPER_CLOSED_COMMAND if current_rule else 0.0
+    if current_rule:
+        rule = mapping(rule, "simple_grasp_rule")
+        # 保留上一轮2mm记录的只读验收，新转换器只接受当前1cm规则。
+        if rule.get("version") == 2:
+            insertion_distance = 0.002
+        if (
+            type(rule.get("version")) is not int
+            or rule.get("version") not in (2, SIMPLE_GRASP_RULE_VERSION)
+            or rule.get("open_command") != GRIPPER_OPEN_COMMAND
+            or rule.get("closed_command") != GRIPPER_CLOSED_COMMAND
+            or rule.get("wait_s") != GRASP_WAIT_S
+            or rule.get("insertion_world_m") != [0.0, insertion_distance, 0.0]
+            or rule.get("retreat_world_m") != [0.0, -insertion_distance, 0.0]
+            or rule.get("grasp_confirmation") != "assumed_for_demo"
+            or number(rule.get("actual_wait_s"), "actual_wait_s") < GRASP_WAIT_S
+        ):
+            raise ValueError("简化协同规则或等待时间与当前约定不一致")
     config = {
         key: number(value, "config/" + key)
         for key, value in mapping(summary.get("config"), "config").items()
@@ -209,11 +239,11 @@ def load_run(directory: str | Path) -> GraspRun:
         stage = event["stage"]
         if stage == "PAUSED":
             continue
-        if stage not in REQUIRED_STAGES:
+        if stage not in required_stages:
             raise ValueError("事件日志包含未知或异常阶段：" + stage)
         if not sequence or sequence[-1] != stage:
             sequence.append(stage)
-    if tuple(sequence) != REQUIRED_STAGES:
+    if tuple(sequence) != required_stages:
         raise ValueError("阶段日志未包含完整且有序的抓取与归位流程")
     if frames[0].stage != "READY" or frames[-1].stage != "COMPLETED":
         raise ValueError("状态记录起止阶段不正确")
@@ -233,8 +263,13 @@ def load_run(directory: str | Path) -> GraspRun:
         previous_time, previous_wall = frame.time, frame.wall_time
         if not 0.0 <= frame.command <= 5.65:
             raise ValueError("夹爪命令超出 0～5.65")
-        if frame.attached and not math.isclose(frame.command, 2.0, abs_tol=1e-12):
-            raise ValueError("虚拟附着期间夹爪命令不是 2.0")
+        if frame.attached and not math.isclose(frame.command, carried_command, abs_tol=1e-12):
+            raise ValueError("虚拟附着期间夹爪命令与本轮规则不一致")
+        if current_rule and frame.stage in (
+            "INSERT", "INSERT_SETTLE", "LIFT", "MOVE", "RETURN", "LOWER",
+            "PLACE_SETTLE", "RETREAT", "RETREAT_SETTLE",
+        ) and not math.isclose(frame.command, carried_command, abs_tol=1e-12):
+            raise ValueError("进给、搬运或退开期间没有保持 5.5 开口")
         if not math.isclose(float(np.linalg.norm(frame.object_pose[3:])), 1.0, abs_tol=1e-6):
             raise ValueError("圆柱姿态四元数未归一化")
         if frame.stage in ZERO_STAGES and np.max(np.abs(frame.inputs[:, 5])) > 1e-12:
@@ -263,8 +298,34 @@ def load_run(directory: str | Path) -> GraspRun:
     ):
         raise ValueError("CSV 起终点与摘要中的反馈不一致")
     home_error = float(np.max(np.abs(final - start)))
-    if home_error > 0.003 or frames[-1].attached or frames[-1].command != 0.0:
-        raise ValueError("任务未完成归位、解除附着和松开")
+    if home_error > 0.003 or frames[-1].attached or frames[-1].command != home_command:
+        raise ValueError("任务未完成归位、解除附着或恢复约定的夹爪状态")
+    if current_rule:
+        if frames[0].command != home_command:
+            raise ValueError("新规则记录必须从夹爪闭合 5.65 开始")
+        waiting = [frame for frame in frames if frame.stage == "GRASP_WAIT"]
+        inserted = [frame for frame in frames if frame.stage == "INSERT"]
+        if (not waiting or not inserted
+                or inserted[0].time - waiting[0].time < GRASP_WAIT_S - 0.061):
+            raise ValueError("记录中的进给开始前没有等待 5 秒")
+        displacements = mapping(
+            summary.get("actual_insertion_displacements_world_m"), "insertion"
+        )
+        for side in SIDES:
+            value = displacements.get(side)
+            if not isinstance(value, list) or len(value) != 3:
+                raise ValueError("摘要缺少进给实际位移：" + side)
+            vector = np.asarray([number(v, "insertion") for v in value], dtype=np.float64)
+            if np.linalg.norm(vector - [0.0, insertion_distance, 0.0]) > 0.0005:
+                raise ValueError("摘要进给位移与本轮 +Y 目标不一致：" + side)
+        retreats = mapping(summary.get("actual_retreat_displacements_world_m"), "retreat")
+        for side in SIDES:
+            value = retreats.get(side)
+            if not isinstance(value, list) or len(value) != 3:
+                raise ValueError("摘要缺少退开实际位移：" + side)
+            vector = np.asarray([number(v, "retreat") for v in value], dtype=np.float64)
+            if np.linalg.norm(vector - [0.0, -insertion_distance, 0.0]) > 0.0005:
+                raise ValueError("摘要退开位移与本轮 -Y 目标不一致：" + side)
     if not any(frame.attached for frame in frames):
         raise ValueError("记录没有包含虚拟夹取阶段")
     final_object = summary.get("final_object_center_world_m")

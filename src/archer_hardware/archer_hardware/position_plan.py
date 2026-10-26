@@ -17,6 +17,11 @@ from .hex_adapter import six_values
 
 MAX_TASK_JOINT_ERROR_RAD = .05  # 完整文件观察运行的最大偏差范围，不改变关节限位。
 
+
+class TrajectoryCancelled(RuntimeError):
+    """已明确取消的执行状态；发送循环按停止收尾，不作为新的SDK故障。"""
+
+
 if TYPE_CHECKING:
     from archer_control.trajectory import FloatArray
 
@@ -584,9 +589,11 @@ class PairedTrajectoryStart:
         """按共同单调时钟连续推进；发送确认只用于失联检查和末包计时."""
         now = time.monotonic()
         with self._lock:
+            if self._cancelled:
+                raise TrajectoryCancelled('双臂轨迹已取消')
             if (not self.delivery_paced or side not in ('left', 'right')
-                    or self._start is None or now < self._start or self._cancelled):
-                raise RuntimeError('共用参考时钟未启动或已经取消')
+                    or self._start is None or now < self._start):
+                raise RuntimeError('共用参考时钟尚未启动或取样配置无效')
             return self._stream_playback(side, delivered_generation, now)
 
     def confirm_delivery(self, side: str, generation: int) -> None:
@@ -676,8 +683,9 @@ class PairedTrajectoryStart:
         with self._lock:
             if self._start is None and time.monotonic() > self._expires:
                 self._cancelled = True
+                raise RuntimeError('双臂轨迹准备超时')
             if self._cancelled:
-                raise RuntimeError('双臂轨迹启动已取消或准备超时')
+                raise TrajectoryCancelled('双臂轨迹启动已取消')
             return self._start
 
     def cancel(self) -> None:

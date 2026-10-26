@@ -28,6 +28,8 @@ setup(
         'console_scripts': [
             'hardware_feedback = archer_hardware.driver_node:main',
             'hardware_position = archer_hardware.position_node:main',
+            'hardware_circle = archer_hardware.circle_task:main',
+            'hardware_grasp = archer_hardware.grasp_task:main',
             'hardware_operator = archer_hardware.operator_client:main',
         ],
     },

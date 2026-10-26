@@ -253,9 +253,12 @@ def main(args: list[str] | None = None) -> int:
     if arguments and arguments[0] == 'task-review':
         from .task_file import main as task_review_main
         return task_review_main(arguments[1:])
-    if arguments and arguments[0] == 'csv-import':
-        from .csv_import import main as csv_import_main
-        return csv_import_main(arguments[1:])
+    if arguments and arguments[0] == 'circle-import':
+        from .circle_import import main as circle_import_main
+        return circle_import_main(arguments[1:])
+    if arguments and arguments[0] == 'grasp-import':
+        from .grasp_import import main as grasp_import_main
+        return grasp_import_main(arguments[1:])
     # 联调工具只在显式选择时载入；不创建操作客户端或控制服务请求。
     if arguments and arguments[0] in ('audit', 'trial'):
         from .commissioning import audit_main, trial_main
@@ -267,7 +270,7 @@ def main(args: list[str] | None = None) -> int:
     )
     parser.add_argument(
         'command', choices=COMMANDS + (
-            'audit', 'trial', 'csv-import', 'task-review',
+            'audit', 'trial', 'circle-import', 'grasp-import', 'task-review',
         ),
         nargs='?', default='status',
     )
@@ -281,9 +284,9 @@ def main(args: list[str] | None = None) -> int:
     if options.timeout is None:
         options.timeout = 120. if options.command == 'task-run' else 30.
     if options.command in (
-        'audit', 'trial', 'csv-import', 'task-review',
+        'audit', 'trial', 'circle-import', 'grasp-import', 'task-review',
     ):
-        parser.error('audit/trial/csv-import/task-review 子命令必须放在参数最前面')
+        parser.error('audit/trial/circle-import/grasp-import/task-review 子命令必须放在参数最前面')
     positive(options.timeout, 'timeout')
     task_request: dict[str, Any] | None = None
     if options.command == 'task-run':

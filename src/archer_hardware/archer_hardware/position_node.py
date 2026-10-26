@@ -141,7 +141,7 @@ def file_request_id(text: str) -> str:
 
 def _review_file_request(
     text: str, limits: dict[str, PositionLimits], max_excursion: float,
-    cancelled: PreparationCancellation,
+    cancelled: PreparationCancellation, *, task_type: str = 'split_circle',
 ) -> Any:
     """共用定位请求解析与文件快照核对，不重复实现文件验证规则."""
     from .task_file import json_mapping, load_reviewed_task
@@ -168,8 +168,13 @@ def _review_file_request(
         paths['run_dir'], paths['limits_file'], paths['prepared_file'], paths['report_file'],
         max_excursion=max_excursion, cancelled=cancelled.is_set,
     )
-    if reviewed.report['task_type'] != 'split_circle':
+    if task_type not in ('split_circle', 'cooperative_grasp'):
+        raise ValueError('未知完整任务类型')
+    if reviewed.report['task_type'] != task_type:
         raise ValueError('抓取文件含虚拟附着事件，真实夹爪未接入；当前仅允许画圆文件进入位置执行')
+    if (task_type == 'cooperative_grasp'
+            and reviewed.report.get('gripper_schedule_verified') is not True):
+        raise ValueError('协同执行需要已核对的新夹爪指令时序')
     if set(limits) != {'left', 'right'} or any(
         reviewed.plans[side].limits != limits[side] for side in ('left', 'right')
     ):
@@ -180,11 +185,12 @@ def _review_file_request(
 def prepare_file_core_message(
     text: str, limits: dict[str, PositionLimits], max_excursion: float,
     cancelled: PreparationCancellation, *, joint_error_rad: float, control_hz: int = 500,
+    task_type: str = 'split_circle',
 ) -> PreparedFileCore:
     """只在未申请控制时核对文件主体，返回可跨进程复用的数值与几何结果."""
     from .task_geometry import check_task_geometry
 
-    reviewed = _review_file_request(text, limits, max_excursion, cancelled)
+    reviewed = _review_file_request(text, limits, max_excursion, cancelled, task_type=task_type)
     error = checked_joint_error(joint_error_rad, limits['left'].feedback_tolerance,
                                 nominal_feedback_guarded=True)
     checked_joint_error(error, limits['right'].feedback_tolerance, nominal_feedback_guarded=True)
@@ -205,16 +211,20 @@ def prepare_file_task_message(
     saved_initial: dict[str, tuple[float, ...]] | None = None,
     startup_joint_error_rad: float = 0., prepared_core: PreparedFileCore | None = None,
     control_hz: int = 500,
+    task_type: str = 'split_circle',
 ) -> StagedPair:
     """根据最新实测和保持目标检查衔接；匹配的主体结果不重复计算."""
     from .task_file import ReviewedTask, json_mapping
     from .task_geometry import assemble_task_cycle, check_task_geometry, prepare_approach
     from .task_geometry import prepare_return, trajectory_fingerprint
 
+    if task_type not in ('split_circle', 'cooperative_grasp'):
+        raise ValueError('未知完整任务类型')
     identifier = file_request_id(text)
     data = json_mapping(text.encode('utf-8'))
     if prepared_core is None:
-        reviewed = _review_file_request(text, limits, max_excursion, cancelled)
+        reviewed = _review_file_request(
+            text, limits, max_excursion, cancelled, task_type=task_type)
     else:
         if (prepared_core.request_sha256 != hashlib.sha256(text.encode()).hexdigest()
                 or prepared_core.control_hz != control_hz
@@ -222,9 +232,13 @@ def prepare_file_task_message(
                 or set(prepared_core.plans) != {'left', 'right'}
                 or any(prepared_core.plans[s].limits != limits[s] for s in limits)
                 or prepared_core.geometry.get('task_trajectory_sha256')
-                != trajectory_fingerprint(prepared_core.plans)):
+                != trajectory_fingerprint(prepared_core.plans)
+                or prepared_core.report.get('task_type') != task_type):
             raise ValueError('主体检查与请求、限位或轨迹不同，必须重新检查')
         reviewed = ReviewedTask(prepared_core.plans, prepared_core.report)
+    if (task_type == 'cooperative_grasp'
+            and reviewed.report.get('gripper_schedule_verified') is not True):
+        raise ValueError('协同执行需要已核对的夹爪时序')
     transition = positive(data['transition_max_excursion'], 'transition_max_excursion')
     error = checked_joint_error(joint_error_rad, limits['left'].feedback_tolerance,
                                 nominal_feedback_guarded=True)
@@ -283,7 +297,7 @@ def prepare_file_task_message(
                            startup_duration_s=approach[side].duration if startup_error else 0.)
              for side, curve in cycle.items()}
     details = {
-        'request_id': identifier, 'task_type': 'split_circle',
+        'request_id': identifier, 'task_type': task_type,
         'duration_s': cycle['left'].duration, 'sha256': dict(reviewed.report['sha256']),
         'initial_positions': {s: list(p.initial) for s, p in cycle.items()},
         'actual_initial_positions': {s: list(p) for s, p in start.items()},
@@ -306,15 +320,32 @@ def prepare_file_task_message(
         'sampled_geometry': geometry, 'preserve_path': True,
         'gripper_commands_included': False,
     }
+    if task_type == 'cooperative_grasp':
+        from copy import deepcopy
+
+        schedule = deepcopy(reviewed.report['gripper_event_schedule'])
+        offset = approach['left'].times_ns[-1]
+        schedule['phase_start_ns'] = {k: v + offset
+                                      for k, v in schedule['phase_start_ns'].items()}
+        for event in schedule['events']:
+            if event['phase'] != 'BEFORE_MOTION':
+                event['time_ns'] += offset
+            if 'end_time_ns' in event:
+                event['end_time_ns'] += offset
+        details['gripper_event_schedule'] = schedule
     return StagedPair(cycle['left'].times_ns, {}, 0., cycle, details)
 
 
 class PositionControlNode(Node):
     """双臂各有独立执行线程，ROS 服务只受理请求并发布状态."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, task_type: str = 'split_circle',
+                 backend_type: Callable[..., PositionBackend] | None = None) -> None:
         """校验所有启动参数后再创建线程，默认不连接任何设备."""
         super().__init__('archer_position_driver')
+        if task_type not in ('split_circle', 'cooperative_grasp'):
+            raise ValueError('未知任务类型')
+        self._task_type = task_type
         descriptor = ParameterDescriptor(read_only=True, dynamic_typing=True)
         defaults = {
             'arms': 'both', 'connect_on_start': False, 'control_hz': 250,
@@ -435,8 +466,9 @@ class PositionControlNode(Node):
                     vectors['max_acceleration'], feedback_tolerance=feedback_tolerance,
                 )
                 self.limits[side] = limits
+                selected_backend = HexPositionAdapter if backend_type is None else backend_type
                 factory = partial(
-                    HexPositionAdapter, url, limits, control_hz=frequency,
+                    selected_backend, url, limits, control_hz=frequency,
                     max_excursion=self.max_excursion, tracking_tolerance=tolerance,
                     readiness_timeout=readiness_timeout,
                 )
@@ -744,6 +776,11 @@ class PositionControlNode(Node):
             self._paired_phase = 'VALIDATING'
             assert self._preparer is not None
             if task_file:
+                extra: dict[str, Any] = {}
+                if getattr(self, '_task_type', 'split_circle') == 'cooperative_grasp':
+                    extra['task_type'] = 'cooperative_grasp'
+                if prepared_core is not None:
+                    extra['prepared_core'] = prepared_core
                 self._preparation = self._preparer.submit(
                     prepare_file_task_message, text, dict(self.limits), self.max_excursion,
                     {side: frame.positions for side, frame in frames.items()},
@@ -753,7 +790,7 @@ class PositionControlNode(Node):
                     joint_error_rad=self.task_joint_error_rad,
                     startup_joint_error_rad=self.task_startup_joint_error_rad,
                     control_hz=round(1. / self._control_period),
-                    **({'prepared_core': prepared_core} if prepared_core is not None else {}),
+                    **extra,
                 )
             else:
                 self._preparation = self._preparer.submit(
@@ -882,6 +919,17 @@ class PositionControlNode(Node):
             self._paired_phase = 'PREPARING'
             self._paired_requested_at = time.monotonic()
             try:
+                if getattr(self, '_task_type', 'split_circle') == 'cooperative_grasp':
+                    from .gripper_adapter import CooperativePositionAdapter
+
+                    if (plan.details is None
+                            or plan.details.get('task_type') != 'cooperative_grasp'):
+                        raise RuntimeError('协同入口只执行已核对的完整协同文件')
+                    for side in self.sides:
+                        backend = self.workers[side]._backend
+                        if not isinstance(backend, CooperativePositionAdapter):
+                            raise RuntimeError('协同入口缺少夹爪后端')
+                        backend.gripper.bind_program(plan.details['gripper_event_schedule'], gate)
                 for side in self.sides:
                     if plan.continuous is None:
                         identifiers[side] = self.workers[side].submit(

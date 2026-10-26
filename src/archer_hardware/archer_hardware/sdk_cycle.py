@@ -8,6 +8,8 @@ from threading import Event, RLock
 import time
 from typing import Any, Callable
 
+from .position_plan import TrajectoryCancelled
+
 
 @dataclass(frozen=True)
 class PositionSample:
@@ -47,10 +49,27 @@ class SdkCycleSender:
         self.last_position: tuple[float, ...] | None = None
         self.last_position_at: float | None = None
         self.sample_position: Callable[[], PositionSample | None] | None = None
+        self.cancel_position: Callable[[], None] | None = None
+        self._position_cancelled = False
+
+    def _brake_message(self, arm: Any) -> Any:
+        """为SDK已复制的旧位置命令返回合法制动编码，仍由发送出口核对准入。"""
+        targets = arm._construct_custom_motor_msg(self.types.BRAKE, [True] * 6)
+        return arm._construct_custom_joint_command_msg(targets)
+
+    def _cancel_position(self) -> None:
+        """复用调用方停止状态和BRAKE生命周期，不在SDK线程等待自身发送。"""
+        if self.cancel_position is not None:
+            self.cancel_position()
+        else:
+            self.cancel()
 
     def encode_position(self, arm: Any, command: Any, encode: Callable[[Any], Any]) -> Any:
         """在官方周期实际构包时取样，避免反复发送旧缓存后跳到较晚目标."""
         with self.lock:
+            if (command.command_type == self.types.POSITION
+                    and (self.closed or self._position_cancelled)):
+                return self._brake_message(arm)
             request = self.pending.get('position')
             if (self.closed or self.sample_position is None or request is None
                     or command.command_type != self.types.POSITION):
@@ -59,7 +78,11 @@ class SdkCycleSender:
                 raise RuntimeError('SDK 构包时目标代次已失效')
             if time.perf_counter() > request.deadline:
                 raise RuntimeError('SDK 目标超过40ms未更新，禁止周期取样复活旧任务')
-            sample = self.sample_position()
+            try:
+                sample = self.sample_position()
+            except TrajectoryCancelled:
+                self._cancel_position()
+                return self._brake_message(arm)
             if sample is None:
                 return encode(command)
             sampled = deepcopy(command)
@@ -91,8 +114,10 @@ class SdkCycleSender:
                 if target is None:
                     raise RuntimeError('位置目标为空')
                 arm.motor_command(self.types.POSITION, list(target))
+                self._position_cancelled = False
             elif kind == 'brake':
                 self.pending.clear()
+                self._position_cancelled = True
                 arm.motor_command(self.types.BRAKE, [True] * 6)
             elif kind == 'initialize':
                 arm.start()
@@ -119,6 +144,7 @@ class SdkCycleSender:
         """立即使缓存目标失效；之后仍可显式提交本代 BRAKE."""
         with self.lock:
             self.pending.clear()
+            self._position_cancelled = True
             self.last_position = None
             self.last_position_at = None
 
@@ -126,6 +152,7 @@ class SdkCycleSender:
         """关闭发送准入，不发失能、归位或零力矩命令."""
         with self.lock:
             self.closed = True
+            self._position_cancelled = True
             self.pending.clear()
             self.last_position = None
             self.last_position_at = None
@@ -204,7 +231,7 @@ class SdkCycleSender:
             with self.lock:
                 captured.delivered.set()
                 if (kind == 'position' and captured.epoch == self.epoch()
-                        and not self.closed):
+                        and not self.closed and not self._position_cancelled):
                     # 实际发送已完成，即使缓存已更新，也须登记这份包的原始目标。
                     # 不读可能已被后来构造操作更新的SDK历史，更不复活取消代次。
                     self.last_position = sent_target
@@ -214,5 +241,7 @@ class SdkCycleSender:
                 if self.pending.get(kind) is captured:
                     if kind in ('initialize', 'calibrate', 'clear_api_timeout'):
                         self.pending.pop(kind)
+        except TrajectoryCancelled:
+            self._cancel_position()
         except Exception as error:
             self.fail(str(error))

@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import yaml
 
-from archer_hardware.csv_import import main as prepare_main
+from archer_hardware.circle_import import main as prepare_main
 from archer_hardware.operator_client import main as operator_main
 from archer_hardware.task_file import json_mapping, review_task_files
 from archer_hardware.position_node import prepare_file_task_message

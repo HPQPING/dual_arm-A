@@ -1,0 +1,32 @@
+# 协同任务独立配置：转换不连接设备；dual_grasp_real显式execute=true才执行。
+# 双臂共用控制器：左CAN0/8439、右CAN1/9439；单位rad、rad/s、rad/s²。
+# 关节范围沿用已验证画圆配置，包括J2/J4的-1.575rad项目工程下限。
+# V0.5/A0.3为项目上限；不是厂商加速度额定值。250Hz及反馈保护沿用现有驱动。
+# 夹爪约定为5.65闭合、5.5任务开口；没有将数值换算成毫米或证明实际夹持。
+archer_position_driver:
+  ros__parameters:
+    arms: both
+    connect_on_start: false
+    allow_paired_trajectory: false
+    allow_continuous_trajectory: false
+    allow_task_file_trajectory: false
+    readiness_timeout: 10.0
+    control_hz: 250
+    startup_timeout: 10.0
+    target_timeout: 5.0
+    max_excursion: 0.05
+    tracking_tolerance: 0.10
+    feedback_tolerance: 0.005
+    left_url: "ws://192.168.1.100:8439"
+    right_url: "ws://192.168.1.100:9439"
+    left_limits_confirmed: false
+    right_limits_confirmed: false
+    left_lower: [-2.61, -1.575, 0.0, -1.575, -1.55, -2.96]
+    left_upper: [2.79, 2.09, 3.14, 1.57, 1.55, 2.96]
+    left_max_velocity: [0.50, 0.50, 0.50, 0.50, 0.50, 0.50]
+    left_max_acceleration: [0.30, 0.30, 0.30, 0.30, 0.30, 0.30]
+    right_lower: [-2.61, -1.575, 0.0, -1.575, -1.55, -2.96]
+    right_upper: [2.79, 2.09, 3.14, 1.57, 1.55, 2.96]
+    right_max_velocity: [0.50, 0.50, 0.50, 0.50, 0.50, 0.50]
+    right_max_acceleration: [0.30, 0.30, 0.30, 0.30, 0.30, 0.30]
+    use_sim_time: false

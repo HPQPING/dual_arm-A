@@ -19,7 +19,7 @@ from .sdk_cycle import PositionSample, SdkCycleSender
 from .sdk_position import isolated_arm_class
 from .position_plan import (
     ContinuousPositionTrajectory, JointPositionMove, JointPositionTrajectory,
-    PairedTrajectoryStart, PositionLimits,
+    PairedTrajectoryStart, PositionLimits, TrajectoryCancelled,
     limit_preparation_complete, limit_preparation_goal, positive,
 )
 
@@ -91,6 +91,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
             self._check_dispatch, self._native_failure, lambda: self._epoch, self._command_types,
         )
         self._native.sample_position = self._stream_position_sample
+        self._native.cancel_position = lambda: self.stop(wait=False)
 
         class PositionAPI(managed_base):
             """替换机械臂类并保留附属设备反馈，控制下行经项目核对."""
@@ -228,7 +229,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
         """发布缓存及官方真实发送前都复核会话、故障、反馈与双臂取消."""
         if (kind == 'position' and self._trajectory_gate is not None
                 and self._trajectory_gate.cancelled):
-            raise RuntimeError('双臂轨迹已取消，禁止发送排队的位置消息')
+            raise TrajectoryCancelled('双臂轨迹已取消，禁止发送排队的位置消息')
         permitted = (
             kind == 'clear_api_timeout' and self.state == 'REQUESTING'
             and self.readiness_stage == 'CLEARING_API_TIMEOUT'
@@ -490,6 +491,8 @@ class HexPositionAdapter(HexFeedbackAdapter):
             if self._native_error:
                 raise RuntimeError(self._native_error)
             self._tick()
+        except TrajectoryCancelled:
+            self.stop(wait=False)
         except Exception as error:
             self.last_error = str(error)
             self.stop(fault=True)
@@ -577,7 +580,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
         if not calibrated:
             raise RuntimeError('设备 calibrated 状态失效，停止发送位置目标')
         if self._trajectory_gate is not None and self._trajectory_gate.cancelled:
-            raise RuntimeError('双臂轨迹已取消，停止后续位置发送')
+            raise TrajectoryCancelled('双臂轨迹已取消，停止后续位置发送')
         if now - self._last_tick > 0.04:
             raise RuntimeError('位置目标更新间隔超过 40 ms')
         if self.state == 'ARMED':

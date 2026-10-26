@@ -16,7 +16,7 @@ import yaml
 
 from archer_control.continuous_trajectory import RecordedTimeMap, circle_blend_windows
 from .position_plan import load_limits
-from .csv_import import import_samples
+from .circle_import import import_samples
 from .position_plan import ContinuousPositionTrajectory, positive, prepare_continuous_pair
 
 
@@ -76,13 +76,17 @@ def completed_task(summary: Mapping[str, Any], csv_name: str) -> str:
     raise ValueError('只接受画圆或完整圆柱抓取任务，不接受旧协同参考物示意')
 
 
-def check_task_stages(stages: object, task: str) -> None:
+def check_task_stages(stages: object, task: str, *, simplified_grasp: bool = False) -> None:
     """每侧必须依次包含任务主要阶段和最终归位，禁止截取部分文件冒充整轮."""
     if not isinstance(stages, list) or any(not isinstance(s, str) for s in stages):
         raise ValueError('任务阶段必须是字符串序列')
     required = (('APPROACH', 'ARC', 'RETURN_HOME') if task == 'split_circle' else
                 ('APPROACH', 'ALIGN_JOINT6', 'INSERT', 'CLOSE_DEMO', 'LIFT',
                  'RELEASE', 'RETREAT', 'RETURN_HOME', 'COMPLETED'))
+    if task == 'cooperative_grasp' and simplified_grasp:
+        from .grasp_events import GRASP_MOTION_STAGES
+
+        required = GRASP_MOTION_STAGES
     cursor = 0
     for name in required:
         try:
@@ -202,12 +206,25 @@ def load_reviewed_task(
     if not isinstance(stage_report, dict) or set(stage_report) != {'left', 'right'}:
         raise ValueError('准备报告缺少双侧原始阶段')
     required_stops = {0, count - 1}
+    settle_boundaries: set[int] = set()
+    continuous_events: set[int] = set()
+    settle_blend = report.get('cooperative_settle_blend')
+    if settle_blend is not None:
+        from .grasp_events import settle_blend_info
+
+        if task != 'cooperative_grasp' or settle_blend != settle_blend_info(samples):
+            raise ValueError('协同稳定尾段融合与原始阶段或事件不一致')
+        settle_boundaries = set(settle_blend['boundaries'])
+        continuous_events = set(settle_blend['continuous_reference_event_indices'])
     tolerance = 0.
     if report.get('position_filter') is not None:
         value = report.get('position_smoothing_tolerance_rad')
+        cap = (.004 if settle_blend is not None
+               and report.get('cooperative_timing_policy') == 'bounded_phase_quintic_v2'
+               else .0005)
         if (report['position_filter'] != 'bounded_spatial_spline'
                 or isinstance(value, bool) or not isinstance(value, (int, float))
-                or not math.isfinite(value) or not 0. < value <= .0005):
+                or not math.isfinite(value) or not 0. < value <= cap):
             raise ValueError('空间路径拟合的节点误差上限无效')
         tolerance = float(value)
     return_range = _return_profile_range(report, task, plans, stage_report, tolerance)
@@ -217,7 +234,8 @@ def load_reviewed_task(
         raw = samples[side]['points']
         points = payload[side]['points']
         labels = [p['source_stage'] for p in raw]
-        check_task_stages(labels, task)
+        check_task_stages(labels, task, simplified_grasp=(
+            task == 'cooperative_grasp' and summary.get('simple_grasp_rule') is not None))
         if labels != stage_report[side] or len(points) != len(raw):
             raise ValueError(side + '采样数量或阶段被改动')
         maximum = 0.
@@ -228,6 +246,8 @@ def load_reviewed_task(
                              zip(prepared['positions'], original['positions']))
             maximum = max(maximum, difference)
             allowed = .004 if return_range is not None and i > return_range[0] else tolerance
+            if settle_blend is not None and labels[i] not in ('APPROACH', 'APPROACH_SETTLE'):
+                allowed = min(allowed, .0005)
             if difference > allowed + (1e-12 if allowed else 0.):
                 raise ValueError(side + '原始实际关节角被改写')
             if tolerance and i in payload['stop_indices'] and difference != 0.:
@@ -236,7 +256,7 @@ def load_reviewed_task(
             source_ns = t['sec'] * 10 ** 9 + t['nanosec']
             if side == 'left':
                 source_times.append(source_ns)
-            if i and labels[i] != labels[i - 1]:
+            if i and labels[i] != labels[i - 1] and i not in settle_boundaries:
                 required_stops.update((i - 1, i))
         changes[side] = maximum
         if tolerance:
@@ -257,10 +277,11 @@ def load_reviewed_task(
     mapping = RecordedTimeMap.from_report(report, tuple(source_times), plans['left'].times_ns,
                                           held_intervals=held)
     events = []
-    for event in samples['reference_events']:
+    for event_index, event in enumerate(samples['reference_events']):
         relative = event['source_time_ns'] - samples['source_time_origin_ns']
         index = min(count - 1, bisect_left(source_times, relative))
-        required_stops.update((max(0, index - 1), index))
+        if event_index not in continuous_events:
+            required_stops.update((max(0, index - 1), index))
         events.append({**event, 'prepared_time_ns': mapping.map_ns(relative)})
     if report.get('reference_events') != events:
         raise ValueError('参考事件或事件时间与原始记录不同')
@@ -288,6 +309,18 @@ def load_reviewed_task(
             required_stops.difference_update(expected['removed_stops'])
     if not required_stops <= set(payload['stop_indices']):
         raise ValueError('任务阶段或夹爪参考事件缺少必要停顿')
+    gripper_schedule = None
+    if task == 'cooperative_grasp' and summary.get('simple_grasp_rule') is not None:
+        from .grasp_events import event_schedule
+
+        gripper_schedule = event_schedule(samples, payload, summary)
+        if report.get('gripper_event_schedule') != gripper_schedule:
+            raise ValueError('协同夹爪时序与原始阶段或最终轨迹时间不一致')
+        events_path = root / 'events.csv'
+        if report.get('events_sha256') != hashlib.sha256(
+            read_snapshot(events_path, 2 * 1024 * 1024)
+        ).hexdigest():
+            raise ValueError('协同事件日志与转换报告不一致')
     duration = plans['left'].times_ns[-1] / 1e9
     details = {
         'task_files_verified': True, 'task_type': task, 'paired_samples': count,
@@ -300,6 +333,9 @@ def load_reviewed_task(
         'gripper_execution_verified': False,
         'scope': '验证文件快照一致、整轮阶段、采样保留及连续关节约束；不验证碰撞或实际抓取',
     }
+    if gripper_schedule is not None:
+        details['gripper_event_schedule'] = gripper_schedule
+        details['gripper_schedule_verified'] = True
     return ReviewedTask(MappingProxyType(plans), MappingProxyType(details))
 
 

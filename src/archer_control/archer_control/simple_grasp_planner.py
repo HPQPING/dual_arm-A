@@ -1,4 +1,4 @@
-"""简化抓取演示规划：接近、仅 J6 对齐、沿 world +Y 插入 1 cm、搬运和归位."""
+"""简化协同规划：接近、J6 对齐、+Y 进给 1 cm、搬运、-Y 退开 1 cm 和归位."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from .dual_arm_trajectory import (
     rigid_transform,
 )
 from .grasp_task_planner import CollisionGeometry, GraspMotion, _join, _reverse
+from .grasp_record_format import INSERTION_DISTANCE_M
 from .kinematics import ArmKinematics
 from .trajectory import FloatArray, JointPlan, sample_joint_plan, validate_joints
 from archer_mujoco.dual_model_loader import LoadedDualArm, load_dual_arm
@@ -144,10 +145,10 @@ def prepare_simple_motion(
         seeds[side] = min(candidates, key=lambda q: float(np.max(np.abs(q - starts[side]))))
         seeds[side][5] = 0.0
 
-    # 从抓取点退回 1 cm，构造对齐点。这样再沿 +Y 前进 1 cm 才到工件，避免越过工件。
+    # 从抓取点退回 1 cm 构造对齐点，再沿 world +Y 进给至工件。
     pre = {side: targets[side].copy() for side in targets}
     for pose in pre.values():
-        pose[1, 3] -= 0.01
+        pose[1, 3] -= INSERTION_DISTANCE_M
     check_planning_cancelled(cancelled)
     backward = model.plan_world_poses(
         seeds["left"],
@@ -247,7 +248,7 @@ def prepare_simple_motion(
     cooperative = replace(cooperative, paired=zero_joint6(cooperative.paired))
     retreat_poses = {side: targets[side].copy() for side in targets}
     for side in retreat_poses:
-        retreat_poses[side][1, 3] = far[side][1, 3]
+        retreat_poses[side][1, 3] -= INSERTION_DISTANCE_M
     check_planning_cancelled(cancelled)
     retreat = model.plan_world_poses(
         cooperative.paired.left.positions[-1],

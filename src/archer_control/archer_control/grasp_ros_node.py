@@ -128,7 +128,9 @@ class GraspSimulationNode(Node):
             "抓取仿真 READY；调用 /dual/grasp/start 开始，启动节点不会自动运动。"
         )
         self.get_logger().info(
-            "当前为简化抓取演示：夹爪目标 2.0，工件虚拟附着，不验证实际接触力。"
+            "简化协同：初始夹爪 5.65；到位后 5.5，等待 5 秒、world +Y 进给 1 cm；"
+            "搬运保持 5.5，放置后 -Y 退开 1 cm，归位前闭合 5.65。"
+            "工件虚拟附着，不验证接触力。"
         )
         self.get_logger().info(
             "起点与归位目标在每次开始时读取当前仿真反馈；到位后左右 J6 目标均为 0 rad。"
