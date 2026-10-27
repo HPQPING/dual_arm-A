@@ -20,7 +20,7 @@ def inputs() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     times, elapsed = [], 0
     for name in labels:
         times.append(elapsed)
-        elapsed += 5 if name == 'GRASP_WAIT' else 1
+        elapsed += 1
     raw = {side: {'points': [{'source_stage': name} for name in labels]}
            for side in ('left', 'right')}
     prepared = {
@@ -28,7 +28,7 @@ def inputs() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         for side in ('left', 'right')
     }
     summary = {'simple_grasp_rule': {
-        'version': 3, 'closed_command': 5.65, 'open_command': 5.5, 'wait_s': 5.,
+        'version': 4, 'closed_command': 5.65, 'open_command': 5.5, 'wait_s': 0.,
         'insertion_world_m': [0., .01, 0.], 'retreat_world_m': [0., -.01, 0.],
         'grasp_confirmation': 'assumed_for_demo',
     }}
@@ -39,8 +39,9 @@ def test_schedule_never_turns_virtual_attachment_into_a_command():
     raw, prepared, summary = inputs()
     raw['reference_events'] = [{'virtual_attached': 1}]
     schedule = event_schedule(raw, prepared, summary)
-    assert [e['target'] for e in schedule['events']] == [5.65, 5.5, 5.5, 5.5, 5.65]
-    assert schedule['events'][2]['minimum_wall_s'] == 5.
+    assert [e['target'] for e in schedule['events']] == [5.65, 5.5, 5.5, 5.65]
+    assert not any(e['kind'] == 'dwell' for e in schedule['events'])
+    assert 'GRASP_WAIT' not in schedule['phase_start_ns']
     assert schedule['execution_ready'] is False
     assert schedule['grasp_confirmation'] == 'assumed_for_demo'
     assert all('virtual_attached' not in e for e in schedule['events'])
@@ -53,13 +54,10 @@ def test_desynchronized_arm_stages_are_rejected():
         event_schedule(raw, prepared, summary)
 
 
-def test_shortened_wait_is_rejected():
+def test_legacy_wait_rule_requires_regeneration():
     raw, prepared, summary = inputs()
-    first = next(i for i, p in enumerate(raw['left']['points']) if p['source_stage'] == 'INSERT')
-    for side in ('left', 'right'):
-        for point in prepared[side]['points'][first:]:
-            point['time_from_start']['sec'] -= 1
-    with TestCase().assertRaisesRegex(ValueError, '五秒等待'):
+    summary['simple_grasp_rule'].update(version=3, wait_s=5.)
+    with TestCase().assertRaisesRegex(ValueError, '新版协同规则'):
         event_schedule(raw, prepared, summary)
 
 

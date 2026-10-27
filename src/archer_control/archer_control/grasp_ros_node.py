@@ -26,7 +26,8 @@ from std_msgs.msg import Float64, String
 from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
 
-from .simple_grasp_scene import SimpleGraspDemo
+from .simple_grasp_scene import SIMULATION_INITIAL, SimpleGraspDemo
+from .trajectory import joint_vector
 from .grasp_recording import GraspRunRecorder
 from .result_paths import DEFAULT_RESULTS_DIR
 from .kinematics import rotation_error
@@ -65,7 +66,13 @@ class GraspSimulationNode(Node):
             raise ValueError(
                 "没有可用的 DISPLAY；请在 Ubuntu 桌面终端启动，或设置 show_viewer:=false"
             )
-        self.demo = SimpleGraspDemo()
+        initial = {}
+        for side in ("left", "right"):
+            name = side + "_initial_joints"
+            self.declare_parameter(name, list(SIMULATION_INITIAL[side]))
+            initial[side] = joint_vector(
+                np.asarray(self.get_parameter(name).value, dtype=object), name)
+        self.demo = SimpleGraspDemo(left_initial=initial["left"], right_initial=initial["right"])
         self.resources = ExitStack()
         self.viewer: Viewer | None = None
         self.viewer_threads: tuple[Thread, ...] = ()
@@ -128,7 +135,7 @@ class GraspSimulationNode(Node):
             "抓取仿真 READY；调用 /dual/grasp/start 开始，启动节点不会自动运动。"
         )
         self.get_logger().info(
-            "简化协同：初始夹爪 5.65；到位后 5.5，等待 5 秒、world +Y 进给 1 cm；"
+            "简化协同：初始夹爪 5.65；到位后 5.5，直接 world +Y 进给 1 cm；"
             "搬运保持 5.5，放置后 -Y 退开 1 cm，归位前闭合 5.65。"
             "工件虚拟附着，不验证接触力。"
         )

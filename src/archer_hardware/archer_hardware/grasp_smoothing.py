@@ -67,6 +67,8 @@ def smooth_grasp_samples(
         phase = labels[first]
         source_span_ns = source_ns[last] - source_ns[first]
         selected = n >= 6 and phase in MOTION_STAGES and labels[last] == phase
+        short_bridge = not selected and n <= 3 and source_span_ns <= 50_000_000
+        bridge_scale = 1.
         controls = 0
         if selected:
             # 同一时间参数和节点用于两臂。端点角度固定；共同五次进度给出零端速度与加速度。
@@ -168,11 +170,25 @@ def smooth_grasp_samples(
                 a[arm, first:last + 1] = unit_a[:, section] / duration**2
         else:
             offsets = old_ns[first:last + 1] - old_ns[first]
-            time_ns[first:last + 1] = time_ns[first] + offsets
             for arm, side in enumerate(('left', 'right')):
                 pts = baseline[side]['points'][first:last + 1]
                 v[arm, first:last + 1] = [p['velocities'] for p in pts]
                 a[arm, first:last + 1] = [p['accelerations'] for p in pts]
+                if short_bridge:
+                    # 与主体一样按解析极值定时，避免几毫秒的微小残差绕过jerk约束。
+                    # 统一缩放双臂时间，q不变，v/a相应缩放，保持零速事件边界。
+                    for i in range(first, last):
+                        h = int(old_ns[i + 1] - old_ns[i]) / 1e9
+                        c = coefficients(q[arm, i], q[arm, i + 1], v[arm, i], v[arm, i + 1],
+                                         a[arm, i], a[arm, i + 1], h)
+                        peak = float(np.max(abs(_extrema(c, h, 3))))
+                        bridge_scale = max(bridge_scale, margin * (peak / .4)**(1./3.),
+                                           1. / execution_hz / h)
+            if short_bridge and bridge_scale > 1.:
+                offsets = np.ceil(offsets * bridge_scale).astype(np.int64)
+                v[:, first:last + 1] /= bridge_scale
+                a[:, first:last + 1] /= bridge_scale**2
+            time_ns[first:last + 1] = time_ns[first] + offsets
         for arm, side in enumerate(('left', 'right')):
             for i in range(first, last):
                 h = int(time_ns[i + 1] - time_ns[i]) / 1e9
@@ -190,9 +206,13 @@ def smooth_grasp_samples(
                         raise ValueError(side + '协同样条段内导数超限：' + phase)
                 if selected and np.max(abs(_extrema(c_final, h, 3))) > jerk * (1. + 1e-6):
                     raise ValueError(side + '协同样条加加速度超限：' + phase)
+                if short_bridge and np.max(abs(_extrema(c_final, h, 3))) > .4 * (1. + 1e-6):
+                    raise ValueError(side + '协同短过渡加加速度超限：' + phase)
                 polynomials[side].append(c_final)
         blocks.append({'first': first, 'last': last, 'phase': phase, 'fitted': selected,
                        'spline_controls': controls,
+                       'short_bridge_jerk_limited': short_bridge,
+                       'short_bridge_time_scale': bridge_scale,
                        'duration_s': int(time_ns[last] - time_ns[first]) / 1e9,
                        **({'planning_velocity_rad_s': speed,
                            'planning_joint3_velocity_rad_s': float(np.max(cap_v[:, 2])),

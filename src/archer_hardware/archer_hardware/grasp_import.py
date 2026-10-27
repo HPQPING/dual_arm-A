@@ -110,7 +110,7 @@ def main(args: list[str] | None = None) -> int:
     details: dict[str, Any] = json.loads(report)
     print('协同连续轨迹：' + str(output))
     print('转换及夹爪时序报告：' + str(evidence))
-    print(f"计划约{details['duration_s']:.2f}秒；双臂共同时间轴，五秒等待已保留。")
+    print(f"计划约{details['duration_s']:.2f}秒；双臂共同时间轴，开爪后直接进给，不含固定等待。")
     print('仅完成离线转换，不会启动真机；真实夹爪及执行许可尚未核验。')
     return 0
 

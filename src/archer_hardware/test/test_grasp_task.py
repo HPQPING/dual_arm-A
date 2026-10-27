@@ -147,8 +147,8 @@ class GraspTaskTests(unittest.TestCase):
                                      self.config, expected_csv_name='state.csv')
 
     def test_gripper_profile_is_continuous_and_holds_during_carry(self):
-        schedule = {'policy': 'cooperative_grasp_events_v1', 'phase_start_ns': {
-            'OPEN_FOR_GRASP': 10**9, 'GRASP_WAIT': 2*10**9,
+        schedule = {'policy': 'cooperative_grasp_events_v2', 'phase_start_ns': {
+            'OPEN_FOR_GRASP': 10**9, 'INSERT': 2*10**9,
             'CLOSE_BEFORE_HOME': 8*10**9, 'RETURN_HOME': 9*10**9,
         }}
         for elapsed, expected in ((0., 5.65), (1., 5.65), (1.5, 5.575),

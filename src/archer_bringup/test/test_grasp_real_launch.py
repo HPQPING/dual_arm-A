@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest import TestCase
 
 from launch import LaunchContext
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, ExecuteProcess
 from launch.utilities import perform_substitutions
 from launch_ros.actions import Node
 
@@ -51,3 +51,24 @@ def test_missing_trajectory_rejected_before_node_creation():
     ctx.launch_configurations['trajectory_file'] = ' '
     with TestCase().assertRaisesRegex(ValueError, 'state.json'):
         load()._start(ctx)
+
+
+def test_simulation_passes_circle_initial_pose_even_without_rviz():
+    """关闭RViz不应退回另一套协同初值；实际启动命令携带两侧六轴参数。"""
+    path = Path(__file__).resolve().parents[1] / 'launch/dual_grasp_sim.launch.py'
+    spec = importlib.util.spec_from_file_location('sim_grasp_launch_test', path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    config = path.parents[1] / 'config/dual_circle.yaml'
+    task_context = LaunchContext()
+    task_context.launch_configurations.update({
+        'output_file': '', 'python_executable': '/usr/bin/python3',
+        'show_viewer': 'false', 'show_rviz': 'false', 'rviz_params_file': str(config)})
+    actions = module._start(task_context)
+    process = next(action for action in actions if isinstance(action, ExecuteProcess))
+    command = [perform_substitutions(task_context, item) for item in process.cmd]
+    parameters = module.initial_joint_parameters(config)
+    assert command[-len(parameters):] == parameters
+    assert any(item.startswith('left_initial_joints:=') for item in command)
+    assert any(item.startswith('right_initial_joints:=') for item in command)

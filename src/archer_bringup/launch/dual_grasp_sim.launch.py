@@ -1,7 +1,8 @@
 """
 启动完整圆柱的简化抓取 ROS 演示，等待服务命令，不自动运动.
 
-同一 ROS 域内使用时，应先停止原双臂仿真，避免两套关节状态发布者。 到位开口 5.5、等待 5 秒、沿 world +Y 进给 1 cm；搬运保持开口，放置后 -Y 退开 1 cm、归位前闭合 5.65。 工件虚拟附着，不验证真实夹紧力，不启动画圆任务。
+同一 ROS 域内使用时，应先停止原双臂仿真，避免两套关节状态发布者。 到位开口 5.5 后直接沿 world +Y 进给 1 cm；搬运保持开口。
+放置后 -Y 退开 1 cm、归位前闭合 5.65。工件虚拟附着，不验证真实夹紧力，不启动画圆任务。
 """
 
 import json
@@ -64,11 +65,32 @@ def validate_view_parameters(path: Path) -> None:
                     raise ValueError("显示参数与抓取物理模型不一致：" + name + "/" + key)
 
 
+def initial_joint_parameters(path: Path) -> list[str]:
+    """复用画圆场景初值；无RViz时也读取同一配置，不连接真机。"""
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    node = raw.get("dual_arm_scene") if isinstance(raw, dict) else None
+    values = node.get("ros__parameters") if isinstance(node, dict) else None
+    if not isinstance(values, dict):
+        raise ValueError("初值配置缺少 dual_arm_scene/ros__parameters")
+    arguments = []
+    for side in ("left", "right"):
+        key = side + "_initial_joints"
+        q = values.get(key)
+        if (not isinstance(q, list) or len(q) != 6
+                or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                       or not math.isfinite(v) for v in q)):
+            raise ValueError("仿真初值必须为六个有限角度：" + key)
+        arguments.extend(["-p", key + ":=" + json.dumps(q)])
+    return arguments
+
+
 def _start(context) -> list[Action]:
     # 将路径编码成 YAML 兼容字符串，空值和带空格的路径也能正确传递。
     output = LaunchConfiguration("output_file").perform(context)
     python = LaunchConfiguration("python_executable").perform(context)
     show_viewer = LaunchConfiguration("show_viewer").perform(context)
+    config = Path(LaunchConfiguration("rviz_params_file").perform(context)).expanduser().resolve()
+    initial_parameters = initial_joint_parameters(config)
     process = ExecuteProcess(
         cmd=[
             python,
@@ -81,6 +103,7 @@ def _start(context) -> list[Action]:
             "output_file:=" + json.dumps(output),
             "-p",
             "show_viewer:=" + show_viewer,
+            *initial_parameters,
         ],
         output="screen",
     )
@@ -138,7 +161,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "rviz_params_file",
                 default_value=str(share / "config/dual_circle.yaml"),
-                description="仅用于核对显示模型安装参数，不启动画圆任务",
+                description="共用画圆初始角度并核对显示模型安装参数，不启动画圆任务",
             ),
             OpaqueFunction(function=_start),
         ]

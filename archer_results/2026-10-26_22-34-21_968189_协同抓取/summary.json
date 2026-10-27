@@ -1,0 +1,238 @@
+{
+  "state": "COMPLETED",
+  "failure": "",
+  "config": {
+    "pedestal_height": 0.01,
+    "object_height": 0.65,
+    "object_diameter": 0.01,
+    "object_mass": 0.05,
+    "initial_clearance": 0.001,
+    "grasp_offset": 0.2,
+    "lift_height": 0.04,
+    "move_distance": 0.02,
+    "friction": 0.8,
+    "finger_force": 2.0,
+    "timestep": 0.001
+  },
+  "simulation_time_s": 82.85400000003156,
+  "stages": [
+    "READY",
+    "PLANNING",
+    "SETTLE",
+    "APPROACH",
+    "APPROACH_SETTLE",
+    "ALIGN_JOINT6",
+    "ALIGN_SETTLE",
+    "OPEN_FOR_GRASP",
+    "INSERT",
+    "INSERT_SETTLE",
+    "LIFT",
+    "MOVE",
+    "RETURN",
+    "LOWER",
+    "PLACE_SETTLE",
+    "RETREAT",
+    "RETREAT_SETTLE",
+    "CLOSE_BEFORE_HOME",
+    "RETURN_HOME",
+    "HOME_SETTLE",
+    "COMPLETED"
+  ],
+  "start_joints_from_feedback_rad": {
+    "left": [
+      -0.05190439141181987,
+      -1.5562463364050407,
+      3.1310214258685156,
+      -1.5731246904907943,
+      -0.05454260438925883,
+      1.5794920803862234
+    ],
+    "right": [
+      0.16851410980118184,
+      -1.5718603547632792,
+      3.132083171127393,
+      -1.573745587476367,
+      -0.00521553467881118,
+      1.5959727864760695
+    ]
+  },
+  "final_joints_rad": {
+    "left": [
+      -0.05190439206028036,
+      -1.5562467736800087,
+      3.131021899418708,
+      -1.5731248465107077,
+      -0.05454263722453697,
+      1.5794921183710409
+    ],
+    "right": [
+      0.168514110009592,
+      -1.5718608483536864,
+      3.1320832808636854,
+      -1.5737456930247675,
+      -0.005215506646081897,
+      1.5959728248056997
+    ]
+  },
+  "home_maximum_joint_error_rad": {
+    "left": 4.735501923924801e-07,
+    "right": 4.935904072134178e-07
+  },
+  "maximum_object_position_error_mm": 0.37010311839456944,
+  "maximum_model_tcp_difference_mm": 0.00030399999994304005,
+  "minimum_lift_clearance_mm": 39.91252663206162,
+  "final_object_center_world_m": [
+    -3.0139093205966123e-06,
+    0.39998124617240516,
+    0.31499959673799205
+  ],
+  "scope": "完整圆柱几何；真实关节动力学；虚拟附着演示，不验证夹紧力或摩擦，不连接实机",
+  "mode": "simple_demo",
+  "attachment_method": "virtual_translation_follow",
+  "gripper_closed_command": 5.65,
+  "gripper_open_command": 5.5,
+  "simple_grasp_rule": {
+    "version": 4,
+    "closed_command": 5.65,
+    "open_command": 5.5,
+    "wait_s": 0.0,
+    "actual_wait_s": 0.0,
+    "insertion_world_m": [
+      0.0,
+      0.01,
+      0.0
+    ],
+    "retreat_world_m": [
+      0.0,
+      -0.01,
+      0.0
+    ],
+    "grasp_confirmation": "assumed_for_demo",
+    "opening_mapping": "user_defined_command_not_mm_calibration"
+  },
+  "gripper_command": 5.65,
+  "attached": false,
+  "actual_insertion_displacements_world_m": {
+    "left": [
+      -2.1516321346416408e-05,
+      0.009970472395114116,
+      -1.5562814358438537e-05
+    ],
+    "right": [
+      2.7942163413397934e-06,
+      0.009975739551034146,
+      1.1163084752546792e-06
+    ]
+  },
+  "actual_retreat_displacements_world_m": {
+    "left": [
+      -1.2265327513984939e-05,
+      -0.010017446787337791,
+      6.97115167606066e-05
+    ],
+    "right": [
+      -1.572829521821901e-05,
+      -0.009990588167626546,
+      2.8346188509303927e-05
+    ]
+  },
+  "gripper_plane": "真实 GP80 网格的工具 YZ 平面，法向为工具 X",
+  "gripper_visual": "original_GP80_static_mesh",
+  "initial_position_source": "任务开始时读取当前 MuJoCo data.qpos",
+  "simulation_initial_requested_rad": {
+    "left": [
+      -0.05190439141181987,
+      -1.5562463364050407,
+      3.1310214258685156,
+      -1.5731246904907943,
+      -0.05454260438925883,
+      1.5794920803862234
+    ],
+    "right": [
+      0.16851410980118184,
+      -1.5718603547632792,
+      3.132083171127393,
+      -1.573745587476367,
+      -0.00521553467881118,
+      1.5959727864760695
+    ]
+  },
+  "simulation_initial_applied_rad": {
+    "left": [
+      -0.05190439141181987,
+      -1.5562463364050407,
+      3.1310214258685156,
+      -1.5731246904907943,
+      -0.05454260438925883,
+      1.5794920803862234
+    ],
+    "right": [
+      0.16851410980118184,
+      -1.5718603547632792,
+      3.132083171127393,
+      -1.573745587476367,
+      -0.00521553467881118,
+      1.5959727864760695
+    ]
+  },
+  "plane_alignment_errors": {
+    "after_XOY_error_rad": {
+      "left": 0.0001999109344556248,
+      "right": 1.236695837055546e-05
+    }
+  },
+  "arrival_joint6": {
+    "left": {
+      "actual_rad": 1.5794920941659618,
+      "target_rad": 0.0,
+      "rotation_rad": -1.5794920941659618
+    },
+    "right": {
+      "actual_rad": 1.5959727860244284,
+      "target_rad": 0.0,
+      "rotation_rad": -1.5959727860244284
+    }
+  },
+  "maximum_attachment_relative_error_mm": 0.30986128073473473,
+  "maximum_alignment_tcp_drift_mm": 0.05937367464740333,
+  "ros_stage": "COMPLETED",
+  "recording": {
+    "enabled": true,
+    "complete": true,
+    "saved": true,
+    "task_name": "协同抓取",
+    "directory": "/home/user/archer_ws/archer_results/2026-10-26_22-34-21_968189_协同抓取",
+    "started_at": "2026-10-26T22:34:21.968189+08:00",
+    "task_completed": true,
+    "state_csv": "/home/user/archer_ws/archer_results/2026-10-26_22-34-21_968189_协同抓取/state.csv",
+    "events_csv": "/home/user/archer_ws/archer_results/2026-10-26_22-34-21_968189_协同抓取/events.csv",
+    "summary_json": "/home/user/archer_ws/archer_results/2026-10-26_22-34-21_968189_协同抓取/summary.json",
+    "sample_count": 1672,
+    "observed_stages": [
+      "READY",
+      "PLANNING",
+      "SETTLE",
+      "APPROACH",
+      "APPROACH_SETTLE",
+      "ALIGN_JOINT6",
+      "ALIGN_SETTLE",
+      "OPEN_FOR_GRASP",
+      "INSERT",
+      "INSERT_SETTLE",
+      "LIFT",
+      "MOVE",
+      "RETURN",
+      "LOWER",
+      "PLACE_SETTLE",
+      "RETREAT",
+      "RETREAT_SETTLE",
+      "CLOSE_BEFORE_HOME",
+      "RETURN_HOME",
+      "HOME_SETTLE",
+      "COMPLETED"
+    ],
+    "sampling": "同一 MuJoCo 状态，约每 0.05 仿真秒及阶段变化时记录",
+    "drive_input_note": "驱动输入含仿真参考速度前馈，不能直接当作实机位置指令",
+    "scope": "仅仿真记录；虚拟附着不代表已验证真实抓取，不可直接下发实机"
+  }
+}

@@ -115,7 +115,7 @@ def run(
                                   if elapsed >= stamp / 1e9), '')
                     if phase and phase != previous_phase:
                         print('轨迹阶段：' + phase + f'，参考时间{elapsed:.2f}s', flush=True)
-                        if cooperative and phase in ('OPEN_FOR_GRASP', 'GRASP_WAIT', 'INSERT'):
+                        if cooperative and phase in ('OPEN_FOR_GRASP', 'INSERT'):
                             show_gripper_feedback(node.workers)
                         previous_phase = phase
                 if time.monotonic() >= next_print:

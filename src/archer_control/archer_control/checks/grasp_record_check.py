@@ -13,7 +13,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from ..grasp_record_format import (
-    EVENT_FIELDS, SIDES, STATE_FIELDS, GRASP_WAIT_S, GRIPPER_CLOSED_COMMAND,
+    EVENT_FIELDS, SIDES, STATE_FIELDS, GRIPPER_CLOSED_COMMAND,
     GRIPPER_OPEN_COMMAND, INSERTION_DISTANCE_M, SIMPLE_GRASP_RULE_VERSION,
     SIMPLE_GRASP_STAGES,
 )
@@ -132,7 +132,12 @@ def load_run(directory: str | Path) -> GraspRun:
     rule = summary.get("simple_grasp_rule")
     current_rule = rule is not None
     insertion_distance = INSERTION_DISTANCE_M
+    legacy_wait = current_rule and isinstance(rule, dict) and rule.get("version") in (2, 3)
     required_stages = SIMPLE_GRASP_STAGES if current_rule else REQUIRED_STAGES
+    if legacy_wait:
+        index = required_stages.index("INSERT")
+        required_stages = (*required_stages[:index], "GRASP_WAIT", *required_stages[index:])
+    expected_wait = 5.0 if legacy_wait else 0.0
     carried_command = GRIPPER_OPEN_COMMAND if current_rule else 2.0
     home_command = GRIPPER_CLOSED_COMMAND if current_rule else 0.0
     if current_rule:
@@ -142,14 +147,14 @@ def load_run(directory: str | Path) -> GraspRun:
             insertion_distance = 0.002
         if (
             type(rule.get("version")) is not int
-            or rule.get("version") not in (2, SIMPLE_GRASP_RULE_VERSION)
+            or rule.get("version") not in (2, 3, SIMPLE_GRASP_RULE_VERSION)
             or rule.get("open_command") != GRIPPER_OPEN_COMMAND
             or rule.get("closed_command") != GRIPPER_CLOSED_COMMAND
-            or rule.get("wait_s") != GRASP_WAIT_S
+            or rule.get("wait_s") != expected_wait
             or rule.get("insertion_world_m") != [0.0, insertion_distance, 0.0]
             or rule.get("retreat_world_m") != [0.0, -insertion_distance, 0.0]
             or rule.get("grasp_confirmation") != "assumed_for_demo"
-            or number(rule.get("actual_wait_s"), "actual_wait_s") < GRASP_WAIT_S
+            or number(rule.get("actual_wait_s"), "actual_wait_s") < expected_wait
         ):
             raise ValueError("简化协同规则或等待时间与当前约定不一致")
     config = {
@@ -305,9 +310,12 @@ def load_run(directory: str | Path) -> GraspRun:
             raise ValueError("新规则记录必须从夹爪闭合 5.65 开始")
         waiting = [frame for frame in frames if frame.stage == "GRASP_WAIT"]
         inserted = [frame for frame in frames if frame.stage == "INSERT"]
-        if (not waiting or not inserted
-                or inserted[0].time - waiting[0].time < GRASP_WAIT_S - 0.061):
-            raise ValueError("记录中的进给开始前没有等待 5 秒")
+        if legacy_wait:
+            if (not waiting or not inserted
+                    or inserted[0].time - waiting[0].time < expected_wait - 0.061):
+                raise ValueError("历史记录中的进给开始前没有等待 5 秒")
+        elif waiting or not inserted:
+            raise ValueError("新版协同必须开爪后直接进给，不得包含GRASP_WAIT")
         displacements = mapping(
             summary.get("actual_insertion_displacements_world_m"), "insertion"
         )

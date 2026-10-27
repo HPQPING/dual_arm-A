@@ -1,4 +1,4 @@
-"""核对协同任务的夹爪位置与固定等待时序，不调用 ROS 或 SDK、不确认真实夹持。"""
+"""核对协同任务的夹爪位置与开爪后直接进给时序，不调用 ROS 或 SDK、不确认真实夹持。"""
 
 from __future__ import annotations
 
@@ -7,13 +7,13 @@ import math
 from typing import Any
 
 from archer_control.grasp_record_format import (
-    GRASP_WAIT_S, GRIPPER_CLOSED_COMMAND, GRIPPER_OPEN_COMMAND,
+    GRIPPER_CLOSED_COMMAND, GRIPPER_OPEN_COMMAND,
     INSERTION_DISTANCE_M, SIMPLE_GRASP_RULE_VERSION,
 )
 
 
 GRASP_MOTION_STAGES = (
-    'APPROACH', 'ALIGN_JOINT6', 'OPEN_FOR_GRASP', 'GRASP_WAIT', 'INSERT',
+    'APPROACH', 'ALIGN_JOINT6', 'OPEN_FOR_GRASP', 'INSERT',
     'LIFT', 'MOVE', 'RETURN', 'LOWER', 'PLACE_SETTLE', 'RETREAT',
     'CLOSE_BEFORE_HOME', 'RETURN_HOME', 'COMPLETED',
 )
@@ -47,12 +47,12 @@ def settle_blend_info(samples: Mapping[str, Any]) -> dict[str, Any]:
 def target_at(schedule: Mapping[str, Any], elapsed_s: float) -> float:
     """沿共同参考时间平滑开合；搬运保持5.5，不读取虚拟附着标记。"""
     if (not math.isfinite(elapsed_s) or elapsed_s < 0.
-            or schedule.get('policy') != 'cooperative_grasp_events_v1'):
+            or schedule.get('policy') != 'cooperative_grasp_events_v2'):
         raise ValueError('夹爪计划或参考时间无效')
     phases = schedule['phase_start_ns']
-    opening, waiting, closing, home = [phases[k] / 1e9 for k in (
-        'OPEN_FOR_GRASP', 'GRASP_WAIT', 'CLOSE_BEFORE_HOME', 'RETURN_HOME')]
-    if not 0. <= opening < waiting < closing < home:
+    opening, inserted, closing, home = [phases[k] / 1e9 for k in (
+        'OPEN_FOR_GRASP', 'INSERT', 'CLOSE_BEFORE_HOME', 'RETURN_HOME')]
+    if not 0. <= opening < inserted < closing < home:
         raise ValueError('夹爪开合阶段顺序无效')
 
     def blend(start: float, end: float) -> float:
@@ -61,9 +61,9 @@ def target_at(schedule: Mapping[str, Any], elapsed_s: float) -> float:
 
     if elapsed_s < opening:
         return GRIPPER_CLOSED_COMMAND
-    if elapsed_s < waiting:
+    if elapsed_s < inserted:
         return GRIPPER_CLOSED_COMMAND + (
-            GRIPPER_OPEN_COMMAND - GRIPPER_CLOSED_COMMAND) * blend(opening, waiting)
+            GRIPPER_OPEN_COMMAND - GRIPPER_CLOSED_COMMAND) * blend(opening, inserted)
     if elapsed_s < closing:
         return GRIPPER_OPEN_COMMAND
     if elapsed_s < home:
@@ -82,11 +82,11 @@ def event_schedule(
             or rule.get('version') != SIMPLE_GRASP_RULE_VERSION
             or rule.get('closed_command') != GRIPPER_CLOSED_COMMAND
             or rule.get('open_command') != GRIPPER_OPEN_COMMAND
-            or rule.get('wait_s') != GRASP_WAIT_S
+            or rule.get('wait_s') != 0.
             or rule.get('insertion_world_m') != [0., INSERTION_DISTANCE_M, 0.]
             or rule.get('retreat_world_m') != [0., -INSERTION_DISTANCE_M, 0.]
             or rule.get('grasp_confirmation') != 'assumed_for_demo'):
-        raise ValueError('需要新版协同规则：5.65闭合、5.5开口、等待5秒、进退各1cm')
+        raise ValueError('需要新版协同规则：5.65闭合、5.5开口、开爪后直接进给、进退各1cm')
     labels: list[str] = []
     stamps: list[int] = []
     for side in ('left', 'right'):
@@ -116,13 +116,13 @@ def event_schedule(
         except ValueError as error:
             raise ValueError('协同主要阶段缺失或顺序错误：' + stage) from error
     starts = {name: stamps[labels.index(name)] for name in phases}
-    opened, waiting = starts['OPEN_FOR_GRASP'], starts['GRASP_WAIT']
+    opened = starts['OPEN_FOR_GRASP']
     inserted, closing = starts['INSERT'], starts['CLOSE_BEFORE_HOME']
     home = starts['RETURN_HOME']
-    if waiting <= opened or inserted - waiting < round(GRASP_WAIT_S * 1e9) or home <= closing:
-        raise ValueError('开合动作或固定五秒等待在转换中被压缩')
+    if 'GRASP_WAIT' in phases or inserted <= opened or home <= closing:
+        raise ValueError('开合动作顺序无效，或仍包含已删除的等待阶段')
     return {
-        'policy': 'cooperative_grasp_events_v1',
+        'policy': 'cooperative_grasp_events_v2',
         'position_unit': 'sdk_motor_position_not_mm',
         'grasp_confirmation': 'assumed_for_demo',
         'both_grippers_synchronized': True,
@@ -131,11 +131,8 @@ def event_schedule(
             {'kind': 'position', 'phase': 'BEFORE_MOTION', 'time_ns': 0,
              'target': GRIPPER_CLOSED_COMMAND, 'requires_stationary_arms': True},
             {'kind': 'position', 'phase': 'OPEN_FOR_GRASP', 'time_ns': opened,
-             'end_time_ns': waiting, 'target': GRIPPER_OPEN_COMMAND,
+             'end_time_ns': inserted, 'target': GRIPPER_OPEN_COMMAND,
              'requires_stationary_arms': True},
-            {'kind': 'dwell', 'phase': 'GRASP_WAIT', 'time_ns': waiting,
-             'end_time_ns': inserted, 'minimum_wall_s': GRASP_WAIT_S,
-             'target': GRIPPER_OPEN_COMMAND, 'requires_stationary_arms': True},
             {'kind': 'maintain', 'phase': 'INSERT_TO_RETREAT', 'time_ns': inserted,
              'end_time_ns': closing, 'target': GRIPPER_OPEN_COMMAND},
             {'kind': 'position', 'phase': 'CLOSE_BEFORE_HOME', 'time_ns': closing,

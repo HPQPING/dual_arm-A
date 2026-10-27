@@ -1,4 +1,4 @@
-"""检查协同样条的共同时间、位置边界、等待时长和故障说明，不连接真实设备。"""
+"""检查协同样条的共同时间、位置边界、事件保持时长和故障说明，不连接真实设备。"""
 
 from copy import deepcopy
 import time
@@ -18,7 +18,7 @@ from archer_mujoco.joint_interpolation import coefficients, _extrema
 
 
 def samples():
-    """包含带微噪声的接近、五秒静止等待和J6对齐。"""
+    """包含带微噪声的接近、夹爪动作期间静止和J6对齐。"""
     times = np.r_[np.linspace(0., 2., 21), np.linspace(2.1, 7.1, 51),
                   np.linspace(7.2, 11.2, 41)]
     positions = np.zeros((len(times), 6))
@@ -26,7 +26,7 @@ def samples():
     positions[1:20, 1] = 1e-5 * np.sin(np.arange(1, 20) * 2.3)
     positions[21:, 0] = .2
     positions[72:, 5] = np.linspace(0., .4, 41)
-    labels = ['APPROACH']*21 + ['GRASP_WAIT']*51 + ['ALIGN_JOINT6']*41
+    labels = ['APPROACH']*21 + ['OPEN_FOR_GRASP']*51 + ['ALIGN_JOINT6']*41
     result = {'version': 3, 'kind': 'recorded_joint_samples', 'interpolation': 'unassigned',
               'source_time_origin_ns': 0, 'reference_events': []}
     for side in ('left', 'right'):
@@ -161,3 +161,29 @@ def test_only_settle_markers_without_actuation_can_be_continuous():
     raw['reference_events'][1]['gripper_command'] = 5.5
     with TestCase().assertRaisesRegex(ValueError, '不允许合并'):
         settle_blend_info(raw)
+
+
+def test_short_unfitted_transfer_is_also_jerk_limited():
+    """阶段间微小仿真残差不能绕过抬升/进给的解析jerk约束。"""
+    raw = samples()
+    for side in ('left', 'right'):
+        raw[side]['points'] = [
+            {'positions': [0., value, 0., 0., 0., 0.], 'source_stage': 'INSERT',
+             'time_from_start': {'sec': 0, 'nanosec': i*10_000_000}}
+            for i, value in enumerate((0., 1e-5, 2e-5))]
+    limits = {s: PositionLimits((-3.,)*6, (3.,)*6, (.5,)*6, (.3,)*6)
+              for s in ('left', 'right')}
+    original = deepcopy(raw)
+    result, report = smooth_grasp_samples(raw, limits, execution_hz=250, margin=1.05)
+    assert raw == original
+    assert all(not block['fitted'] for block in report['cooperative_smoothing_blocks'])
+    for side in ('left', 'right'):
+        pts = result[side]['points']
+        times = np.asarray(report['prepared_times_ns'])/1e9
+        assert [p['positions'] for p in pts] == [p['positions'] for p in raw[side]['points']]
+        for i, (first, last) in enumerate(zip(pts, pts[1:])):
+            values = [np.asarray(point[key]) for key in
+                      ('positions', 'velocities', 'accelerations') for point in (first, last)]
+            h = float(times[i+1]-times[i])
+            c = coefficients(values[0], values[1], values[2], values[3], values[4], values[5], h)
+            assert np.max(abs(_extrema(c, h, 3))) <= .4*(1.+1e-6)

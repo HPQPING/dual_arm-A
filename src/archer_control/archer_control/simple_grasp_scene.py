@@ -1,4 +1,4 @@
-"""协同演示：到位开口 5.5、等待 5 秒、进给和退开 1 cm；归位前闭合 5.65."""
+"""协同演示：到位开口 5.5 后直接进给和退开 1 cm；归位前闭合 5.65."""
 
 from __future__ import annotations
 
@@ -26,7 +26,6 @@ from .simple_grasp_planner import (
 )
 from .trajectory import FloatArray, joint_vector
 from .grasp_record_format import (
-    GRASP_WAIT_S,
     GRIPPER_ACTION_S,
     GRIPPER_CLOSED_COMMAND,
     GRIPPER_OPEN_COMMAND,
@@ -40,20 +39,20 @@ from archer_mujoco.grasp_scene import GraspConfig
 # 仅用于仿真世界启动及重置；每轮任务仍从当前 qpos 保存实际起点。
 SIMULATION_INITIAL = {
     "left": (
-        0.0016936991186183399,
-        -1.5557692501183322,
-        3.131012580369181,
-        -1.5715998405409322,
-        -0.05458065430333334,
-        1.6680315339869978,
+        -0.05190439141181987,
+        -1.5562463364050407,
+        3.1310214258685156,
+        -1.5731246904907943,
+        -0.05454260438925883,
+        1.5794920803862234,
     ),
     "right": (
-        -0.008299789093679984,
-        -1.5717756091728772,
-        3.132204154731199,
-        -1.5717483593281518,
-        -0.02457215514032048,
-        1.4469849024526769,
+        0.16851410980118184,
+        -1.5718603547632792,
+        3.132083171127393,
+        -1.573745587476367,
+        -0.00521553467881118,
+        1.5959727864760695,
     ),
 }
 
@@ -117,14 +116,13 @@ class SimpleGraspDemo(DualGraspDemo):
         self.get_mode_notice()
 
     def get_mode_notice(self) -> None:
-        print("简化演示：初始 5.65，到位开口 5.5、等待 5 s、+Y 进给及 -Y 退开各 1 cm。")
+        print("简化演示：初始 5.65，到位开口 5.5 后直接 +Y 进给及 -Y 退开各 1 cm。")
         print("完整 65 cm、50 g 圆柱虚拟附着；5.5 是用户指定开口，不代表实测毫米标定或夹持确认。")
 
     def reset(self) -> None:
         super().reset()
         self.attached = False
         self.gripper_command = GRIPPER_CLOSED_COMMAND
-        self.grasp_wait_elapsed = 0.0
         self.attachment_center = np.zeros(3, dtype=np.float64)
         self.attachment_tcp_midpoint = np.zeros(3, dtype=np.float64)
         self.attachment_relative = np.zeros(3, dtype=np.float64)
@@ -277,7 +275,7 @@ class SimpleGraspDemo(DualGraspDemo):
         paired, sample_time, command = motion.approach, 0.0, GRIPPER_CLOSED_COMMAND
         if active in ("APPROACH", "APPROACH_SETTLE"):
             sample_time = elapsed if active == "APPROACH" else paired.duration
-        elif active in ("ALIGN_JOINT6", "ALIGN_SETTLE", "OPEN_FOR_GRASP", "GRASP_WAIT"):
+        elif active in ("ALIGN_JOINT6", "ALIGN_SETTLE", "OPEN_FOR_GRASP"):
             paired = motion.alignment
             sample_time = elapsed if active == "ALIGN_JOINT6" else paired.duration
             if active == "OPEN_FOR_GRASP":
@@ -286,8 +284,6 @@ class SimpleGraspDemo(DualGraspDemo):
                 command = GRIPPER_CLOSED_COMMAND + (
                     GRIPPER_OPEN_COMMAND - GRIPPER_CLOSED_COMMAND
                 ) * fraction
-            elif active == "GRASP_WAIT":
-                command = GRIPPER_OPEN_COMMAND
         elif active in ("INSERT", "INSERT_SETTLE"):
             paired = motion.insertion
             sample_time = elapsed if active == "INSERT" else paired.duration
@@ -374,9 +370,8 @@ class SimpleGraspDemo(DualGraspDemo):
             if self.state == "OPEN_FOR_GRASP":
                 self.record_plane("after_XOY_error_rad", 2)
         elif self.state == "OPEN_FOR_GRASP" and elapsed >= GRIPPER_ACTION_S:
-            self.enter("GRASP_WAIT")
-        elif self.state == "GRASP_WAIT" and elapsed >= GRASP_WAIT_S:
-            self.grasp_wait_elapsed = elapsed
+            self.gripper_command = GRIPPER_OPEN_COMMAND
+            self.loaded.set_grippers(GRIPPER_OPEN_COMMAND)
             self.insertion_start_tcp = self.tcp_points()
             self.enter("INSERT")
         elif self.state == "INSERT" and elapsed >= motion.insertion.duration:
@@ -462,8 +457,8 @@ class SimpleGraspDemo(DualGraspDemo):
                     "version": SIMPLE_GRASP_RULE_VERSION,
                     "closed_command": GRIPPER_CLOSED_COMMAND,
                     "open_command": GRIPPER_OPEN_COMMAND,
-                    "wait_s": GRASP_WAIT_S,
-                    "actual_wait_s": self.grasp_wait_elapsed,
+                    "wait_s": 0.0,
+                    "actual_wait_s": 0.0,
                     "insertion_world_m": [0.0, INSERTION_DISTANCE_M, 0.0],
                     "retreat_world_m": [0.0, -INSERTION_DISTANCE_M, 0.0],
                     "grasp_confirmation": "assumed_for_demo",
