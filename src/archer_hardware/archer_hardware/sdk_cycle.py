@@ -244,4 +244,4 @@ class SdkCycleSender:
         except TrajectoryCancelled:
             self._cancel_position()
         except Exception as error:
-            self.fail(str(error))
+            self.fail(str(error) or type(error).__name__)

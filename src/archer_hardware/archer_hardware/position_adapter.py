@@ -356,7 +356,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
             if start_periodic is not None:
                 start_periodic()
         except Exception as error:
-            self.last_error = str(error)
+            self.last_error = str(error) or type(error).__name__
             self.stop(fault=True)
             raise
 
@@ -494,7 +494,7 @@ class HexPositionAdapter(HexFeedbackAdapter):
         except TrajectoryCancelled:
             self.stop(wait=False)
         except Exception as error:
-            self.last_error = str(error)
+            self.last_error = str(error) or type(error).__name__
             self.stop(fault=True)
             raise
         return self.state

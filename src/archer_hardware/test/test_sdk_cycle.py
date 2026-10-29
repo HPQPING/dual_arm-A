@@ -151,6 +151,41 @@ class NativeCycleTests(unittest.TestCase):
                     await self.finish(task)
         asyncio.run(run())
 
+    def test_empty_transport_exception_keeps_its_type(self) -> None:
+        """空正文异常不能变成无法定位的SDK任务故障；仍取消位置并制动。"""
+        async def run() -> None:
+            with patch.object(self.sdk, '_send_down_message', self.capture):
+                task = await self.acquire()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            self.adapter._target = (.0001,) * 6
+            targets = self.arm._construct_custom_motor_msg(
+                self.adapter._command_types.POSITION, list(self.adapter._target))
+            self.adapter._send(self.arm._construct_custom_joint_command_msg(targets), 'position')
+            packet = self.arm._construct_joint_command_msg(self.arm._target_command)
+
+            async def fail_transport(api: Any, message: Any) -> None:
+                raise TimeoutError()
+
+            try:
+                with patch.object(self.sdk, '_send_down_message', fail_transport):
+                    await self.api._send_down_message(packet)
+                self.assertEqual(self.adapter._native_error, 'TimeoutError')
+                self.assertEqual(self.adapter.state, 'FAULT')
+            finally:
+                await self.finish(task)
+        asyncio.run(run())
+
+    def test_empty_tick_exception_keeps_its_type(self) -> None:
+        """周期异常同样保存类型，不把空AssertionError丢失为未知故障。"""
+        self.adapter.state = 'HOLDING'
+        with patch.object(self.adapter, '_tick', side_effect=AssertionError()), \
+                patch.object(self.adapter, 'stop') as stop:
+            with self.assertRaises(AssertionError):
+                self.adapter.tick()
+        self.assertEqual(self.adapter.last_error, 'AssertionError')
+        stop.assert_called_once_with(fault=True)
+
     def test_control_periodic_is_deferred_and_starts_only_once(self) -> None:
         """发现设备不启动控制周期；显式准备后启动一次，重复调用不重复建任务."""
         with patch.object(self.sdk, '_start_device_periodic_task') as start:
