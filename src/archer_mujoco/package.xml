@@ -28,9 +28,6 @@
   <exec_depend>std_srvs</exec_depend>
   <exec_depend>visualization_msgs</exec_depend>
 
-  <!-- 仿真时间与坐标变换。 -->
-  <exec_depend>rosgraph_msgs</exec_depend>
-  <exec_depend>tf2_ros</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
 
   <test_depend>python3-pytest</test_depend>

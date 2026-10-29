@@ -1,63 +1,84 @@
-# Archer 启动入口
+# archer_bringup：统一仿真、显示和真机启动
 
-常用任务只有两个，启动后均等待服务命令，不自动运动：
+更新：2026-10-29。本文以当前源码、注册入口和实际安装检查为准。
+
+本包只组织节点/进程、参数、资源和退出事件；运动算法在control/hardware，模型在description/mujoco。主任务只有画圆和简化协同搬运，辅助显示/单臂入口不表示新增主任务。
+
+## 常用命令
+
+### 仿真
 
 ```bash
-source /opt/ros/humble/setup.bash
-source ~/archer_ws/install/setup.bash
-
-# 画圆：默认同时显示MuJoCo和RViz，记录开启；启动后等待开始服务。
 ros2 launch archer_bringup dual_circle_sim.launch.py
-# 另一个已source环境的终端开始画圆。
-ros2 service call /dual/task/start std_srvs/srv/Trigger '{}'
-
-# 完整圆柱抓取：另一次独立任务，不能与画圆仿真同时运行。
 ros2 launch archer_bringup dual_grasp_sim.launch.py
-# 另一个已source环境的终端开始抓取。
+```
+
+选择一个任务启动；准备就绪后另开已加载环境的终端分别调用：
+
+```bash
+ros2 service call /dual/task/start std_srvs/srv/Trigger '{}'
 ros2 service call /dual/grasp/start std_srvs/srv/Trigger '{}'
 ```
 
-旧画圆启动名称已移除，请统一使用 `dual_circle_sim.launch.py`。新入口不显示 `task_type` 任务选择，旧 `cooperative` 参数或配置会明确拒绝，并提示完整抓取入口。内部早期参考物协同规划代码保留，不作为常用任务入口。
+第一条开始画圆，第二条开始搬运；不要在画圆后端等待抓取服务。两种launch均默认show_viewer:=true、show_rviz:=true；无窗口统一加show_viewer:=false show_rviz:=false。画圆默认record:=true；已单独运行记录器时可设false避免重复记录。
 
-两个任务的 `show_rviz` 均默认true，自动包含同一个 `dual_arm_view.launch.py`，不需再另开显示launch。
-该公共文件只负责模型、TF、实际反馈汇总与RViz，没有运动规划，保留供两个任务复用。
-关闭RViz可加 `show_rviz:=false`。完全无窗口时同时加 `show_viewer:=false show_rviz:=false`。
-两个任务的MuJoCo窗口也均默认开启；其余默认值和开始服务不变。
-`single_arm_display.launch.py`、`single_arm_sim.launch.py` 用于单臂调试，保留供开发排查。
+### 真机（显式执行后会运动）
 
-只允许同时运行一套仿真场景，避免重复发布左右关节反馈。以上仿真入口不启动实机SDK。
+```bash
+ros2 launch archer_bringup dual_circle_real.launch.py execute:=true trajectory_file:="/转换目录/tracking.json"
+ros2 launch archer_bringup dual_grasp_real.launch.py execute:=true trajectory_file:="/转换目录/state.json"
+```
 
-## 画圆仿真初值
+每次显式指定转换轨迹文件，不设默认路径，不在功能包内保存JSON轨迹。报告由调度器自动从同目录查找，不把_report.json当输入。原始记录迁移时支持run_dir，特殊配置可指定limits_file；配置字节需与报告绑定一致。
 
-`config/dual_circle.yaml`的`dual_arm_scene.ros__parameters.left_initial_joints`和
-`right_initial_joints`已更新为2026-10-20 21:29只读采集的实际静止角度，未裁剪或改写。
-每组按J1到J6填写，单位rad；本次两臂均在名义限位内。
-它们是固定的仿真参数，启动仿真不会重新连接真机。实机姿态改变后，需要重新取得实际角度再更新。
+不加execute:=true仅打印未连接；执行许可和轨迹路径都会在创建控制节点前核对。console与launch调用同一任务调度器，不用另开hardware_position或旧缓存脚本。当前协同正式版211含沿用206反馈及两处时间优化；真机整合版平稳性仍待实际验证。
 
-完整画圆仍按“读取仿真反馈起点→接近→左右半圆→自动归位→COMPLETED”执行。
-沿用上面的一个launch命令和开始服务即可，成功后只在archer_results下生成一份新的日期时间任务目录。
-画圆的新初值不修改独立抓取任务的配置，也不改变真机驱动的实时读取规则。
+## 每份启动文件
 
+| 文件 | 基本功能 |
+|---|---|
+| [dual_arm_view.launch.py](launch/dual_arm_view.launch.py) | 公共双臂TF、joint_state_publisher汇总、robot_state_publisher与RViz；由两份主仿真launch包含，也可独立显示。 |
+| [dual_circle_real.launch.py](launch/dual_circle_real.launch.py) | 一份hardware_circle整轮调度器，显式execute和JSON/记录定位；默认不连接，不重生进程。 |
+| [dual_circle_sim.launch.py](launch/dual_circle_sim.launch.py) | 主画圆仿真：共享MuJoCo后端、后台任务规划、自动记录及可选公共双臂显示；默认不启动运动。 |
+| [dual_grasp_real.launch.py](launch/dual_grasp_real.launch.py) | 一份hardware_grasp正式211调度器，显式execute与state.json，处理夹爪、反馈修正和归位。 |
+| [dual_grasp_sim.launch.py](launch/dual_grasp_sim.launch.py) | 主简化协同仿真：grasp_ros_node、完整工件、夹爪示意、进退1cm和归位；共用画圆启动姿态。 |
+| [single_arm_display.launch.py](launch/single_arm_display.launch.py) | 单臂Xacro、滑块反馈、TF及RViz，供模型调试；不是MuJoCo动力学。 |
+| [single_arm_sim.launch.py](launch/single_arm_sim.launch.py) | 单臂MuJoCo、反馈/轨迹接收、夹爪标记与可选RViz；供单臂任务联调。 |
 
-## 166：画圆上游的归位感知逆解选择
+## 参数与显示资源
 
-`archer_control/circle_planner.py`保留相同圆弧点、工具姿态和随机种子，
-收集去重后能够连续完成圆弧的IK分支，比较左右臂配对的接近、圆弧、归位代价。
-代价使用当前速度配置和共同五次段时长估算；只有各阶段代价均不变差且总成本
-有实际下降（或同等时间下关节总路程改善）时才改选，否则保留原首条可行分支。
-`plan_circle(..., return_aware=False)`供离线旧算法对照；正常调用默认启用整轮选择。
-任务节点传入实际`speed_limits`，不再让候选排序和初始关节规划隐式使用默认速度。
-不会直接修改J6目标、工具旋转、限位、夹爪、硬件配置或已有CSV/JSON。
+| 文件 | 基本功能 |
+|---|---|
+| [config/dual_circle.yaml](config/dual_circle.yaml) | 共享双臂安装、仿真固定初角、画圆几何/速度/加速度和记录器参数；协同也复用其初角/显示安装。 |
+| [rviz/dual_arm.rviz](rviz/dual_arm.rviz) | 双臂模型、TF、半圆/TCP轨迹等显示布局。 |
+| [rviz/dual_grasp.rviz](rviz/dual_grasp.rviz) | 协同模型、工件/阶段标记等显示布局。 |
 
-参考MoveIt Task Constructor的ComputeIK多解去重及SerialContainer完整任务代价思想：
-<https://moveit.picknik.ai/main/doc/concepts/moveit_task_constructor/wrappers.html>
-<https://moveit.picknik.ai/main/doc/concepts/moveit_task_constructor/moveit_task_constructor.html>
-这里使用项目自身IK与代价比较，未集成MTC求解器；不保证找全分支或全局最优。
-最终连续轨迹的V/A和跨臂离散间隙仍由既有完整路径检查复核，候选代价不是实际耗时承诺。
+| 文件/目录 | 用途 |
+|---|---|
+| [package.xml](package.xml) | ROS依赖、包名与ament构建类型。 |
+| [CMakeLists.txt](CMakeLists.txt) | 安装launch、config、rviz和README并注册启动回归。 |
 
-使用当前dual_circle.yaml初值、相同32次随机尝试离线对比：两臂各找到一个可行分支，
-新旧关节节点完全相同；完整上游仿真计划71.2208秒，其中接近14.2504、归位14.2505秒。
-TCP节点位置误差最大0.0592mm、姿态误差0.000193rad，完整跨臂离散预检通过。
-因此当前上游尚无分支提速收益，不能把下游归位较慢主要归因于J6大幅度。
-这些时间是上游计划值，不是记录CSV重定时后的真机执行时间。
-原启动命令保持不变；既有158/164缓存文件不会因本次源码变更而自动改变。
+主画圆支持params_file、python_executable、show_viewer、show_rviz、record；主协同支持python_executable、output_file、show_viewer、show_rviz、rviz_params_file。
+output_file仅为显式额外结果JSON，不代替archer_results自动成功记录。rviz_params_file关闭RViz时仍提供共用初值核对，不能因此换回另一套仿真起点。
+
+## 辅助调用与退出
+
+```bash
+ros2 launch archer_bringup single_arm_sim.launch.py side:=left
+ros2 launch archer_bringup single_arm_display.launch.py side:=right
+ros2 launch archer_bringup dual_arm_view.launch.py
+```
+
+公共显示不会生成真实反馈或启动运动；主仿真已默认包含它，无需再开相同显示。显示launch不从单臂任务节点导入参数工具，而直接使用纯公共校验模块。
+
+关闭独立显示组只影响其自身；如果它由主launch包含，RViz退出发出的Shutdown会结束同一个launch服务的主任务进程。画圆关闭MuJoCo窗口通常结束整组；协同关闭查看器会冻结场景但可保留ROS服务，结束整组用launch终端Ctrl+C。真机任务Ctrl+C执行软件取消/BRAKE关闭，不故障归位。
+
+## 测试文件
+
+测试文件是开发回归，不随正常任务自动运行。功能回归与完整ament检查方法见项目根README；版权/许可证检查存在占位或跳过，不把功能测试通过写成全部发布检查通过。
+
+| 文件 | 基本功能 |
+|---|---|
+| [test_circle_launch.py](test/test_circle_launch.py) | 验证两个任务的启动入口及旧名称兼容，不启动节点或连接设备. |
+| [test_grasp_real_launch.py](test/test_grasp_real_launch.py) | 检查协同真机launch的显式许可和唯一调度节点，不执行任何节点。 |
+| [test_real_launch.py](test/test_real_launch.py) | 检查画圆真机launch只启动一份正式入口，不执行节点或连接设备。 |

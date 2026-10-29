@@ -2,7 +2,11 @@
 
 from launch import LaunchDescription
 from launch.actions import (
-    DeclareLaunchArgument, EmitEvent, LogInfo, OpaqueFunction, RegisterEventHandler,
+    DeclareLaunchArgument,
+    EmitEvent,
+    LogInfo,
+    OpaqueFunction,
+    RegisterEventHandler,
 )
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
@@ -21,23 +25,45 @@ def _start(context):
         value = LaunchConfiguration(name).perform(context).strip()
         if value:
             arguments.extend(['--' + name.replace('_', '-'), value])
-    task = Node(package='archer_hardware', executable='hardware_grasp',
-                arguments=arguments, output='both', respawn=False,
-                additional_env={'PYTHONUNBUFFERED': '1'})
-    return [RegisterEventHandler(OnProcessExit(
-        target_action=task,
-        on_exit=[EmitEvent(event=Shutdown(reason='协同任务调度器已退出'))],
-    )), task]
+    task = Node(
+        package='archer_hardware',
+        executable='hardware_grasp',
+        arguments=arguments,
+        output='both',
+        respawn=False,
+        additional_env={'PYTHONUNBUFFERED': '1'},
+    )
+    return [
+        RegisterEventHandler(
+            OnProcessExit(
+                target_action=task,
+                on_exit=[EmitEvent(event=Shutdown(reason='协同任务调度器已退出'))],
+            )
+        ),
+        task,
+    ]
 
 
 def generate_launch_description() -> LaunchDescription:
-    return LaunchDescription([
-        DeclareLaunchArgument('trajectory_file', default_value='',
-                              description='转换后state.json，自动定位同名报告和原始记录'),
-        DeclareLaunchArgument('run_dir', default_value='', description='可选的原始记录目录'),
-        DeclareLaunchArgument('limits_file', default_value='',
-                              description='默认archer_hardware/config/grasp_real.yaml'),
-        DeclareLaunchArgument('execute', default_value='false', choices=['true', 'false'],
-                              description='true表示允许双臂轨迹、夹爪开合及自动归位'),
-        OpaqueFunction(function=_start),
-    ])
+    return LaunchDescription(
+        [
+            DeclareLaunchArgument(
+                'trajectory_file',
+                default_value='',
+                description='转换后state.json，自动定位同名报告和原始记录',
+            ),
+            DeclareLaunchArgument('run_dir', default_value='', description='可选的原始记录目录'),
+            DeclareLaunchArgument(
+                'limits_file',
+                default_value='',
+                description='默认archer_hardware/config/grasp_real.yaml',
+            ),
+            DeclareLaunchArgument(
+                'execute',
+                default_value='false',
+                choices=['true', 'false'],
+                description='true表示允许双臂轨迹、夹爪开合及自动归位',
+            ),
+            OpaqueFunction(function=_start),
+        ]
+    )

@@ -50,6 +50,7 @@ def show_gripper_feedback(workers: Mapping[str, Any]) -> None:
 def run(
     prepared_dir: Path, run_dir: Path, config: Path, *, ros_args: list[str] | None = None,
     trajectory_file: Path | None = None, task_type: str = 'split_circle',
+    backend_type: type[Any] | None = None,
 ) -> int:
     """显式启动后才连接；中间采样点不等待到位，不生成额外诊断文件。"""
     if task_type not in ('split_circle', 'cooperative_grasp'):
@@ -83,7 +84,7 @@ def run(
             from .gripper_adapter import CooperativePositionAdapter
 
             node = PositionControlNode(
-                task_type=task_type, backend_type=CooperativePositionAdapter)
+                task_type=task_type, backend_type=backend_type or CooperativePositionAdapter)
         else:
             node = PositionControlNode()
 

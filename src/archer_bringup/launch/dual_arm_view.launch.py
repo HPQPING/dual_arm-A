@@ -27,7 +27,7 @@ from launch_ros.parameter_descriptions import ParameterValue
 from archer_control.model_checks import validate_tool_chain
 from archer_control.dual_arm_trajectory import rigid_transform
 from archer_control.kinematics import ArmKinematics
-from archer_control.single_arm_node import numbers
+from archer_control.parameter_validation import numbers
 
 
 def _mapping(value: object, label: str) -> dict[str, object]:
@@ -186,7 +186,7 @@ def _start(context) -> list[Action]:
         output="screen",
         parameters=[{"use_sim_time": False}],
     )
-    # 退出这组显示进程，不影响另一个终端中的共享仿真和任务节点。
+    # 关闭独立显示组；被主launch包含时，Shutdown会同时结束同组仿真和任务。
     handlers = [
         RegisterEventHandler(
             OnProcessExit(

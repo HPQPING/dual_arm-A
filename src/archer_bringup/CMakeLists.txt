@@ -30,4 +30,6 @@ if(BUILD_TESTING)
   endif()
 endif()
 
+install(FILES README.md DESTINATION share/${PROJECT_NAME})
+
 ament_package()

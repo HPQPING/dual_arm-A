@@ -5,7 +5,7 @@ from __future__ import annotations
 from bisect import bisect_right
 from dataclasses import dataclass
 import math
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -968,7 +968,9 @@ def smooth_circle_interior(
         rhs = np.vstack((target, np.zeros((len(grid), 12))))
         c = c0 + free @ np.linalg.lstsq(design @ free, rhs - design @ c0, rcond=None)[0]
         spline = BSpline(knots, c, 5)
-        nq, nv, na = spline(u), spline(u, 1) / duration, spline(u, 2) / duration**2
+        nq = cast(FloatArray, spline(u))
+        nv = cast(FloatArray, spline(u, 1) / duration)
+        na = cast(FloatArray, spline(u, 2) / duration**2)
         nq[[0, -1]], nv[[0, -1]], na[[0, -1]] = q[[0, -1]], v[[0, -1]], a[[0, -1]]
         if float(np.max(abs(nq - original))) > .0005:
             continue
@@ -1014,7 +1016,7 @@ def smooth_circle_interior(
         for field in fields:
             for array in field.values():
                 array.setflags(write=False)
-        return ContinuousPair(plan.times, *fields, plan.stops), dict(
+        return ContinuousPair(plan.times, fields[0], fields[1], fields[2], fields[3], plan.stops), dict(
             policy='bounded_minimum_jerk_bspline', first=first, last=last,
             controls=controls, penalty=penalty, time_axis_preserved=True,
             boundary_qva_preserved=True, edge_jerk_change_rad_s3=edge_error,
@@ -1226,7 +1228,7 @@ def retime_spatial_pair(
         values.setflags(write=False)
     changes = {s: float(np.max(np.abs(q[i] - raw[i])))
                for i, s in enumerate(('left', 'right'))}
-    plan = ContinuousPair(times, *arrays, polynomials, stops)
+    plan = ContinuousPair(times, arrays[0], arrays[1], arrays[2], polynomials, stops)
     return plan, {
         'continuous_constraints_passed': True, 'samples_preserved': count,
         'positions_preserved': False, 'position_filter': 'bounded_spatial_spline',

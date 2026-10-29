@@ -72,3 +72,10 @@ def test_simulation_passes_circle_initial_pose_even_without_rviz():
     assert command[-len(parameters):] == parameters
     assert any(item.startswith('left_initial_joints:=') for item in command)
     assert any(item.startswith('right_initial_joints:=') for item in command)
+
+
+def test_no_default_trajectory_file():
+    """与画圆一致：每次显式指定JSON地址，数据只在结果转换目录管理。"""
+    defaults = {a.name: a.default_value for a in load().generate_launch_description().entities
+                if isinstance(a, DeclareLaunchArgument)}
+    assert perform_substitutions(LaunchContext(), defaults['trajectory_file']) == ''

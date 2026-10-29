@@ -1,33 +1,11 @@
-"""安装MuJoCo仿真入口及模型、配置资源，保留资源目录结构."""
+"""安装MuJoCo入口、YAML配置与README."""
 
-from pathlib import Path
+from glob import glob
 
 from setuptools import find_packages, setup
 
 
 PACKAGE_NAME = "archer_mujoco"
-
-
-def resource_files(directory):
-    """保留资源目录结构，安装其中的非隐藏文件."""
-    result = []
-    root = Path(directory)
-
-    if not root.is_dir():
-        return result
-
-    for parent in sorted({path.parent for path in root.rglob("*") if path.is_file()}):
-        files = sorted(
-            str(path)
-            for path in parent.iterdir()
-            if path.is_file() and not path.name.startswith(".")
-        )
-
-        if files:
-            destination = (Path("share") / PACKAGE_NAME / parent).as_posix()
-            result.append((destination, files))
-
-    return result
 
 
 setup(
@@ -41,10 +19,9 @@ setup(
         ),
         (
             "share/" + PACKAGE_NAME,
-            ["package.xml"],
+            ["package.xml", "README.md"],
         ),
-        *resource_files("config"),
-        *resource_files("models"),
+        ("share/" + PACKAGE_NAME + "/config", glob("config/*.yaml")),
     ],
     install_requires=["setuptools"],
     zip_safe=False,

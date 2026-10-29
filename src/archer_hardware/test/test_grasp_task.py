@@ -111,6 +111,9 @@ class GraspTaskTests(unittest.TestCase):
         (self.converted / 'state_report.json').write_text(json.dumps(report))
         self.ros = patch('archer_hardware.grasp_task.import_module', return_value=SimpleNamespace(
             remove_ros_args=lambda *, args: args))
+        self.budget = patch.object(grasp_task, 'qualify_prepared_return')
+        self.budget.start()
+        self.addCleanup(self.budget.stop)
         self.ros.start()
         self.addCleanup(self.ros.stop)
 
@@ -129,7 +132,8 @@ class GraspTaskTests(unittest.TestCase):
             self.assertEqual(grasp_task.main(arguments), 0)
         run.assert_called_once_with(
             self.converted, self.source, self.config, trajectory_file=self.payload,
-            ros_args=arguments, task_type='cooperative_grasp')
+            ros_args=arguments, task_type='cooperative_grasp',
+            backend_type=grasp_task.CarryFeedbackAdapter)
 
     def test_changed_input_rejected_before_creating_node(self):
         (self.source / 'state.csv').write_text('changed after conversion')

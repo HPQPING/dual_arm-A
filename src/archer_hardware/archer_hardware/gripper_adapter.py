@@ -342,7 +342,7 @@ class CooperativePositionAdapter(HexPositionAdapter):
         self._api._process_api_up = observe
 
     def observe_tracking(self, message: Any) -> None:
-        """只观察已有同帧反馈，最多50Hz/251帧；诊断失败不得改变控制状态。"""
+        """只观察已有同帧反馈，最多50Hz；帧数由适配器缓存容量决定。"""
         if self.state != 'RUNNING':
             return
         now = time.perf_counter_ns()
@@ -428,7 +428,7 @@ class CooperativePositionAdapter(HexPositionAdapter):
                        (round(rows[i]['device_rad'][joint], 6)
                         if rows[i]['device_rad'][joint] is not None else None),
                        round(rows[i]['effort'][joint], 6)] for i in selected]
-            context = ('；同轴近5秒[参考s,期望rad,实际rad,实际速度rad/s,已发rad,设备目标rad,反馈力矩]='
+            context = ('；同轴缓存观测[参考s,期望rad,实际rad,实际速度rad/s,已发rad,设备目标rad,反馈力矩]='
                        + json.dumps(values, separators=(',', ':')))
         trace_error = getattr(self, '_tracking_trace_error', '')
         if trace_error:

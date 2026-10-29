@@ -18,7 +18,7 @@ setup(
         ),
         (
             "share/" + PACKAGE_NAME,
-            ["package.xml"],
+            ["package.xml", "README.md"],
         ),
         (
             "share/" + PACKAGE_NAME + "/config",

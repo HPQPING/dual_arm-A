@@ -1,4 +1,4 @@
-"""离线生成并复核连续画圆候选，版本二文件尚不接入现有执行端."""
+"""开发工具：从版本一逐点计划生成并复核版本二连续画圆候选，不连接真机."""
 
 from __future__ import annotations
 
@@ -121,7 +121,7 @@ def main() -> int:
             }
         )
         points = read_source(yaml.safe_load(source.decode("utf-8")))
-        settings = yaml.safe_load(config.decode("utf-8"))
+        settings = cast(dict[str, Any], yaml.safe_load(config.decode("utf-8")))
         params = settings["archer_position_driver"]["ros__parameters"]
         constraints = [
             np.asarray([params[f"{side}_{field}"] for side in ("left", "right")], dtype=np.float64)

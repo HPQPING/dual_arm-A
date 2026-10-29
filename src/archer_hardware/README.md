@@ -1,627 +1,138 @@
-# 真机接口与完整任务流程
+# archer_hardware：真机接入与完整任务执行
 
-更新日期：2026-10-23。
+更新：2026-10-29。本文以当前源码、注册入口和实际安装检查为准。
 
-当前画圆已通过多次整轮实机播放及自动归位；最近一次日志显示播放95.858秒，退出前
-归位误差left约0.001634rad、right约0.002038rad。此结果是播放与归位记录，不是TCP精度验收。
-完整任务验证使用的固定配置为`~/.cache/archer_development/circle111_trial.yaml`，
-速度上限0.50rad/s、加速度上限0.30rad/s²、250Hz；基础`config/position_control.yaml`
-仍保留0.10rad/s²及默认关闭的许可，两者用途不同。历史配置与转换报告绑定哈希，
-不能只改注释、参数或报告哈希就继续使用旧证明；当前固定验证配置保留原字节。
+## 职责和当前版本
 
-正常任务采用“启动 → 接近 → 任务动作 → 计划内归位 → 保持”。归位属于同一份完整任务计划，执行前一并检查。协同抓取仿真已有释放、退开及归位；画圆仿真补入共享时间轴归位段。底层单点 move 或任意关节轨迹只执行给定目标，不会自行猜测和追加归位。
+本包负责厂商SDK的连接、反馈、SDK准备、POSITION发送、双臂共同参考时间、夹爪事件、故障取消以及关闭。规划数学与模型检查复用control/mujoco；普通任务无需单独启动底层驱动。
 
-## 退出与故障停止
+正式协同版本为211：反馈控制沿用206实机认可逻辑，J6调姿与归位开始分臂时间采用211候选。J6名义主段9.887→7.423秒，分臂11.337→8.956秒；它们是计划值，211整合版真实平稳性仍待验证。
 
-无需启动键盘监听。退出位置驱动时，在**驱动所在前台终端**按 Ctrl+C：先取消两臂的活动请求，再等待执行线程关闭 SDK 连接，最后退出 ROS。不中途归位，不发送零力矩或 MIT 命令。现有适配器关闭时会尽力 BRAKE 后断开；这里没有新增失能指令。按用户确认的设备特性，断连后由设备自锁。
+## 主要命令
 
-Ctrl+C 只作用于对应终端的进程；退出 RViz、状态客户端或只读报告不等于关闭另一个终端的位置驱动。强杀进程、断电与网络故障不保证软件清理完成。
-
-移除 `hardware_operator keyboard`、`hardware_operator stop` 及 `/hardware/position/stop`。不再通过停止命令发起独立归位。保留全局 `/hardware/position/halt` 供程序故障联停：取消运动、作废目标、本次运行不可恢复；halt 服务本身保留反馈连接，与退出驱动不同。没有 reset/resume 入口。
-
-## 目录与基本功能
-
-```text
-archer_hardware/
-├── archer_hardware/
-│   ├── hex_adapter.py          # SDK依赖、只读反馈与状态解析
-│   ├── driver_node.py          # 左右臂只读反馈
-│   ├── position_plan.py        # 关节限位、位置轨迹和公共校验
-│   ├── position_adapter.py     # SDK位置模式执行与关闭清理
-│   ├── position_worker.py      # 每臂执行线程、取消和状态快照
-│   ├── position_node.py        # ROS目标暂存、显式执行与故障联停
-│   ├── operator_client.py      # 显式操作入口，无专用键盘监听
-│   ├── commissioning.py        # 反馈报告、试动预览与普通双臂计划校验
-│   ├── circle_import.py           # 成功任务CSV转为待检查的候选路径
-│   ├── task_file.py            # 原始记录、准备报告及连续文件核对
-│   ├── task_geometry.py        # 接近归位拼接及模型间隙检查
-│   ├── sdk_position.py        # 每臂独立SDK配置、历史与位置编码
-│   └── sdk_cycle.py           # 官方周期取样、传输确认和有效期保护
-├── config/
-├── test/                      # 离线替身与开发检查
-├── setup.py
-└── package.xml
-```
-
-## 不连接设备的查询命令
+先加载ROS/工作空间环境。转换输入是**原始CSV**，执行输入是**转换后的轨迹JSON**，不是报告JSON。
 
 ```bash
-source /opt/ros/humble/setup.bash
-source ~/archer_ws/install/setup.bash
-ros2 run archer_hardware hardware_operator --help
-ros2 run archer_hardware hardware_operator status --timeout 5
-ros2 run archer_hardware hardware_operator circle-import --help
-ros2 run archer_hardware hardware_operator task-review --help
+ros2 run archer_hardware hardware_operator circle-import --input "/原始任务目录/tracking.csv" --profile circle
+ros2 run archer_hardware hardware_operator grasp-import --input "/原始任务目录/state.csv"
+ros2 launch archer_bringup dual_circle_real.launch.py execute:=true trajectory_file:="/转换目录/tracking.json"
+ros2 launch archer_bringup dual_grasp_real.launch.py execute:=true trajectory_file:="/转换目录/state.json"
 ```
 
-status 只订阅已存在驱动的状态，不自动连接或使能。hex_device 仍是必要依赖，适配器没有替代官方 SDK。
+两条launch会运动，内部各只创建一份完整任务调度器。数据统一保存在archer_results_trans，每次显式指定文件；不安装任务数据、不猜测最新日期。通过同名_report.json定位绑定的原始CSV/summary/events；迁移原始记录时可加run_dir:=/新原始目录。
 
-## 当前边界
-
-连接、使能、单点及成对位置轨迹接口已有离线替身检查，左右臂准备和原位保持已做实机验证。
-画圆文件已完成多次整轮实机播放与自动归位，仍未完成外部TCP定量精度验收。CSV转换只产生候选，
-默认配置不会自动开放控制。抓取文件目前只做离线检查，真实夹爪尚未接入。
-
-只读反馈验收报告增加逐关节最小值、最大值、变化范围、最大相邻变化量和变化次数。
-`positions_exactly_constant` 只说明本次窗口内至少两帧读数是否逐位相同；无样本或单帧时为null。
-这些统计不自动放宽起点或限位，不代表设备可控，也不能用一次不变的观察保证以后没有抖动。
-统计包括结构与时间合法的超限读数以保留证据；坏帧仍判失败。报告频率是收到反馈的频率，
-不是250/500Hz控制目标发送频率。
-
-反馈报告的 `startup_review` 单独列出是否需要收回名义限位、准备位置候选和本轮原始初值对应的
-限位内归位候选。准备候选复用已有 `recovery_goal`：只改变超限关节，并在边界内留出0.005rad；
-归位候选复用 `return_goal`，超限初值对应名义边界，实际初始记录保持原值。
-存在坏帧或没有反馈时不给位置候选；无论只读窗口是否通过，`execution_ready`始终为false。
-候选不是已检查的可执行轨迹，不会自动使能、收回或执行。轻微抖动也不触发反馈裁剪或四舍五入。
-
-### 显式入限和边界余量准备
-
-本臂已显式connect、enable并处于HOLDING后，可单独请求：
+仅核对协同文件，不连接SDK：
 
 ```bash
-ros2 run archer_hardware hardware_operator recover-limits --side right --timeout 10
+ros2 run archer_hardware hardware_grasp --check-only --trajectory-file "/转换目录/state.json"
 ```
 
-这是一条会产生实际运动的准备命令，不能当作只读检查。执行线程从同一帧新鲜静止反馈生成目标，
-若存在超限轴，本段只将超限轴收到边界内0.01rad，正常轴保持；全部名义入限后，
-再次显式调用时才把距边界不足0.003rad的轴收到边界内0.01rad，其他轴保持。
-不会在首段完成后自动追加第二段。采用2秒五次插值，
-每关节位移不超过配置max_excursion与0.02rad中的较小值，并重新检查速度及加速度。
-不先导出静态目标再读取执行反馈，因此正常关节的微小反馈变化不会误触发“夹带任务运动”的拒绝。
-普通move仍严格检查原目标，不因新增命令而放宽。
+直接console入口与launch使用同一实现，可通过 `ros2 run archer_hardware hardware_grasp --help` 或 `hardware_circle --help` 查看参数。正常使用优先上面的launch；无需同时运行hardware_position。
+
+## 每份实现文件
+
+| 文件 | 基本功能 |
+|---|---|
+| [__init__.py](archer_hardware/__init__.py) | 声明Python包，不启动节点或任务。 |
+| [circle_import.py](archer_hardware/circle_import.py) | 画圆CSV转换与同名输出替换，可显式启用连续样条、共同时间重分配和圆弧/边界平滑。 |
+| [circle_task.py](archer_hardware/circle_task.py) | 画圆真机入口；复用共用整轮调度，保持现有命令、参数和运动策略。 |
+| [commissioning.py](archer_hardware/commissioning.py) | 提供只读反馈验收、小幅试动文件生成及普通双臂计划校验，不连接SDK或发送控制命令. |
+| [cooperative_feedback.py](archer_hardware/cooperative_feedback.py) | 211运行反馈：双J2有界修正、归位软边界、末点保持和搬运双J3三极点低通；内存观测保留但不注册全局任务列表。 |
+| [cooperative_timing.py](archer_hardware/cooperative_timing.py) | 离线两窗口优化：正C3共同时间密度、固定节点和约束最小jerk/snap重建；不参与SDK实时发送。 |
+| [driver_node.py](archer_hardware/driver_node.py) | 发布双臂实机只读反馈，默认不连接设备，不接收运动指令. |
+| [file_task.py](archer_hardware/file_task.py) | 画圆/协同公共全流程：离线预检、SDK准备、实际起点衔接、连续回放、归位和退出；显式注入协同后端。 |
+| [grasp_events.py](archer_hardware/grasp_events.py) | 核对协同任务的夹爪位置与开爪后直接进给时序，不调用 ROS 或 SDK、不确认真实夹持。 |
+| [grasp_import.py](archer_hardware/grasp_import.py) | 协同CSV通用转换，保留关节轨迹、夹爪事件和来源哈希；不会隐式启用211特定输入优化。 |
+| [grasp_smoothing.py](archer_hardware/grasp_smoothing.py) | 按协同阶段拟合有界五次样条，抑制仿真采样微波动，保留事件停顿与双臂共同时间。 |
+| [grasp_task.py](archer_hardware/grasp_task.py) | 协同真机任务入口：读取已转换轨迹，按共同时间开合夹爪，整轮归位后关闭。 |
+| [gripper_adapter.py](archer_hardware/gripper_adapter.py) | GP80复用机械臂SDK连接；显式启用才启动官方夹爪周期，不发送力矩或零力矩。 |
+| [hex_adapter.py](archer_hardware/hex_adapter.py) | 封装hex_device依赖、反馈解析、设备状态和连接清理；仍需要Ubuntu安装的官方SDK。 |
+| [operator_client.py](archer_hardware/operator_client.py) | 提供显式真机操作及离线检查入口，不直接调用SDK或自动使能. |
+| [position_adapter.py](archer_hardware/position_adapter.py) | 独立的 SDK 关节位置控制接入，默认只连接反馈，不自动申请控制权. 调用方需显式申请控制并持续调用 tick；软件制动请求不等同于实体急停。 |
+| [position_feedback.py](archer_hardware/position_feedback.py) | 协同双J2有界平滑反馈滤波；不导入ROS/SDK或发送指令。 |
+| [position_node.py](archer_hardware/position_node.py) | 提供显式连接、使能、目标预检、执行和停止的 ROS 位置接口. |
+| [position_plan.py](archer_hardware/position_plan.py) | 检查关节限制并生成位置轨迹与双臂启动屏障，不连接设备. |
+| [position_worker.py](archer_hardware/position_worker.py) | 以每臂独立线程调度位置接口，服务回调不直接访问 SDK. |
+| [sdk_cycle.py](archer_hardware/sdk_cycle.py) | 将项目目标交给官方 SDK 周期发送，逐包复核权限、有效期和原始编码. |
+| [sdk_position.py](archer_hardware/sdk_position.py) | 为官方 SDK 位置命令隔离每臂配置与历史；本模块不连接设备或启动任务. |
+| [task_file.py](archer_hardware/task_file.py) | 离线核对成功任务的原始记录与连续轨迹，输出证据但不连接ROS或SDK. |
+| [task_geometry.py](archer_hardware/task_geometry.py) | 离线拼接接近、文件任务与归位轨迹，并对连续插值做离散几何预检. |
+
+## 配置、安装与测试文件
+
+| 配置 | 功能 |
+|---|---|
+| [config/hardware.yaml](config/hardware.yaml) | 只读左右臂反馈节点的连接/发布参数。 |
+| [config/position_control.yaml](config/position_control.yaml) | 底层位置驱动基础配置，默认不自动连接、不开放完整任务许可。 |
+| [config/circle_real.yaml](config/circle_real.yaml) | 画圆转换与整轮执行的绑定配置。 |
+| [config/grasp_real.yaml](config/grasp_real.yaml) | 协同转换与执行配置，包含两臂范围、250Hz、0.5rad/s和0.3rad/s²上限。 |
+
+YAML字节参与SHA256报告绑定。本轮保留全部真机YAML字节，避免已有转换因仅改注释失效。其中历史“尚未接入夹爪/未实机”注释不能代表当前能力，以本文和正式入口为准。直接启动底层驱动时许可默认关闭；完整调度器会显式设置本次所需许可与运行误差界限，不意味着修改配置文件。
+
+| 文件/目录 | 用途 |
+|---|---|
+| [package.xml](package.xml) | ROS依赖、包名与ament构建类型。 |
+| [setup.py](setup.py) | 注册Python可执行入口并安装配置和README。 |
+| [setup.cfg](setup.cfg) | 把console脚本安装到ROS包的lib目录。 |
+| resource/archer_hardware | ament索引标记，不是执行程序。 |
+
+测试文件是开发回归，不随正常任务自动运行。功能回归与完整ament检查方法见项目根README；版权/许可证检查存在占位或跳过，不把功能测试通过写成全部发布检查通过。
+
+| 文件 | 基本功能 |
+|---|---|
+| [test_circle_import.py](test/test_circle_import.py) | 验证仿真CSV离线导入、原始时间和角度保留，不连接设备或执行运动. |
+| [test_circle_task.py](test/test_circle_task.py) | 验证正式画圆入口的许可、路径及ROS参数处理，不连接机械臂。 |
+| [test_cooperative_carry_feedback.py](test/test_cooperative_carry_feedback.py) | 离线验证搬运J3修正与成功204其他阶段隔离，不建立设备连接。 |
+| [test_cooperative_package.py](test/test_cooperative_package.py) | 正式协同入口的默认文件、显式许可和后端注入，不连接设备。 |
+| [test_cooperative_return_feedback.py](test/test_cooperative_return_feedback.py) | 验证192仅影响归位及结束交接，归位前与冻结189逐周期一致；不连接硬件。 |
+| [test_copyright.py](test/test_copyright.py) | 检查功能包源文件的版权声明格式，不启动节点或连接设备. |
+| [test_feedback_adapter.py](test/test_feedback_adapter.py) | 离线验证反馈适配器，所有测试均禁止连接实际设备. |
+| [test_feedback_audit.py](test/test_feedback_audit.py) | 离线验证反馈验收，ROS 消息使用合成数据，不连接设备. |
+| [test_feedback_node.py](test/test_feedback_node.py) | 在真实 ROS 通信中验证只读节点，设备连接始终用替身隔离. |
+| [test_flake8.py](test/test_flake8.py) | 仅检查当前功能包的 Python 样式，并处理检查器初始化失败. |
+| [test_grasp_import.py](test/test_grasp_import.py) | 检查协同事件、连续时间轴、命令分发与失败保留旧转换，不连接真实设备。 |
+| [test_grasp_smoothing.py](test/test_grasp_smoothing.py) | 检查协同样条的共同时间、位置边界、事件保持时长和故障说明，不连接真实设备。 |
+| [test_grasp_task.py](test/test_grasp_task.py) | 检查协同入口许可、输入文件绑定及夹爪连续时序，不创建SDK连接。 |
+| [test_gripper_adapter.py](test/test_gripper_adapter.py) | 以SDK替身验证夹爪发送准入、过期取消、端口隔离和制动，不连接设备。 |
+| [test_gripper_sdk.py](test/test_gripper_sdk.py) | 运行官方Hands周期并截获全部传输，核对真实编码与BRAKE，不创建网络API。 |
+| [test_joint_trial.py](test/test_joint_trial.py) | 离线验证试动文件、普通双臂计划校验，不连接SDK或驱动机械臂. |
+| [test_operator_client.py](test/test_operator_client.py) | 离线验证显式操作客户端，服务后端仅为内存替身. |
+| [test_pep257.py](test/test_pep257.py) | 从任意工作目录运行时，都只检查当前功能包的文档字符串. |
+| [test_position_control.py](test/test_position_control.py) | 离线验证位置控制，所有发送均被替身接收，不连接实际设备. |
+| [test_position_node.py](test/test_position_node.py) | 通过真实 ROS 服务和线程验证位置节点，设备始终使用离线替身. |
+| [test_sdk_cycle.py](test/test_sdk_cycle.py) | 以内存传输运行真实 SDK 周期，验证位置、取消、过期和退出，不连接设备. |
+| [test_sdk_position.py](test/test_sdk_position.py) | 使用真实 SDK 离线验证双臂历史隔离和目标拒改，不建立网络连接. |
+| [test_task_file.py](test/test_task_file.py) | 验证整轮任务文件核对及篡改拒绝，不连接设备或执行动作. |
+| [test_task_geometry.py](test/test_task_geometry.py) | 验证离线接近、连续路径加密采样及碰撞拒绝，不连接实机. |
+
+## 数据与接口规则
+
+转换默认写入archer_results_trans/原任务目录名，画圆tracking.json+tracking_report.json，协同state.json+state_report.json。同一输出目录成功转换时替换同名文件，写第二文件失败会回滚；失败不发布半套数据。
+
+JSON包含左右六关节位置、时间和连续轨迹导数/停止节点；报告保存输出与输入SHA、限位配置、时间映射、阶段、夹爪事件和检查指标。不是“任何CSV读取后就立即运动”：转换只写文件，显式执行入口才接入机器人。
+
+- 左臂CAN0/8439，右臂CAN1/9439，共同控制器192.168.1.100。软件共同参考时间不等于CAN总线硬件同步。
+- 官方SDK250Hz意味着约4ms一次周期取样；原CSV无需逐行与4ms对应，执行器在连续曲线上取样。
+- 整轮画圆使用0.05rad、协同0.045rad的统一预检/运行界限，中间点连续通过，不逐点等到位。
+- POSITION用于轨迹目标；gripper_adapter管理GP80夹爪事件。双J2偏移与搬运双J3修正有各自幅度/速度/加速度及平滑窗口，不是第二个SDK发送线程。
+- 新鲜实际初值与计划初值不同，由有界接近段衔接；正常末段回本轮初始目标。SDK初始化/必要校准、指定一次API超时清除沿用既有规则，运行中故障不自动清除重试。
+- 本项目SDK仍来自hex_device；删除厂商SDK不能继续接入真机。封装用于集中处理版本、状态、新鲜度和关闭，不是复制厂商实现。
+
+## 底层联调入口
+
+`hardware_feedback`是只读反馈节点；`hardware_position`是显式位置控制服务节点，默认不连接。完整任务launch不需要它们另行启动。
+`hardware_operator`的status/connect/enable/move/recover-limits/halt/disconnect/task-run用于高级联调，涉及连接/使能/运动，不能当成查看帮助自动执行。audit读取已发布反馈生成开发报告；trial只预览单关节/入限候选，不自动发运动。具体参数使用子命令 `--help`。
+
+底层发布 `/hardware/position/status`，左右 `/hardware/position/...` 状态由驱动提供；软件halt取消活动请求但本身不等于退出连接。正常退出使用运行任务的前台终端Ctrl+C，公共流程取消、尽力BRAKE并关闭，不发送零力矩、MIT或故障归位。GUI窗口退出不等同于关闭另一终端的真机驱动。
+
+## 算法与辅助模块为何分开
+
+cooperative_feedback是运行时反馈，cooperative_timing是离线时间规划，两者属于同一211版本。J6/分臂提速已写入当前转换JSON，运行时不重新搜索时间最优解。通用grasp-import并未自动升级为对所有新CSV应用211的特定输入策略。
 
-已在名义限位内且余量足够时报告无需动作；超出初值读取容差、反馈过期、运动未停稳或控制状态无效时拒绝。
-命令受理后清除本臂已暂存的单点目标，防止随后误用旧目标。客户端按本次操作编号等待结果；
-本段实际反馈须全部入限，变化轴至少保留0.003rad边界余量，各轴目标偏差不超过0.005rad，
-且仍满足已有跟踪保护；速度不超过0.02rad/s并持续0.2秒才完成。
-极窄的测试范围会按宽度缩小目标及最低余量，实机各轴范围不受影响。
-此结果只表示本段入限准备合格，目标精度须单独记录。原始初始角度记录不改变，另一臂不随该命令移动。
-连接和使能不会自动触发本动作；后台预检、成对运动或halt后的本次运行均不能调用。
-它不是故障复位、软件解锁或任务归位入口，退出及联停规则保持不变。
+circle_task和grasp_task保持独立，公共流程已在file_task共享；它们的文件类型、许可、夹爪与后端不同。FeedbackCooperativeAdapter、ReturnFeedbackAdapter和CarryFeedbackAdapter包含实质算法，归位故意绕过普通阶段的J2分支，不能机械换成super或折叠为重复修正。
 
-普通移动末点仍使用min(0.003rad, tracking_tolerance)；完整文件按其已声明并通过几何检查的误差界限判定末点。
-仅上述显式入限准备使用独立准入条件，不把本次准备合格当作画圆精度合格。
-计划结束后2秒仍未满足则故障取消，不因接近边界而扩大容差或自动追加更远目标。
-这只是软件判定条件，并非声称设备已达到该精度。
+## 输出与验证边界
 
-实际连接及控制操作仍按用户选择的范围执行。只读反馈检查不等于允许轨迹执行。
+正常完整执行只输出终端状态，默认不生成任务结果文件。内存观测用于关闭摘要及故障上下文，最大50Hz；正式协同缓存8000条，不会因为进程结束自动写入archer_results。开发验收数据放archer_validation或开发缓存。
 
-### 默认可执行限位与模型一致
-
-J2、J4的项目模型、规划默认值与真机软件下限统一为-1.575rad；这是用户授权的
-0.005rad工程余量，解决静态摆放和重力导致的少量超出旧模型下限问题，不修改控制器固件。
-其余边界保持原值：J1[-2.61,2.79]、J2[-1.575,2.09]、J3[0,3.14]、
-J4[-1.575,1.57]、J5[-1.55,1.55]、J6[-2.96,2.96]。
-这项软件设置不是厂商对额外机械行程的认证；整轮仍使用已记录的原关节路径。
-实际初始角度原样保存，在已授权软件范围内直接规划接近与返回，不另做独立入限试验。
-读取容差与运行时跟踪误差保护保持分开，其他关节不随本次调整放宽。
-修改配置后必须从原CSV真实重转候选并重新预检，不手改哈希冒充通过。
-
-## 统一工具入口
-
-面向用户的入口为hardware_operator。只读统计用`hardware_operator audit`，试动预览用
-`hardware_operator trial`，转换用`hardware_operator circle-import`，连续文件核对用
-`hardware_operator task-review`；可分别加`--help`查看参数。
-不再安装hardware_feedback_audit、hardware_joint_trial两个重复别名。
-旧plan-check/plan-retime命令已退役；普通双臂接口所需quintic_stop结构校验保留为内部核心，
-不等于当前完整文件采用逐点停车。load_limits已移到position_plan公共模块，CSV和文件核对
-不再为读取配置而导入联调节点模块。
-
-## 归位与记录
-
-完整任务的归位属于同一条计划，使用常规轨迹执行器；停止或退出不会额外归位。
-原始初始角度保留，略超限时归位目标单独限制到名义边界。
-归位记录使用同一次任务CSV的phase=RETURN_HOME，不产生独立文件或任务。
-
-## CSV连续轨迹准备
-
-CSV读取已支持在同一入口增加 `--prepare`：保留全部实际关节采样和顺序，用两臂共同时间比例放慢路径，准备位置、速度、加速度连续的版本二轨迹。非均匀采样间隔和静止区间保留；阶段边界及夹爪参考事件处设置停点，段内角度、峰值速度和加速度均进行解析检查。
-
-```bash
-source ~/archer_ws/install/setup.bash
-ros2 run archer_hardware hardware_operator circle-import \
-  --run-dir ~/archer_ws/archer_results/某次已完成任务目录 \
-  --limits-file ~/archer_ws/src/archer_hardware/config/position_control.yaml \
-  --prepare
-```
-
-默认在 `~/archer_ws/archer_results_trans/原任务目录名/` 保存转换文件，沿用CSV主文件名：`tracking.csv` 生成 `tracking.json` 和 `tracking_report.json`，`state.csv` 生成 `state.json` 和 `state_report.json`。自动创建目录，不改写原CSV和摘要，同目录同名转换成功后替换旧轨迹和旧报告，只保留最新一份。标准输入位于某工作空间的 `archer_results` 时，转换目录跟随该工作空间；其他输入路径默认使用 `~/archer_ws`。可用 `--output-dir` 指定转换目录，或用 `--output`、`--report` 指定文件。仅给 `--output` 时，报告默认放在同目录，以轨迹文件名加 `_report.json` 命名。移除 `--prepare` 时只导入原始采样，文件名仍相同，文件内容会标明版本与类型；同名文件再次转换成功会被替换；需同时保留两种版本时，请显式指定不同输出目录或文件。
-
-记录目录约定：`archer_results` 保存画圆和协同抓取任务，`archer_validation` 保存硬件逐轴/组合/同步观察，`archer_results_trans` 保存CSV转换产物。转换文件仍需文件、模型和实际起点核对；导入不触发机械臂运动。转换失败保留上次成功的两份文件，终端明确报告失败；报告含converted_at和conversion_mode便于辨认更新时间与类型。写入先暂存后替换，普通替换错误尝试回滚；若回滚失败会输出并保留备份目录。读取方仍须验证报告与轨迹哈希，不支持同时转换到同一组目标文件。
-
-准备结果依然标记 `execution_ready=false`：它尚未通过实际起点和完整几何检查；参考夹爪事件不会作为真实夹爪指令执行。版本二使用独立的连续执行核心，不偷偷退回逐点停车方式。画圆完整文件的专用入口见“画圆完整文件执行通道”，默认关闭；抓取文件尚不能进入真实执行。连接机械臂前仍先由用户选择。
-
-## 连续执行核心
-
-版本二读取与执行核心：`prepare_continuous_pair` 在准备阶段重新解析左右时间、关节顺序、停止点及位置/速度/加速度，并检查整个多项式段内约束；生成只读的预检对象。`arm_continuous` 接收该对象，核对新鲜静止反馈与实际起点，等待现有双臂共同启动门控。
-
-普通版本二关节候选允许0.005 rad内的小差异，有差异时重建并重新检查首段；首段仍可能因速度或加速度超限而拒绝。经过几何检查的完整文件使用 `preserve_path=true`，要求实际起点精确匹配，禁止套用上述首段重建逻辑；变化后必须重新规划和检查。
-
-250/500Hz位置发送循环只查询当前段并计算目标，不逐点补发过期样本，也不重复做全程实根检查。使用原有位置模式、实际到位保持、故障取消和关闭清理，不发送速度模式、MIT或零力矩。速度和加速度字段只用于重建位置曲线。
-
-连续执行核心和画圆完整文件已接入ROS后台预检与工作线程，并已有完整画圆实机播放记录；
-基础配置仍默认不开放。成功播放不代表真实抓取、TCP精度或所有工况均已验收。
-
-## 后台预检与双臂线程衔接
-
-`/hardware/position/paired_target` 的回调仅提交字符串，JSON解析及整段约束检查交给单一后台计算进程（spawn方式启动）。通过后再次核对最新静止反馈和实际起点，暂存为STAGED；收到显式paired_move后，才把连续对象交给左右执行线程。两侧各自复核起点并通过共同启动门控，任一侧失败则取消双方。
-
-新增只读参数 `allow_continuous_trajectory=false`，必须与既有成对许可及两臂已确认限位同时满足才允许版本二接入；默认不会连接、使能或执行。现有小幅位移限制不变，不会因版本二文件到达而扩大限制。
-
-后台任务最多一个，不排队积压。跨进程返回的数值数组会在暂存前重新冻结；取消信号独立传递，故障时先请求两臂执行线程停止，再通知计算进程退出。预检未完成时收到新消息会作废旧结果并拒绝新请求，等待后台退出后需重新提交。预检期间禁止单臂运动和提前开始；halt、显式断开、驱动退出均作废预检结果。普通候选预检上限30秒，含文件核对与模型检查的完整文件上限120秒；迟到成功也不能重新暂存。
-
-状态话题提供VALIDATING、STAGED等阶段与preflight_busy。普通paired_target仅检查关节约束；文件入口还做本文所述离散几何检查，但没有真实夹爪验证。Linux线程及JSON解析不构成硬实时停止保证，替身测试也不能代替实际控制器验收。
-
-
-## 完整任务文件只读核对
-
-先使用已有 `circle-import --prepare` 生成连续候选，再使用 `task-review` 核对同一轮记录：
-
-```bash
-ros2 run archer_hardware hardware_operator task-review \
-  --run-dir ~/archer_ws/archer_results/日期_时间_任务名称 \
-  --limits-file ~/archer_ws/src/archer_hardware/config/position_control.yaml \
-  --prepared-file ~/archer_ws/archer_results_trans/日期_时间_任务名称/tracking.json \
-  --report-file ~/archer_ws/archer_results_trans/日期_时间_任务名称/tracking_report.json \
-  --max-excursion 0.05
-```
-
-`--max-excursion` 是本次离线检查的明确关节位移上限，单位 rad，不修改驱动配置。完整任务若超过0.05会被拒绝；只有明确评估后才能为离线检查选择其他值，不能据此推导已允许驱动发送大范围轨迹。
-
-入口只读取五种文件快照：CSV、成功摘要、限位配置、连续候选和准备报告。校验哈希对应、任务种类、原始实际角度逐点保留、时间映射、两侧完整阶段及事件停顿，再复用连续多项式约束检查器验证全段角度、速度和加速度。仅接受画圆 `split_circle` 或完整圆柱抓取记录，不接受旧参考物协同示意。
-
-2026-10-21更新：连续准备优先局部分配双臂共同时间，保留全部采样角度与原有等待。
-各结点共用重算的速度、零加速度，显式阶段和参考事件停点仍保持零速零加速度。
-用批量导数实根求峰值，分别尝试有界的直接和阻尼伸长，选择满足约束的较短结果；
-再独立以多项式实根检查全段位置、速度与加速度，避免单步过度伸长引起不必要的整轮回退。
-局部分配若没有得到更短且满足要求的候选，退回原统一放慢。
-真实静止区间以及相邻阶段、事件停点之间的总时长不缩短；运动区间可重新分配时间，
-不把日志的每个采样间隔当成物理等待。审阅器由原始双臂角度重新识别静止区间并逐项核对。
-局部报告的timing_policy为local_segment_c2，uniform_time_scale为null，保存来源和准备纳秒轴、
-整轮比例effective_time_scale；事件采用相同的分段时间映射。旧统一倍率报告仍可核对，但须匹配当时配置。
-采样点之间的插值会改变，报告给出各侧段形变化的关节角上界，完整几何预检必须重新执行。
-
-按用户指定，两臂候选速度上限现为0.50rad/s，限加速度保留0.10rad/s²；这不是已完成的真机速度验收。
-配置仍不自动连接、不自动使能，完整文件入口默认关闭，位移范围也未扩大。
-修改速度配置会改变限位文件哈希，旧候选不能直接配合新配置，需从原CSV重新转换。
-
-结果仅打印至终端，不新增任务文件、不初始化ROS、不加载SDK或连接机械臂。通过时 `task_files_verified=true`，`execution_ready=false`。这不是文件签名或厂商认证：哈希只证明当前这些快照与准备报告一致，不能防止整套记录与报告被一起伪造。碰撞、工件真实性、实际起点和夹爪执行仍需后续验证。报告中的这些许可字段不作为本入口的信任依据。
-
-该入口没有播放动作，也没有自动接近、使能、归位或夹爪命令。后续执行必须使用已核对的同一份内存快照，不能检查后再次读取并发送一个可能已变化的路径文件。
-
-
-## 离线起点衔接与采样几何检查
-
-在 `task-review` 后增加 `--geometry`，使用同一次校验保留下来的只读轨迹对象进行几何检查，不重新打开候选路径文件。可选 `--start-file` 提供离线起点，并明确指定 `--approach-max-excursion`：
-
-```bash
-ros2 run archer_hardware hardware_operator task-review \
-  --run-dir ~/archer_ws/archer_results/日期_时间_任务名称 \
-  --limits-file ~/archer_ws/src/archer_hardware/config/position_control.yaml \
-  --prepared-file ~/archer_ws/archer_results_trans/日期_时间_任务名称/tracking.json \
-  --report-file ~/archer_ws/archer_results_trans/日期_时间_任务名称/tracking_report.json \
-  --max-excursion 6.3 --geometry \
-  --start-file /path/to/start.json --approach-max-excursion 0.05
-```
-
-起点文件仅包含 `left`、`right` 两个六维关节角数组，单位rad。离线文件不能冒充新鲜反馈；未来执行仍须重新读取并核对双臂实际反馈、状态和时间。略超名义限位的读数会拒绝，要求先走既有的独立限位恢复流程，不自动裁剪反馈。
-
-三段方案是：本轮起点→文件起点的接近、完整原文件、文件末点→本轮保存起点的归位。两个边界段都用零速零加速度五次插值，按更严格一侧的限速自动选择共同时间；文件主体不改写。这里只生成内存预检对象，没有播放命令，也没有新增独立归位结果文件。
-
-几何检查沿实际连续多项式采样，按解析速度峰值加密，相邻点最多0.1秒、单关节行程目标上限0.005rad；默认总预算100000点。预算不足直接拒绝，不降低精度或只检查前半段。检查当前安装模型下跨臂10mm和机器人与台面1mm间隙；台面Z=-0.01m，双基座X=±0.21m、yaw=90°，TCP使用当前工程候选值。模型检查GP80和法兰固定链，哈希记录加载后的几何与运动学数据。
-
-通过时 `sampled_geometry.sampled_cross_arm_table_passed=true`；`interval_collision_proven=false`，因为加密采样仍不是连续碰撞证明。自碰撞、工件、线缆、外部障碍与真实抓取接触没有纳入。离线结果不构成执行许可，不会据此连接、使能或下发动作。
-
-`--max-excursion 6.3` 仅是本例的离线全文件检查范围，正式驱动0.05rad小幅限制及默认关闭许可不变。接近和归位共用单独的0.05rad范围，不能拿全文件范围替代边界段保护。
-
-## 画圆完整文件执行通道
-
-基础配置不自动连接或使能，限位未确认，三项轨迹许可均为false，小幅范围为0.05rad。
-已验证的一键脚本仅在显式`--execute-authorized-full-circle`下临时打开本轮所需参数，
-不写回基础配置。分步ROS入口仍要求操作者先启动驱动、连接并准备双臂。
-
-分步执行入口形式如下；四个路径必须定位驱动所在电脑上的同一轮记录与准备文件，
-驱动配置须与准备报告一致且已显式开放完整画圆入口：
-
-```bash
-ros2 run archer_hardware hardware_operator task-run \
-  --run-dir /path/to/archer_results/某轮画圆 \
-  --limits-file ~/archer_ws/src/archer_hardware/config/position_control.yaml \
-  --prepared-file ~/archer_ws/archer_results_trans/日期_时间_任务名称/tracking.json \
-  --report-file ~/archer_ws/archer_results_trans/日期_时间_任务名称/tracking_report.json \
-  --transition-max-excursion 0.05
-```
-
-该入口不连接或使能，要求双臂已经处于HOLDING并有新鲜静止反馈。驱动保存本轮双臂角度快照（两帧时间差不超过20ms），计算进程读取并核对文件快照、当前限位和完整阶段，规划接近与返回本轮起点，再检查原任务及两段过渡。整轮范围仍由驱动的max_excursion约束，不从文件请求接受扩大值。
-
-通过后重新核对反馈并暂存STAGED；客户端再用同一唯一编号显式消费一次计划。路径在同一共同时间轴中包含接近、完整文件和归位；左右线程复核后通过共同门控启动。完成需匹配两侧本次命令编号、SUCCEEDED、HOLDING及新鲜反馈，不能把“收到请求”或另一轮FINISHED当作成功。正常返回操作客户端只关闭客户端，位置驱动继续保持最终目标。
-
-文件定位话题为 `/hardware/position/task_file`；带编号的执行话题为 `/hardware/position/task_execute`。普通paired_move服务不能消费完整文件，以免把旧的预检编号或另一份暂存误当成本次请求。正式状态在 `/hardware/position/status` 的paired_trajectory下，包含request_id、task_file、last_file_rejection和左右命令编号。
-
-文件内容不会在检查后重新打开用于发送；跨进程返回数组重新冻结。预检后、左右准备时或等待共同启动时，起点发生变化都不能重建首段继续执行。默认采取精确起点匹配；可选的有界反馈模式见下节，必须先完成相应误差包围检查。
-
-`--timeout`对task-run默认120秒，表示通信及预检等待窗口；任务执行等待按路径自身时长再加该窗口，不将902秒轨迹误当120秒失败，也不因更改timeout而加速任务。调用中断或执行结果不明时沿用既有尽力halt；不会自动重发、重新连接、归位、发送零力矩或失能。退出真实驱动仍在驱动终端按Ctrl+C，取消后关闭连接。
-
-抓取记录会明确拒绝进入此运动通道，因为虚拟附着和夹爪命令2.0尚不能映射为已验证的真实夹爪动作；仍可使用task-review做离线核对。当前几何检查依然不含自碰撞、工件、线缆或连续碰撞证明，实际TCP标定和运动时序、跟踪误差仍待验证；这些属于执行真机任务前的后续工作。
-
-配置文件内容变化会改变哈希。旧准备报告若不再匹配，应从同一份原CSV重新准备到开发缓存，保留原始采样；不要手工改哈希字段冒充验证通过。
-
-## 关节误差的几何包围检查
-
-几何检查函数可显式指定 `joint_error_rad`，默认0。
-几何函数可检查0到0.05rad的明确误差界限。普通连续入口未启用名义反馈保护时，
-允许值受读取容差与0.01rad的较小值限制；完整文件逐帧检查名义限位时可显式到0.05rad。
-这不是厂商精度参数。默认仍为0；每个非零候选必须核对完整路径的相应几何包围。
-检查器沿碰撞几何到各祖先转动关节的固定链，利用偏移长度和几何包围球求转动半径上界，
-再用各关节 `R*误差角` 之和保守覆盖任意碰撞外形点的位移。
-跨臂要求增加左右位移上界之和，台面要求增加两侧上界的较大值；角度误差包围也必须在名义与模型限位内。
-不支持的活动关节、无效包围数据或间隙不足均拒绝，不把误差容差当作忽略碰撞的理由。
-
-报告同时输出误差角、外形位移上界和实际检查的间隙要求。结果仍是离散姿态检查，
-没有证明采样间隔内的运动安全，也未覆盖自碰撞、线缆、工件或实际跟踪动态。
-位置节点参数`task_joint_error_rad`默认0；基础配置未启用非零值，近期完整画圆一键验证显式用0.05rad。
-只有已显式开放完整文件入口时才允许配置非零值。节点从同一次工作线程快照读取新鲜实际反馈和
-当前HOLDING的已发送目标，反馈与目标必须都在名义限位内且偏差不超过该参数。
-后台以当前保持目标作为接近起点；最终归位独立使用本轮控制准备时保存的实际初始角度。
-初值略超名义限位时，保留原始读数，但将归位目标限制到名义边界；不会返回限位恢复后的保持位置。
-actual_initial_positions 为提交预检时反馈，saved_initial_positions 为最初实测值，return_targets 为实际归位目标。
-
-入限后再提交完整文件时，接近段起点可以不同于最初实测位置。完整路径拼接和几何检查
-均使用同一份return_targets核对归位终点，不能误用入限后的接近起点代替。
-归位段仍完整参加名义限位、跨臂与台面检查；没有明确目标时，离线检查沿用返回提供起点的规则。
-
-完整任务、接近及归位均按同一误差加严几何检查，通过后才给不可改写的轨迹绑定该误差值。
-后台完成、消费暂存、设备线程准备及等待共同启动时都会复核；保持目标变化或反馈超差就拒绝。
-允许范围内只接受反馈变化，所有原始多项式、时间轴和首次保持指令均不因反馈噪声改写。
-执行期间及末端保持也按这条更严格误差界限逐周期核对；超差取消后续位置发送并沿用故障联停，
-不会以旧的较宽tracking_tolerance代替几何误差界限，也不会自动重新规划或归位。
-
-这仍是软件采样监测：尚未证明实际设备能满足该界限，也不能保证两次反馈之间的动态误差。
-实际反馈及发送频率、通信延迟和跟踪滞后都可能触发拒绝，运动验收后再确定参数与时间伸长。
-
-## 左右臂统一SDK准备
-
-左右臂共用HexPositionAdapter。connect只连接反馈；显式enable才进行以下准备：
-
-1. 若有可远程清除的PscAPICommunicationTimeout，且reason恰为API communication timeout，发送一次官方清除请求。要求故障状态完整、无电机故障、不占用其他会话，新鲜实测反馈静止且在读取容差内。
-2. 更新反馈确认停车消失后，申请一次初始化并等待本会话控制权。无停车时直接申请初始化。
-3. calibrated=false时发送一次SDK校准请求，不以初始化尚未确认而阻塞该请求。取得控制、初始化与校准均确认后，保存当时新鲜静止实测角度，用POSITION保持。
-
-没有额外的校准许可开关或等待许可模式；旧allow_api_calibration参数已移除。单纯启动节点或connect不会触发校准。清除、初始化和校准共用readiness_timeout；失败或未确认时结束本次准备，不循环重试。readiness_stage显示CLEARING_API_TIMEOUT、WAITING_SESSION、WAITING_INITIALIZATION、WAITING_CALIBRATION和READY。
-
-HOLDING、ARMED或RUNNING期间出现停车或通信超时，取消目标及双臂共同门控，尽力BRAKE；不清除、不重新初始化、不继续发送旧CSV目标。急停、电机故障、未知停车均不属于启动清除范围。停止和关闭使排队准备失效，迟到确认不能恢复执行。
-
-## 官方周期与反馈时效
-
-开发启动入口`verify_circle116.py`先连接反馈并在未申请控制时完成完整CSV主体检查。
-发现机械臂时仅接收反馈，不启动Arm控制周期；显式准备先排入初始化或指定通信超时清除请求，
-再启动一次官方控制周期，避免预检期间SDK反复尝试恢复控制。反馈收包不依赖Arm控制周期。
-关闭时取消共同门控并清空本轮轨迹、目标、初始角度和准备状态；再次连接重新读取实际角度。
-关闭仍采用尽力BRAKE并断开，不新增失能或零力矩命令。控制器断连后可能产生的API通信超时
-属于设备状态，不能靠清空软件变量保证消失；下次显式准备仅按上述规则处理一次指定可清除故障。
-主体快照及其时间轴、系数、限位、误差标准、采样标准和模型指纹绑定在本次启动内，
-不生成长期有效的运动许可，也不从旧日志直接恢复运行。
-主体通过后才执行官方SDK准备；此时重新读取实际起点并保存本轮归位目标。
-接近、归位段按最新保持目标生成并检查，模型指纹变化即拒绝复用；
-执行前仍用新鲜静止反馈核对起点，未改变限位、跟踪误差或通信超时保护。
-直接提交ROS文件请求且未提供本次启动内主体结果时，仍执行完整预检，不自动跳过检查。
-
-公共五次插值采用Horner求值，减少每周期临时数组；位置、速度、加速度与原多项式定义等价，
-不改变轨迹点、时间轴或停止点。几何预检仍检查原完整采样网格，按MuJoCo膨胀宽阶段的全部
-跨臂和台面候选计算姿态误差包围，并批量处理同一零件的上游关节；保护距离及二阶余量保留。
-2026-10-22对同一完整候选离线比较：主体预检51.764秒降至42.385秒，单次位置取样
-7.619微秒降至3.838微秒。此为本机性能测量，不代表每次启动耗时或实机振动改善保证。
-该早期候选时长为105.754939016秒，接近与归位衔接另计；后续候选时间见各版本记录，
-不能把这里的旧性能对比当作当前完整周期时长。
-后续重定时与加加速度优化参考[TOPPRA](https://github.com/hungpham2511/toppra)及
-[Ruckig](https://github.com/pantor/ruckig)的约束设计；本改动未引入这两个依赖或替换执行器。
-
-路径重定时可显式追加`--smooth-cruise --planning-jerk 2.0`：前者使用共同标量进度的
-平滑速度起落及匀速段（起落各占归一化阶段的25%），后者对两臂最终五次段解析计算加加速度
-峰值，必要时按立方根比例延长整个共同阶段。两项都需要`--prepare --path-retime`；
-默认关闭，不改变旧命令或已成功候选。2.0rad/s³是本项目候选规划界限，不是厂商允许值。
-报告新增`jerk_metrics`、`planning_jerk_limit_rad_s3`、`path_progress_profile`。
-最终执行格式仍为C2五次段，已约束加加速度幅值，但不承诺段间加加速度连续；报告另列跳变。
-位置拟合误差仍不超过0.0005rad，边界停点保留，左右臂不分别缩放时间；执行器仍按原周期
-播放完整多项式。新候选必须重新完成完整文件和几何检查，不能复用旧候选的通过结果。
-
-可进一步显式追加`--continuous-jerk`（必须同时选`--path-retime --planning-jerk`）。
-它复用既有五次样条平滑器，在空间拟合与重定时后统一每个停车区间内的节点导数，节点位置
-不变，停车边界仍零速零加速度；普通节点的三阶导数跳变降至数值计算误差量级。
-不是逐点独立套用点到点运动，也不移除必要停车。最终仍是原版本二五次段格式，执行端
-不需要SciPy。此选项保持规划速度比例，并在导数重算后解析核对V/A及已指定的jerk上界；
-如违反约束可统一延长双臂时间，不允许为了保持时长提高约束。相对前处理候选的段内
-位置变化必须不超过0.00005rad，否则转换失败，保留旧输出；最终仍需完整几何检查。
-
-算法处理顺序参考[MoveIt的定时后平滑流程](https://moveit.picknik.ai/main/doc/examples/time_parameterization/time_parameterization_tutorial.html)，
-具体导数计算复用项目已有SciPy五次插值器，不是接入Ruckig或更换控制接口。
-
-`--arc-smooth`是显式圆弧内部平滑选项，需同时开启`--boundary-blend`及其依赖。
-它只处理两个融合窗口之间的ARC，窗口本身、接近、归位、所有节点时间及停车策略保持不变。
-五次B样条以完整12轴共同求解时间加权位置拟合与jerk平方正则项，固定两端q/v/a/j；
-再按原时间节点重构为既有五次执行段。不是移动平均滤波，也不逐点停车或增加实时依赖。
-原始CSV节点变化≤0.0005rad，相对输入成功曲线的段内变化≤0.0001rad；仍解析检查位置、
-速度、加速度与规划jerk。必须同时降低最终执行段的jerk/snap平方积分，且jerk峰值最多
-比输入局部峰值增加5%（仍服从规划上限），不允许只凭拟合器输出宣称平滑成功。
-如果数据不足、存在实际保持、内部停车或质量门槛不满足，则拒绝，保留旧输出。
-报告`arc_smoothing`记录窗口、误差及前后积分/峰值，实际机械振动仍需实机对照。
-参考[MoveIt的轨迹定时后jerk受限平滑流程](https://moveit.picknik.ai/main/doc/examples/time_parameterization/time_parameterization_tutorial.html)
-及[SciPy的加权最小二乘B样条](https://docs.scipy.org/doc/scipy/reference/generated/scipy.interpolate.make_lsq_spline.html)。
-本项目使用SciPy基函数和端点约束实现正则化拟合，没有接入Ruckig或宣称这是厂商补偿控制。
-
-成功circle153版本已同步正式转换目录`~/archer_ws/archer_results_trans/2026-10-21_21-57-33_619810_画圆`，
-代码、配置、转换文件及成功运行日志留存于`~/.local/share/archer_successful/circle153_20261022/`。
-circle154_arc单独位于开发缓存，不覆盖上述153对照版本；最新完整播放记录见本文开头。成功版实际播放95.859秒，
-退出前归位误差left约0.001618、right约0.002084rad；这是本次实机结果，不是精度验收结论。
-
-`--boundary-blend`是可选的画圆入口、出口局部衔接，需要同时开启下述
-`--transit-profile`及其依赖选项。只接受左右一致的APPROACH→ARC→RETURN_HOME三阶段、
-没有参考事件的画圆记录。分别处理两处窗口，以七次边界引导和五次段重构保留现有执行格式；
-局部融合后两个阶段衔接连续通过，整轮起点、终点仍停车，抓取流程不受影响。
-窗口外的位置、速度、加速度、多项式及全部时间戳原样保留；没有重新加速圆弧主体。
-相对原始节点及原候选段内的局部变化均不超过0.0005rad，仍核对位置、速度、加速度及规划jerk。
-出口按同一个误差上限选择较小融合强度；不保证整个候选C3连续，也不表示实际微抖已经消除。
-报告记录两个窗口及移除的阶段停车索引；正式文件核对器独立从原始阶段和最终时间轴定位窗口，
-不允许将抓取事件、保持区间或其他停车点作为画圆衔接删除。默认不开启，不覆盖旧成功候选。
-新生成路径必须重新核对模型间隙，旧几何结论不复用；候选数值与实机结果分别记录。
-
-`--transit-profile`是显式的接近/归位候选选项，需要同时开启`--prepare --path-retime
---smooth-cruise --planning-jerk 2.0 --continuous-jerk`。它先生成上述成功平滑基线，再对
-接近/归位计算起落比例0.15、规划速度不超过0.25rad/s、规划加速度不超过0.20rad/s²的
-另一时间分配；若配置限制更严格则服从配置。只取标签在两臂均为APPROACH或RETURN_HOME、
-完整停车边界之间且确实更快的阶段，其余圆弧与跨阶段桥接多项式和每段纳秒时长逐段保留。
-全部节点角度必须与基线完全相同；所替换阶段的段内角度相对基线变化≤0.00005rad，
-超限就拒绝生成。不是将原记录任意拉直或删去停点，也不修改源CSV。
-
-文件执行参考推进预算按驱动已配置的250/500Hz周期计算，仍保留20%编码余量。节点向后台
-传递真实配置频率，主体复用结果绑定同一频率；不一致则拒绝复用。旧纯函数调用未知频率时
-保留500Hz默认。参考时钟不会因此提前于单调时间正常播放，也不取消SDK实际构包限速、
-逐侧更新保护或反馈保护；配置频率不等于实际稳定收发频率。此修正避免以250Hz运行时，
-仍用2ms预算将新候选和未改圆弧整体放慢。
-
-项目发布最新目标缓存和运行有效期，传输仍由官方Arm周期执行。
-完整文件周期模式在SDK实际构包时从已验证轨迹按共同时间轴取样，不重复旧缓存后跳到较晚目标。
-构包时再次核对该采样时刻的目标与新鲜反馈误差，之后按官方编码及速度限制生成报文。
-sdk_cycle将本包取样值与预期编码绑定，发送前复核状态、代次、双臂取消及编码。
-规划线程超过40毫秒未更新即取消，SDK取样不能延长旧请求有效期或复活取消任务。
-非完整文件模式保持缓存接口。每臂sdk_position隔离同型号配置与历史；
-若厂商将裁剪目标仍拒绝发送，不通过抬高速度上限或静默改写路径规避。
-
-SDK首次收包估计的时钟偏移可能使换算时间略领先本机。托管API保存同帧关节数据、本地单调收包处理时刻和原SDK时间；控制反馈以本地收包处理时刻计算新鲜度，100毫秒上限不变。原SDK时间继续用于拒绝重复、倒序、明显未来或积压旧帧；重复收包不能刷新旧数据。收包时间不等于设备采样或执行时刻。
-
-通信线程不争读反馈序号，只复核项目缓存。BRAKE另行复核本会话控制权，故障或反馈过期不会阻止尽力制动；制动传输返回不等于物理停止确认。关闭先取消目标并尽力BRAKE，再取消周期和关闭传输，避免厂商退出过程的固定等待；不额外发送零力矩、失能或归位。
-
-## 当前验证状态
-
-两臂均已有官方SDK准备及原位保持记录，画圆已有完整播放和自动归位记录，最近结果见本文开头。
-早期入限试验、失败及候选时长属于开发历史，不作为当前执行规则。原始报告与成功版本归档保留，
-不通过删除历史证据冒充问题从未发生。真实夹持与外部TCP精度验收仍未完成。
-
-### 完整画圆文件的共同周期时钟
-
-完整文件入口将接近、文件任务、返回本轮实测起点作为一条路径执行，不重复独立入限试验。
-接近与归位的平滑过渡按至少3秒计算，并保留5%时间余量；小幅衔接实际为3.15秒。
-它仅减缓衔接段，不更改CSV主体路径或运行时跟踪误差界限，不保证已消除机械臂跟踪滞后。
-完整文件的两个误差参数默认均为0，基础节点不会自行开放轨迹。
-当前一键观察配置显式设置task_joint_error_rad和task_startup_joint_error_rad为0.05rad，
-并按相同误差重新检查模型间隙；这不是厂商精度参数或自动修改基础配置。
-接近段按startup参数，进入文件主体和归位后按task参数检查，不将起始标准隐式带到后续阶段。
-实际反馈仍逐帧检查名义限位、新鲜度和声明的跟踪误差范围。
-后台从完整多项式的解析速度峰值计算单次参考时间推进上限，为 SDK 的位置限速留出余量。
-共用时钟按实际单调经过时间连续推进，不将取样时刻量化到整数周期，也不等待每代发送确认。
-SDK底层发送完成直接确认该包的取样代次，缓存更新或事件被替换不会丢失确认。
-软件传输确认用于两侧通信看门狗与末包确认，不表示控制器收包或实际机械臂到位。
-参考时间不快于单调时间，延迟不积累成补发欠账；任一侧40ms无新发送确认即取消两侧。
-完整文件采用连续参考时间播放，不按中间采样点的实际偏差暂停、减速或等待到位。
-原路径的后续目标持续更新，不按发送确认预算切割成微小时间步，不积累时间追赶欠账。
-实际反馈继续用于限位、反馈新鲜度与异常偏差检查；观察运行可声明最多0.05rad路径误差边界（同步扩大几何包围），越界明确取消。
-这不等于取消异常保护，也不代表实际机械臂能精确复现轨迹；偏差以运行记录为准。
-旧反馈减速/等待模式及逐代发送确认推进模式已移除，完整文件仅使用共同单调时钟播放。
-
-状态 `paired_trajectory.reference_clock` 同时报告参考时间、两侧已共同发送的参考时间、
-代次、每侧发送确认年龄及末目标发送状态。跟踪误差必须对照同一参考时间的目标，而不是运行墙钟时间的目标。
-完整路径末点使用已声明且经过几何预检的关节误差界限，并保留静止确认及有界等待；
-普通单点动作的原有到位标准保持不变。
-
-靠近边界的实际起点不再仅因对称误差盒越过限位而要求先留固定余量：完整文件预检可使用
-“跟踪误差范围与名义限位的交集”，前提是运行时逐帧严格检查实际角度在名义限位内，
-并要求项目反馈范围完全位于 URDF 范围内。碰撞距离仍按完整误差盒膨胀，不缩小保护距离。
-普通离线几何检查默认仍要求完整误差盒在限位内。报告明确记录这项运行条件，
-缺少该条件时文件执行入口拒绝消费报告。此策略不扩大目标或实际反馈的名义限位，
-也不证明连续碰撞安全、机械停止距离或真实跟踪精度。
-
-本轮画圆观察入口采用0.05rad运行及接近段偏差上限；关节限位、起点读取容差、速度及加速度不变。
-扩大容差不代表改善实际精度，也不保证更宽几何包围下整条路径仍通过检查。
-
-简化画圆观察入口：连接并读取初始角度、SDK准备、一次完整路径检查、连续播放接近/原文件/归位、退出。
-不做中间点到位等待或反馈减速；0.05rad用于明显跟随异常保护并同步扩大几何范围，不是精度承诺。
-入口不再逐包采集、生成调试报告或依赖verify_arm58等调试脚本，失败及Ctrl+C不追加归位或零力矩。
-
-几何误差包围按各碰撞零件分别计算，只累计影响该零件的上游关节；固定底座不套用末端最大偏移。
-跨臂判定采用10mm加参与接触的两零件位移上界，台面采用1mm加该零件位移上界。
-宽阶段仍覆盖所有零件可能的接近范围，保留原误差盒与采样密度，不将更精细的上界当作连续碰撞证明。
-
-检查时还按每个采样姿态的世界关节轴与零件中心计算转动半径，加包围球半径覆盖外形。
-按根到末端的关节扰动顺序和三角不等式覆盖同时误差；固定长度上界继续用于宽阶段检索。
-
-固定平面台面的距离按法向位移检查：Rodrigues公式的一阶/二阶界加上上游转动改变投影方向的余量。
-非平面或非固定台面仍用整体位移上界；基础台面间隙1mm不变，当前工程台面高度仍为world Z=-0.01m。
-报告中的checked_cross_arm_clearance_m和checked_table_clearance_m保留为宽阶段检索上限，
-实际拒绝门槛由per_contact_pose_bound策略按各接触零件及当前姿态计算。
-
-CSV平滑转换可在`hardware_operator circle-import --prepare`后增加`--smooth`。
-平滑按阶段拟合五次样条，保留全部位置采样、阶段停点和真实静止区间，重算普通节点的速度与加速度；
-不再强制每个普通节点的加速度都为零。段内角度、速度及加速度仍使用解析峰值检查，
-角度过冲拒绝生成，导数超限则统一延长时间；不会提高配置上限，也不会连接设备。
-段内路径会有微小变化，转换报告记录`smoothing_max_segment_change_rad`及普通节点的三阶导数跳变。
-这些指标只说明数值曲线，不能代替实际运动效果验证。
-
-此选项需要与NumPy兼容的SciPy；仅转换进程需要，播放生成的JSON不需要SciPy。
-当前Ubuntu已在`~/.cache/archer_spline_runtime`隔离安装兼容版本，不改写系统依赖。
-转换时使用`PYTHONPATH="$HOME/.cache/archer_spline_runtime:$PYTHONPATH" ros2 run archer_hardware hardware_operator circle-import`，
-再附原来的`--run-dir`、`--limits-file`、`--prepare --smooth`与`--output-dir`参数。
-不加`--smooth`保持原转换行为；试验候选先使用独立输出目录，避免覆盖已跑通版本。
-
-正式文件入口沿用`shared_periodic_latest_target`接口标识：两臂使用共同连续单调时钟，
-不再等待每一个中间目标都由两侧确认发送后才推进。默认250Hz对应4ms；
-SDK构包时生成该时刻的路径位置，仍由官方SDK的唯一周期发送器发送。
-SDK和工作线程从同一参考时间连续取样；每次推进不超过实际经过时间及全路径计算的SDK单包步长，
-丢弃超额时间欠账，不集中补发。每侧40ms无新发送确认或控制更新仍取消双臂，
-末段到位计时仍从两侧最终目标实际发送后开始，不降低限位、跟踪及偏差保护。
-以上是软件时序改善，仍需真实运动确认抖动是否消除。
-
-不再按整数4ms时间格推进，避免回调跨格时一包跨两格、下一包零增量的目标跳变。
-SDK位置校验以最后实际发送的位置为起点，按实际包间隔调用官方限速器；
-早到包保持名义周期步长，实际间隔超过40ms仍拒绝。速度上限未提高，
-未发送的编码历史不能充当实际发送记录，也不允许SDK静默改写目标。
-参考实现思路：ros-controls/ros2_controllers的共同时间采样；现有五次插值保持不变。
-Ruckig和TOPPRA分别作为加加速度约束及路径时间参数化的候选，当前未引入新依赖。
-
-连续仿真记录可使用`circle-import --prepare --path-retime`进行空间路径重定时。
-该模式不与`--smooth`叠加：两臂拼成同一个12维关节路径，累计共同弧长，
-用有界最小二乘样条去除反馈的细小波动，再用五次进度分配阶段内时间。
-每个采样点每关节的拟合变化不得超过0.0005rad；原CSV、采样数量、阶段停车位置不变。
-报告记录`position_filter`、误差上限和实际最大节点变化，加载文件时再次独立核对；
-这些节点误差不是整条曲线的TCP误差承诺，完整候选仍需实际起点与几何检查。
-加速度计算包括路径曲率项，并解析检查最终五次插值段的角度、速度、加速度峰值。
-原始真实静止等待及阶段总时长作为下界，中间点不再强制零速度或零加速度。
-为避免现有SDK单包限制再次拖慢整轮，按配置`control_hz`规划可连续交付的速度：
-250Hz使用配置速度上限的0.4，500Hz使用0.8；不提高配置上限或修改发送保护。
-依赖仍只在隔离SciPy转换环境使用；运行生成的文件不依赖SciPy。
-
-
-## 接近归位内部时间优化
-
-显式选项`--transit-timing`要求已经开启`--arc-smooth`及其完整前置链路，默认关闭。
-生产函数位于`archer_control/transit_timing.py`，只对两处成功融合窗口之外的接近和归位处理。
-采用端点平滑的共同时间变换、节点对齐的五次B样条和q/v/a/j端点约束，固定同一双臂时轴；
-不会重新加速圆弧，不更改成功融合窗口的节点状态或纳秒段时长。
-
-规划V不超过min(配置,0.38)rad/s，A不超过min(配置,0.25)rad/s²，仍使用显式规划jerk限制。
-节点相对输入变化≤0.00002rad、相对原CSV≤0.0005rad，段内变化≤0.00005rad；
-端点jerk变化≤1e-5rad/s³，内部jerk跳变不超过max(1e-5,原值1.1倍)。
-存在实际保持、额外停点、约束不满足或成功融合窗口定位改变时拒绝，不放宽限制生成候选。
-只在离线转换使用SciPy，执行器与SDK配置不变。设计参考Pilz同步阶段及Ruckig受限导数思想，
-没有接入这些控制库，不宣称全局时间最优或保证机械振动消失。
-
-158候选从已保存154文件生成，保存在`~/.cache/archer_development/circle158_transit`，
-原成功154和正式153保持。纯接近内部15.2671→12.8244秒，纯归位内部29.1871→28.5199秒；
-完整文件88.9084→85.7985秒。假设现场起点与文件起点相同、两端各3.15秒衔接时，
-完整周期95.2084→92.0985秒，约缩短3.27%；实际时间与平稳程度需真机对照。
-归位主要受jerk限制，并非简单提高速度和加速度上限就能继续缩短。
-
-
-## 163版离线计算优化（运动曲线保持158成功版本）
-
-本轮保留既有时间律和规划V≤0.38rad/s、A≤0.25rad/s²；硬件仍为0.5rad/s、0.3rad/s²。
-五次段jerk为二次多项式，批量解析检查端点和区间内顶点，先拒绝jerk超限候选，
-合格者才继续原有的位置、速度、加速度和路径误差检查。没有减少最终约束或离散几何检查。
-极值实现与原实根检查有随机数值等价测试；转换输出与成功158的节点、导数、纳秒时间轴独立比较。
-
-尝试过按低jerk区间压缩接近、归位的候选：整轮计划约省1.36秒，
-但jerk均方根约增加7%～12%，因此本轮没有将它选为真机版本。
-成功`circle158_transit`仍是实际运行候选；实验更快路径仅保存在开发缓存，不建议代替成功版本。
-计算优化不会使已生成JSON的运动更快，它改善后续离线转换效率，不宣称精度或抖动已经改善。
-
-参考与集成范围：
-- MoveIt双臂示例：<https://github.com/moveit/moveit2_tutorials/blob/main/doc/examples/dual_arms/dual_arms_tutorial.rst>。
-- MoveIt时间参数化和jerk后处理：<https://moveit.picknik.ai/humble/doc/examples/time_parameterization/time_parameterization_tutorial.html>。
-- Ruckig多轴同步及V/A/J受限生成：<https://docs.ruckig.com/>。
-- 实际调用SciPy BSpline/null_space进行边界约束拟合；未集成MoveIt或Ruckig求解器，不称全局最优。
-
-163最终验收：同机单次对比局部优化计算18.8647→4.5590秒（约减少75.8%），
-不包含读取文件、上游时间参数化或完整几何预检，不能当作启动耗时的同比改善。
-重生成的tracking.json与成功158逐字节相同，SHA256为
-`20c9d005ec1614dbac2283cfa29f1b9c553096e348f64a5ef70479af2ba15ee9`。
-100项相关功能测试、单独flake8检查通过；SDK内存构包每侧21450包、无裁剪、两侧末包完成。
-这些是离线等价与计算效率证据，不是新的真机精度或运动提速结果。
-
-## 164版：仅归位段同步平滑规划（显式候选）
-
-`--return-profile`默认关闭，必须与`--transit-timing`及其完整前置链路一起使用。
-生产实现为`archer_control/transit_timing.py`的`replan_circle_return`，
-转换器为`archer_hardware/circle_import.py`，加载复核为`archer_hardware/task_file.py`。
-只处理画圆出口融合窗口之后的归位内部；接近、圆弧、两个融合窗口的状态和段时长保持原值。
-两臂十二关节共享五次平滑进度，局部七次修正匹配出口及末端q/v/a/j，
-执行文件仍使用既有五次段格式。归位目标不变，不修改SDK发送、停止逻辑或实际反馈保护。
-
-规划上限V=min(配置,0.32)rad/s、A=min(配置,0.18)rad/s²、J≤0.8rad/s³。
-硬件配置仍为0.5rad/s、0.3rad/s²、250Hz，通信更新超时仍为40ms。
-归位内部相对原CSV节点变化上限为0.004rad，其余区域保留0.0005rad；
-实际候选最大节点变化left 0.001763rad、right 0.001777rad。
-此容差仅用于离线归位路径重构，不是运行跟踪容差或TCP精度承诺。
-加载器独立复核区域、节点差、导数上限与jerk连续性，伪造报告不能绕过检查。
-
-候选保存在`~/.cache/archer_development/circle164_return`，成功158版本保留。
-归位内部28.5199→19.4840秒，完整文件85.7985→76.7626秒；
-假设现场起点一致、两端各3.15秒衔接，完整周期92.0985→83.0626秒，约缩短9.81%。
-这是离线计划时间，不是真机实测。归位jerk峰值和整轮逐轴jerk均方根均降低。
-286项相关功能测试、两个包flake8、SDK内存构包、抖动时钟采样与完整离散几何检查通过。
-正式CSV命令行已验证能够生成该模式候选；尚未进行164版真机运行。
-
-设计参考Pilz PTP的关节共同时间同步及Ruckig的V/A/J受限同步思想：
-- Pilz PTP：<https://moveit.picknik.ai/humble/doc/examples/pilz_industrial_motion_planner/pilz_industrial_motion_planner.html>。
-- Ruckig：<https://docs.ruckig.com/>。
-实际使用本项目NumPy多项式规划与既有执行格式，没有接入这两个求解器，不宣称全局时间最优。
-
-## 171：92.817秒成功基线的恢复记录
-
-用户实机反馈170执行版归位微抖加重、完整播放98.497秒，要求回退。
-当前仍选择circle158_transit，恢复92.817秒成功运行时的162执行核心：
-position_plan.py、position_adapter.py、sdk_cycle.py与当时清单的SHA256完全相同。
-SDK适配、节点调用及对应测试同步恢复；撤回165累计包预算、167可选KCP入口、
-170唯一取样/有效期刷新及设备列表替换。当前采用成功版WebSocket接口。
-未提高速度、加速度、误差或通信超时阈值，仍保留真实发送完成确认和末点确认。
-
-启动脚本单独保留165的连接顺序修复：在未建立SDK连接时完成文件主体预检，
-随后读取实际起点、按官方流程准备并核对接近/归位。此顺序不更改运动插值。
-不接受--transport参数。完整画圆示例：
-
-```bash
-cd ~/archer_ws && source /opt/ros/humble/setup.bash && source install/setup.bash && set -o pipefail && /usr/bin/python3 -u ~/.cache/archer_development/verify_circle116.py --run-dir "/home/user/archer_ws/archer_results/2026-10-21_21-57-33_619810_画圆" --prepared-dir "/home/user/.cache/archer_development/circle158_transit" --execute-authorized-full-circle 2>&1 | tee ~/.cache/archer_development/circle_latest_run.log
-```
-
-circle164_return为未选用的归位候选；当前回退不继续压缩归位时间。
-92.817秒及归位误差left 0.003826rad、right 0.002335rad是此前一次成功实测，
-不是回退后的新实机验收结果，也不保证每轮时长完全相同。
-
-## 173：成功执行结构加单包预算修正，复用164归位候选
-
-在171回退基础上仅修改position_plan的一个累计预算上界，不恢复170唯一取样、
-有效期刷新或设备列表改写，不修改position_adapter/sdk_cycle的成功版代码。
-原代码被离线回归复现：两次实际发送之间八次调用可累计推进8ms，超出已检4.487ms单包预算。
-共同参考增加上一双侧实际发送参考的最小值加单包预算的上界，防止重复消费预算。
-普通250Hz时钟仍连续推进，迟到不追赶；40ms保护、SDK真实发送确认及末点确认保留。
-硬件V0.5rad/s、A0.3rad/s²不变，不靠提高SDK速度上限通过。
-
-候选直接复用circle164_return，归位19.484秒、等起点整轮83.0626秒均是计划值。
-164只进行过一次约5.8秒的接近阶段试跑，尚无归位实测，不能说归位已失败或已通过。
-同一候选接近/画圆及出口融合前缀与158一致；本轮不重新生成或改动两份轨迹。
-158仍保留作成功轨迹基线。保持启动脚本先预检再连接及WebSocket接口。
-本轮227项相关功能回归通过，5文件静态检查0错误0警告。
-SDK内存构包包含正式首尾衔接、回调缺拍、变化编码延迟及worker正常取样：
-158计划92.0985秒/扰动模拟92.628秒，164计划83.0626秒/扰动模拟83.564秒。
-两者SDK裁剪为零、双侧末包已发送并进入HOLDING；最大包间角度增量按4ms折算约0.3953rad/s。
-以上是内存传输模拟结果，不是真机耗时或物理平稳性证明。
-配套test_sdk_cycle只修正模拟对端的真实发送确认，不改变生产SDK发送器。
-未获新选择不自动连接真机。
+旧~/.cache/archer_development实验入口绑定旧安装源码摘要，不与正式包混用。206历史归档保留；需要回退应恢复匹配源码/配置/轨迹，而不是强行修改报告哈希。维护者和许可证占位仍需由项目拥有者确认。

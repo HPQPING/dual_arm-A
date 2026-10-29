@@ -119,7 +119,7 @@ def _start(context) -> list[Action]:
     for package in ("archer_description", "archer_mujoco", "archer_control"):
         get_package_share_directory(package)
 
-    # 使用模块入口，不要求本轮额外修改两个 Python 包的 setup.py。
+    # 使用指定Python解释器运行模块，确保ROS 2与MuJoCo处于同一环境。
     scene = ExecuteProcess(
         cmd=[
             str(python),
